@@ -76,12 +76,23 @@ reproduce the fetch and diff.
 The models were **re-fetched from HuggingFace** rather than copied from the
 simulator's older `model_configs/` fixtures, so per-file git history from
 `inference-sim` is intentionally not carried over — the authoritative source is
-the vendor repo named in each `model.yaml`, not the prior fixture. Three configs
-(`glm-5.2-fp8`, `llama-2-7b-hf`, `llama-3.1-8b-instruct`) are therefore **fuller**
-than the hand-trimmed simulator fixtures they replace; they are the current
-upstream configs and are diffable against them. The S-task that adds the loader
-should confirm BLIS parses equivalent values for the keys it reads (R1 acceptance
-test #3, byte-identical stdout).
+the vendor repo named in each `model.yaml`, not the prior fixture. Four configs
+diverge from the older simulator fixtures they replace:
+
+- `glm-5.2-fp8`, `llama-2-7b-hf`, `llama-3.1-8b-instruct` are **fuller** than the
+  hand-trimmed fixtures but carry byte-identical values for every field BLIS
+  reads (verified: the only read key that differs, `llama-3.1`'s `rope_scaling`,
+  is type `llama3`, which `applyRopeScaling` treats as a no-op).
+- `kimi-k3` carries the **corrected** real-model values (`kv_lora_rank: 512`,
+  `moe_intermediate_size: 3072`, 24 full-attention layers) — it matches the
+  current committed simulator fixture and the recorded upstream revision, and
+  supersedes an older stale `kv_lora_rank: 149` copy that BLIS-consumed values
+  would differ from. Any golden/calibration data fitted against that stale copy
+  should be refit against these real values.
+
+They are the current upstream configs and are diffable against them. The S-task
+that adds the loader should confirm BLIS parses equivalent values for the keys it
+reads (R1 acceptance test #3, byte-identical stdout).
 
 ## Conventions
 
