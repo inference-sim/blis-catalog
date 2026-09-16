@@ -1,0 +1,10 @@
+_comment: "MFU values calibrated per Discussion #589: https://github.com/inference-sim/inference-sim/discussions/589"
+TFlopsPeak: 312
+TFlopsFP8: 0
+BwPeakTBs: 2.039
+mfuPrefill: 0.38
+mfuDecode: 0.18
+MemoryGiB: 80.0
+_comment_interconnect: "Per-GPU EFFECTIVE unidirectional bandwidths in GB/s; only their RATIO is used, to price cross-node collective traffic (#1530). NVLink 3 (600 GB/s bidirectional => 300 unidirectional per GPU); inter-node = one HDR 200 Gb/s port per GPU on an HGX A100 (25 GB/s). Ratio 12x."
+IntraNodeBwGBps: 300
+InterNodeBwGBps: 25
