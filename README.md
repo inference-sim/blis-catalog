@@ -7,9 +7,13 @@ inferred. Learned numbers (alpha/beta coefficients, LoRA cost defaults) live in
 `blis-registry`; deployment choices (GPU type, tensor-parallel degree) are stated
 on the command line, not here.
 
-This realises release **R1** of the North Star architecture: *a model runs if and
-only if it is in the catalog* (invariant NS-6). BLIS reads the catalog and never
-writes it.
+This is the **data half** of release **R1** of the North Star architecture,
+toward the goal *a model runs if and only if it is in the catalog* (invariant
+NS-6). This repository provides the catalog contents (C1–C6); the simulator side
+that **reads** it — the `--catalog`/`BLIS_CATALOG` loader, strict catalog-load
+validation, and removal of run-time HuggingFace fetching (the R1 S-tasks in
+`inference-sim`) — is **not yet implemented**. Until it lands, BLIS still reads
+its own bundled `model_configs/`; nothing consumes this catalog at run time yet.
 
 ## Layout
 
