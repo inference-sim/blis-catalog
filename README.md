@@ -76,23 +76,25 @@ reproduce the fetch and diff.
 The models were **re-fetched from HuggingFace** rather than copied from the
 simulator's older `model_configs/` fixtures, so per-file git history from
 `inference-sim` is intentionally not carried over — the authoritative source is
-the vendor repo named in each `model.yaml`, not the prior fixture. Four configs
-diverge from the older simulator fixtures they replace:
+the vendor repo + revision named in each `model.yaml`, not the prior fixture.
 
-- `glm-5.2-fp8`, `llama-2-7b-hf`, `llama-3.1-8b-instruct` are **fuller** than the
-  hand-trimmed fixtures but carry byte-identical values for every field BLIS
-  reads (verified: the only read key that differs, `llama-3.1`'s `rope_scaling`,
-  is type `llama3`, which `applyRopeScaling` treats as a no-op).
-- `kimi-k3` carries the **corrected** real-model values (`kv_lora_rank: 512`,
-  `moe_intermediate_size: 3072`, 24 full-attention layers) — it matches the
-  current committed simulator fixture and the recorded upstream revision, and
-  supersedes an older stale `kv_lora_rank: 149` copy that BLIS-consumed values
-  would differ from. Any golden/calibration data fitted against that stale copy
-  should be refit against these real values.
+**Three C1 fixtures** (`glm-5.2-fp8`, `llama-2-7b-hf`, `llama-3.1-8b-instruct`)
+are **fuller** than the hand-trimmed fixtures they replace, but carry
+byte-identical values for every field BLIS reads. This was verified through the
+real parser (`latency.GetModelConfig` produces an identical `sim.ModelConfig` for
+each catalog config vs its fixture); the only read key that differs, `llama-3.1`'s
+`rope_scaling`, is type `llama3`, which `applyRopeScaling` treats as a no-op. The
+automated regression that locks this in is tracked as a **merge dependency**:
+inference-sim#1748 (design decision recorded on PR #1).
 
-They are the current upstream configs and are diffable against them. The S-task
-that adds the loader should confirm BLIS parses equivalent values for the keys it
-reads (R1 acceptance test #3, byte-identical stdout).
+`kimi-k3` is a **separate case, not a C1 fixture** — it was absent at the
+`891facee` design baseline, so it is not one of the 13 pre-existing fixtures the
+C1 byte-move rule covers. Its sole provenance is the recorded upstream revision
+(`moonshotai/Kimi-K3` @ `f831ab66…`), against which the committed config is
+byte-identical and independently auditable. It carries the real-model values
+(`kv_lora_rank: 512`, `moe_intermediate_size: 3072`, 24 full-attention layers);
+any calibration data fitted against an older stale `kv_lora_rank: 149` copy should
+be refit against these.
 
 ## Conventions
 
