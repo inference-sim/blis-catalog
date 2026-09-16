@@ -1,0 +1,10 @@
+_comment: "MFU values calibrated per Discussion #589: https://github.com/inference-sim/inference-sim/discussions/589"
+TFlopsPeak: 362.05
+TFlopsFP8: 1466.0
+BwPeakTBs: 0.864
+mfuPrefill: 0.32
+mfuDecode: 0.08
+MemoryGiB: 48.0
+_comment_interconnect: "Per-GPU EFFECTIVE unidirectional bandwidths in GB/s; only their RATIO is used, to price cross-node collective traffic (#1530). No NVLink: peer-to-peer runs over PCIe Gen4 x16 (~32 GB/s per direction); inter-node = one 100 GbE port per GPU (12.5 GB/s). Ratio 2.6x — a PCIe node is far less penalized by spanning than an NVLink node, because its on-node link is already slow."
+IntraNodeBwGBps: 32
+InterNodeBwGBps: 12.5

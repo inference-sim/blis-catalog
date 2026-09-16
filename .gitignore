@@ -1,0 +1,22 @@
+# The payload is YAML and JSON, so this file deliberately ignores
+# NOTHING by extension. Before adding a pattern, check that it cannot
+# match:
+#   models/*/config.json   models/*/model.yaml
+#   hardware/*.yaml        workloads/*.yaml       devices/*.yaml
+
+# OS and editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Scratch clones, as a safety net; see the convention in the design note
+scratch/
+local/
+
+# Tooling caches, if a validation or fetch script is added later
+__pycache__/
+.venv/
+node_modules/

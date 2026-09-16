@@ -1,0 +1,10 @@
+_comment: "MFU values calibrated per Discussion #589: https://github.com/inference-sim/inference-sim/discussions/589"
+TFlopsPeak: 989.5
+TFlopsFP8: 1979.0
+BwPeakTBs: 3.35
+mfuPrefill: 0.45
+mfuDecode: 0.30
+MemoryGiB: 80.0
+_comment_interconnect: "Per-GPU EFFECTIVE unidirectional bandwidths in GB/s; only their RATIO is used, to price cross-node collective traffic (#1530). NVLink 4 (900 GB/s bidirectional => 450 unidirectional per GPU); inter-node = one 400 Gb/s ConnectX-7 per GPU on an HGX H100 (50 GB/s), the standard 8-NIC config. Ratio 9x."
+IntraNodeBwGBps: 450
+InterNodeBwGBps: 50

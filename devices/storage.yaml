@@ -1,0 +1,7 @@
+# Storage tiers for KV-cache offload. Read/write bandwidth in MB/s; base_latency in µs.
+# Split verbatim from the kv_offload_devices: section of the simulator's defaults.yaml.
+nvme_gen4: {read_bandwidth: 7.0e3, write_bandwidth: 5.0e3, base_latency: 80.0}
+nvme_gen3: {read_bandwidth: 3.5e3, write_bandwidth: 3.0e3, base_latency: 100.0}
+sata_ssd:  {read_bandwidth: 5.5e2, write_bandwidth: 5.0e2, base_latency: 150.0}
+cpu_dram:  {read_bandwidth: 2.0e4, write_bandwidth: 2.0e4, base_latency: 1.0}
+s3:        {read_bandwidth: 1.0e3, write_bandwidth: 1.0e3, base_latency: 30000.0}

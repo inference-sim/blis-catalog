@@ -1,0 +1,7 @@
+name: qwen3-14b
+source:
+  provider: huggingface
+  repo: Qwen/Qwen3-14B
+  revision: 40c069824f4251a91eefaf281ebe4c544efd3e18
+  revision_verified: true
+  retrieved: 2026-09-16
