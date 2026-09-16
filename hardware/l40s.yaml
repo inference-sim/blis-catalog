@@ -1,6 +1,6 @@
-_comment: "MFU values calibrated per Discussion #589: https://github.com/inference-sim/inference-sim/discussions/589. KNOWN DISCREPANCY (mixed sparsity conventions): TFlopsFP8=1466 is the WITH-SPARSITY figure while TFlopsPeak=362.05 is DENSE BF16 (NVIDIA L40S datasheet: FP8 733 dense / 1466 sparse; BF16 362.05 dense / 733 sparse). This gives an architecturally impossible 4.05x FP8:BF16 ratio (H100/H200 are exactly 2.0x); the dense-consistent value is 733. Migrated VERBATIM from inference-sim hardware_config.json to preserve the exact C6 round-trip; the fix belongs upstream in hardware_config.json first (it feeds the roofline model), tracked as a follow-up."
+_comment: "MFU values calibrated per Discussion #589: https://github.com/inference-sim/inference-sim/discussions/589. TFlopsFP8=733 is DENSE FP8, consistent with TFlopsPeak=362.05 being DENSE BF16 (NVIDIA L40S datasheet: FP8 733 dense / 1466 sparse; BF16 362.05 dense / 733 sparse), giving a ~2.0x dense FP8:BF16 ratio (733/362.05=2.02, the datasheet dense pair; H100/H200 are exactly 2.0x). Corrected from the migrated 1466 (the WITH-SPARSITY figure, which mixed sparsity conventions for an architecturally-impossible 4.05x ratio) per blis-catalog#2 / inference-sim#1738."
 TFlopsPeak: 362.05
-TFlopsFP8: 1466.0
+TFlopsFP8: 733.0
 BwPeakTBs: 0.864
 mfuPrefill: 0.32
 mfuDecode: 0.08
