@@ -3,5 +3,4 @@ source:
   provider: huggingface
   repo: mistralai/Mixtral-8x22B-v0.1
   revision: e1cd34ff1747406fb2277635ed25242803009bc2
-  revision_verified: true   # config.json fetched verbatim from this revision (main HEAD, 2026-09-16)
   retrieved: 2026-09-16

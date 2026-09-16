@@ -3,5 +3,4 @@ source:
   provider: huggingface
   repo: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
   revision: 77df655d5e9f8362164ed14dd8b48f8bce657498
-  revision_verified: true   # config.json fetched verbatim from this revision (main HEAD, 2026-09-16)
   retrieved: 2026-09-16

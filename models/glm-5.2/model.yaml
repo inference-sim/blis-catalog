@@ -3,5 +3,4 @@ source:
   provider: huggingface
   repo: zai-org/GLM-5.2
   revision: cf457fa734ab149ffef225f80893eb38c6ff5cdc
-  revision_verified: true   # config.json fetched verbatim from this revision (main HEAD, 2026-09-16)
   retrieved: 2026-09-16

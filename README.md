@@ -33,8 +33,14 @@ and scenario/candidate objects (introduced by a later release).
 
 ## Usage
 
-BLIS locates the catalog by `--catalog` or the `BLIS_CATALOG` environment
-variable. There is no default and no remote fetch.
+> **Status:** the catalog data exists; the simulator side that consumes it does
+> not yet. The `--catalog` flag, the `BLIS_CATALOG` environment variable, and the
+> CI load-check described below are **planned** (the R1 S-tasks in
+> `inference-sim`), not yet implemented. Today BLIS still reads its own
+> `model_configs/` via `--model-config-folder`. The interface below is the target.
+
+Once the loader lands, BLIS will locate the catalog by `--catalog` or the
+`BLIS_CATALOG` environment variable, with no default and no remote fetch:
 
 ```sh
 export BLIS_CATALOG=~/path/to/blis-catalog     # once, per shell
@@ -56,14 +62,26 @@ name: qwen3-14b
 source:
   provider: huggingface
   repo: Qwen/Qwen3-14B          # case-sensitive, as on the Hub
-  revision: <commit-sha>        # what was downloaded
-  revision_verified: true       # config.json is byte-identical to this revision
+  revision: <commit-sha>        # the exact revision the config was fetched from
   retrieved: 2026-09-16
 ```
 
-`revision_verified: false` marks an entry whose committed `config.json` could not
-be confirmed against the named upstream revision (e.g. a gated repo, or a fixture
-that predates this catalog). The repo still records where the config belongs.
+Each `config.json` was fetched **fresh and verbatim** from its `source.repo` at
+the recorded `revision` (gated repos required an authenticated token). The
+committed bytes are byte-identical to that revision, so a reviewer with access can
+reproduce the fetch and diff.
+
+## Provenance & history
+
+The models were **re-fetched from HuggingFace** rather than copied from the
+simulator's older `model_configs/` fixtures, so per-file git history from
+`inference-sim` is intentionally not carried over — the authoritative source is
+the vendor repo named in each `model.yaml`, not the prior fixture. Three configs
+(`glm-5.2-fp8`, `llama-2-7b-hf`, `llama-3.1-8b-instruct`) are therefore **fuller**
+than the hand-trimmed simulator fixtures they replace; they are the current
+upstream configs and are diffable against them. The S-task that adds the loader
+should confirm BLIS parses equivalent values for the keys it reads (R1 acceptance
+test #3, byte-identical stdout).
 
 ## Conventions
 
@@ -71,8 +89,10 @@ that predates this catalog). The repo still records where the config belongs.
   vendor and never edited, so it stays diffable against upstream
   (`.gitattributes` disables line-ending normalisation for it).
 - **The payload is YAML and JSON.** `.gitignore` deliberately ignores *nothing* by
-  extension — one forgotten whitelist and a model would silently drop out of the
+  extension, and every directory pattern is anchored to the repo root — one
+  unanchored or forgotten pattern and a model would silently drop out of the
   catalog, the failure NS-6 exists to prevent.
-- **Validation is the simulator's.** There is no separate validate command; BLIS
-  validates whatever it reads and fails naming the file and the problem. CI runs a
-  load over every catalog entry through that same code path.
+- **Validation is the simulator's (planned).** There is no separate validate
+  command by design; once the loader lands, BLIS validates whatever it reads and
+  fails naming the file and the problem, and CI runs a load over every catalog
+  entry through that same code path. That CI gate does not exist yet.

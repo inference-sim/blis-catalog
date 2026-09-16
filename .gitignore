@@ -4,19 +4,23 @@
 #   models/*/config.json   models/*/model.yaml
 #   hardware/*.yaml        workloads/*.yaml       devices/*.yaml
 
+# Directory patterns are ANCHORED with a leading slash so they match only at
+# the repo root. An unanchored `scratch/` would also match `models/scratch/`
+# and silently swallow that model — the exact NS-6 failure this file guards.
+
 # OS and editor cruft
 .DS_Store
 Thumbs.db
 *.swp
 *~
-.idea/
-.vscode/
+/.idea/
+/.vscode/
 
 # Scratch clones, as a safety net; see the convention in the design note
-scratch/
-local/
+/scratch/
+/local/
 
 # Tooling caches, if a validation or fetch script is added later
-__pycache__/
-.venv/
-node_modules/
+/__pycache__/
+/.venv/
+/node_modules/
