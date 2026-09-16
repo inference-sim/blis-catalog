@@ -83,9 +83,11 @@ are **fuller** than the hand-trimmed fixtures they replace, but carry
 byte-identical values for every field BLIS reads. This was verified through the
 real parser (`latency.GetModelConfig` produces an identical `sim.ModelConfig` for
 each catalog config vs its fixture); the only read key that differs, `llama-3.1`'s
-`rope_scaling`, is type `llama3`, which `applyRopeScaling` treats as a no-op. The
-automated regression that locks this in is tracked as a **merge dependency**:
-inference-sim#1748 (design decision recorded on PR #1).
+`rope_scaling`, is type `llama3`, which `applyRopeScaling` treats as a no-op
+(already covered permanently by `cmd/root_test.go:TestApplyRopeScaling`). A
+catalog-vs-fixture equivalence check is only meaningful until S6 removes the
+`model_configs/` fixtures; the durable post-S6 guard is a golden `sim.ModelConfig`
+keyed directly off the catalog config, added by the loader S-task.
 
 `kimi-k3` is a **separate case, not a C1 fixture** — it was absent at the
 `891facee` design baseline, so it is not one of the 13 pre-existing fixtures the
