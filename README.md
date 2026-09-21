@@ -7,13 +7,11 @@ inferred. Learned numbers (alpha/beta coefficients, LoRA cost defaults) live in
 `blis-registry`; deployment choices (GPU type, tensor-parallel degree) are stated
 on the command line, not here.
 
-This is the **data half** of release **R1** of the North Star architecture,
-toward the goal *a model runs if and only if it is in the catalog* (invariant
-NS-6). This repository provides the catalog contents (C1–C6); the simulator side
-that **reads** it — the `--catalog`/`BLIS_CATALOG` loader, strict catalog-load
-validation, and removal of run-time HuggingFace fetching (the R1 S-tasks in
-`inference-sim`) — has **landed** (#1731/#1774). BLIS resolves every model
-against the catalog at run time; the old `--model-config-folder` flag is retired.
+This is the **data half** of the North Star architecture, toward the goal *a
+model runs if and only if it is in the catalog* (invariant NS-6). This repository
+provides the catalog contents; `inference-sim` reads it via `--catalog` /
+`BLIS_CATALOG`, resolving every model against the catalog at run time with no
+remote fetch.
 
 ## Layout
 
@@ -110,5 +108,4 @@ be refit against these.
   catalog, the failure NS-6 exists to prevent.
 - **Validation is the simulator's.** There is no separate validate command by
   design: BLIS validates whatever it reads and fails naming the file and the
-  problem. A CI gate that loads *every* catalog entry through that same code path
-  is still planned; it does not exist yet.
+  problem.
