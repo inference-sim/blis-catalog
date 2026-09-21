@@ -72,11 +72,6 @@ reproduce the fetch and diff.
 
 ## Provenance & history
 
-The models were **re-fetched from HuggingFace** rather than copied from the
-simulator's older `model_configs/` fixtures, so per-file git history from
-`inference-sim` is intentionally not carried over — the authoritative source is
-the vendor repo + revision named in each `model.yaml`, not the prior fixture.
-
 **Three C1 fixtures** (`glm-5.2-fp8`, `llama-2-7b-hf`, `llama-3.1-8b-instruct`)
 are **fuller** than the hand-trimmed fixtures they replace, but carry
 byte-identical values for every field BLIS reads. This was verified through the
