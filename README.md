@@ -12,8 +12,8 @@ toward the goal *a model runs if and only if it is in the catalog* (invariant
 NS-6). This repository provides the catalog contents (C1–C6); the simulator side
 that **reads** it — the `--catalog`/`BLIS_CATALOG` loader, strict catalog-load
 validation, and removal of run-time HuggingFace fetching (the R1 S-tasks in
-`inference-sim`) — is **not yet implemented**. Until it lands, BLIS still reads
-its own bundled `model_configs/`; nothing consumes this catalog at run time yet.
+`inference-sim`) — has **landed** (#1731/#1774). BLIS resolves every model
+against the catalog at run time; the old `--model-config-folder` flag is retired.
 
 ## Layout
 
@@ -37,19 +37,19 @@ and scenario/candidate objects (introduced by a later release).
 
 ## Usage
 
-> **Status:** the catalog data exists; the simulator side that consumes it does
-> not yet. The `--catalog` flag, the `BLIS_CATALOG` environment variable, and the
-> CI load-check described below are **planned** (the R1 S-tasks in
-> `inference-sim`), not yet implemented. Today BLIS still reads its own
-> `model_configs/` via `--model-config-folder`. The interface below is the target.
-
-Once the loader lands, BLIS will locate the catalog by `--catalog` or the
-`BLIS_CATALOG` environment variable, with no default and no remote fetch:
+BLIS locates the catalog by `--catalog` or the `BLIS_CATALOG` environment
+variable, with no default and no remote fetch (the flag wins when both are set):
 
 ```sh
 export BLIS_CATALOG=~/path/to/blis-catalog     # once, per shell
-blis run --model glm-5.2 --hardware H100 --tp 8
+blis run --model qwen3-14b --hardware H100 --tp 2
 ```
+
+`--hardware` and `--tp` are the deployment choice; the run is refused if the
+model does not fit. A large bf16 MoE such as `glm-5.2` (~1.4 TiB of weights) does
+not fit on 8×H100 by tensor-parallelism alone — run the FP8 sibling entry
+(`--model glm-5.2-fp8 --tp 16`, half the bytes/param) or add expert parallelism
+(`--model glm-5.2 --tp 8 --dp 4 --enable-expert-parallel`) instead.
 
 To experiment with a hypothetical model shape, clone the catalog, edit a
 `config.json`, and point `BLIS_CATALOG` at the clone — no fork of the simulator,
@@ -111,7 +111,7 @@ be refit against these.
   extension, and every directory pattern is anchored to the repo root — one
   unanchored or forgotten pattern and a model would silently drop out of the
   catalog, the failure NS-6 exists to prevent.
-- **Validation is the simulator's (planned).** There is no separate validate
-  command by design; once the loader lands, BLIS validates whatever it reads and
-  fails naming the file and the problem, and CI runs a load over every catalog
-  entry through that same code path. That CI gate does not exist yet.
+- **Validation is the simulator's.** There is no separate validate command by
+  design: BLIS validates whatever it reads and fails naming the file and the
+  problem. A CI gate that loads *every* catalog entry through that same code path
+  is still planned; it does not exist yet.
