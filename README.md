@@ -41,16 +41,12 @@ BLIS locates the catalog by `--catalog` or the `BLIS_CATALOG` environment
 variable, with no default and no remote fetch (the flag wins when both are set):
 
 ```sh
-export BLIS_CATALOG=~/path/to/blis-catalog     # once, per shell
-blis run --model qwen3-14b --hardware H100 --tp 2
+export BLIS_CATALOG=~/path/to/blis-catalog     # point BLIS at this clone
 ```
 
-`--hardware` and `--tp` are the deployment choice; the run is refused if the
-model does not fit. A large bf16 MoE such as `glm-5.2` (~1.4 TiB of weights)
-does not fit on 8×H100 by tensor-parallelism alone — run the FP8 sibling entry
-(`--model glm-5.2-fp8 --tp 16`, half the bytes/param) or add expert parallelism
-(`--model glm-5.2 --tp 8 --dp 4 --enable-expert-parallel`, which spreads the
-routed experts across the TP×DP group) instead.
+The deployment (GPU type, tensor-parallel degree, and the rest) is stated on the
+command line, not here. For how to run a simulation, see the examples in
+[inference-sim](https://github.com/inference-sim/inference-sim).
 
 To experiment with a hypothetical model shape, clone the catalog, edit a
 `config.json`, and point `BLIS_CATALOG` at the clone — no fork of the simulator,
