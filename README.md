@@ -46,7 +46,7 @@ blis run --model qwen3-14b --hardware H100 --tp 2
 ```
 
 `--hardware` and `--tp` are the deployment choice; the run is refused if the
-model does not fit. A large bf16 MoE such as `glm-5.2` (~1.36 TiB of weights)
+model does not fit. A large bf16 MoE such as `glm-5.2` (~1.4 TiB of weights)
 does not fit on 8×H100 by tensor-parallelism alone — run the FP8 sibling entry
 (`--model glm-5.2-fp8 --tp 16`, half the bytes/param) or add expert parallelism
 (`--model glm-5.2 --tp 8 --dp 4 --enable-expert-parallel`, which spreads the
