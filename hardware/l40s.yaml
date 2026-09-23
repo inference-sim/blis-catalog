@@ -1,10 +1,7 @@
-_comment: "MFU values calibrated per Discussion #589: https://github.com/inference-sim/inference-sim/discussions/589. TFlopsFP8=733 is DENSE FP8, consistent with TFlopsPeak=362.05 being DENSE BF16 (NVIDIA L40S datasheet: FP8 733 dense / 1466 sparse; BF16 362.05 dense / 733 sparse), giving a ~2.0x dense FP8:BF16 ratio (733/362.05=2.02, the datasheet dense pair; H100/H200 are exactly 2.0x). Corrected from the migrated 1466 (the WITH-SPARSITY figure, which mixed sparsity conventions for an architecturally-impossible 4.05x ratio) per blis-catalog#2 / inference-sim#1738."
+_comment: "TFlopsFP8=733 is DENSE FP8, consistent with TFlopsPeak=362.05 being DENSE BF16 (NVIDIA L40S datasheet: FP8 733 dense / 1466 sparse; BF16 362.05 dense / 733 sparse), giving a ~2.0x dense FP8:BF16 ratio (733/362.05=2.02, the datasheet dense pair; H100/H200 are exactly 2.0x). Corrected from the migrated 1466 (the WITH-SPARSITY figure, which mixed sparsity conventions for an architecturally-impossible 4.05x ratio) per blis-catalog#2 / inference-sim#1738."
 TFlopsPeak: 362.05
 TFlopsFP8: 733.0
 BwPeakTBs: 0.864
-mfuPrefill: 0.32
-mfuDecode: 0.08
 MemoryGiB: 48.0
-_comment_interconnect: "Per-GPU EFFECTIVE unidirectional bandwidths in GB/s; only their RATIO is used, to price cross-node collective traffic (#1530). No NVLink: peer-to-peer runs over PCIe Gen4 x16 (~32 GB/s per direction); inter-node = one 100 GbE port per GPU (12.5 GB/s). Ratio 2.6x — a PCIe node is far less penalized by spanning than an NVLink node, because its on-node link is already slow."
+_comment_interconnect: "IntraNodeBwGBps is the on-package link as a per-GPU EFFECTIVE unidirectional bandwidth in GB/s: no NVLink, so peer-to-peer runs over PCIe Gen4 x16 (~32 GB/s per direction). The inter-node fabric figure and the intra:inter ratio it feeds (#1530) now live with the Network object (networks/l40s-100gbe.yaml)."
 IntraNodeBwGBps: 32
-InterNodeBwGBps: 12.5

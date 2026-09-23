@@ -1,0 +1,2 @@
+_comment_interconnect: "InterNodeBwGBps is a per-GPU EFFECTIVE unidirectional inter-node fabric bandwidth in GB/s; paired with a chip's on-node IntraNodeBwGBps, only their RATIO is used, to price cross-node collective traffic (#1530). Fabric: one HDR 200 Gb/s InfiniBand port per GPU on an HGX A100 => 25 GB/s. Against the A100's 300 GB/s on-node NVLink 3 this is a 12x intra:inter ratio. Shared by A100-SXM and its A100-80 alias (same interconnect)."
+InterNodeBwGBps: 25

@@ -1,10 +1,7 @@
-_comment: "Alias for A100-SXM — defaults.yaml uses A100-80 for all A100 model entries (BC-14). MFU values calibrated per Discussion #589: https://github.com/inference-sim/inference-sim/discussions/589"
+_comment: "Alias for A100-SXM — defaults.yaml uses A100-80 for all A100 model entries (BC-14)."
 TFlopsPeak: 312
 TFlopsFP8: 0
 BwPeakTBs: 2.039
-mfuPrefill: 0.38
-mfuDecode: 0.18
 MemoryGiB: 80.0
-_comment_interconnect: "Per-GPU EFFECTIVE unidirectional bandwidths in GB/s; only their RATIO is used, to price cross-node collective traffic (#1530). Alias of A100-SXM; same interconnect. Ratio 12x."
+_comment_interconnect: "IntraNodeBwGBps is the on-package NVLink 3 link as a per-GPU EFFECTIVE unidirectional bandwidth in GB/s (alias of A100-SXM; same interconnect). The inter-node fabric figure and the intra:inter ratio it feeds (#1530) now live with the Network object (networks/hgx-a100-hdr-200g.yaml)."
 IntraNodeBwGBps: 300
-InterNodeBwGBps: 25

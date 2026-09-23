@@ -1,0 +1,2 @@
+_comment_interconnect: "InterNodeBwGBps is a per-GPU EFFECTIVE unidirectional inter-node fabric bandwidth in GB/s; paired with a chip's on-node IntraNodeBwGBps, only their RATIO is used, to price cross-node collective traffic (#1530). Fabric: one 400 Gb/s ConnectX-7 NIC per GPU (1:1 GPU:NIC rail) on the standard 8-NIC HGX H100 / HGX H200 config => 50 GB/s. Same NVLink 4 + ConnectX-7 fabric across HGX H100 and HGX H200. Against those chips' 450 GB/s on-node NVLink 4 this is a 9x intra:inter ratio. This is the one fabric BLIS has calibration from."
+InterNodeBwGBps: 50
