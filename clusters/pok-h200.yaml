@@ -1,0 +1,5 @@
+# POK HGX H200 pool.
+hardware: h200
+network: ib-400g
+provenance: deployment
+_comment: "H200 chips on the same InfiniBand NDR 400G fabric as pok-h100 — HGX H200 shares the H100 NVLink 4 + ConnectX-7 fabric (same fabric class, different chip). Derived intra:inter ratio for #1530 = 450 (NVLink 4, nominal) : 50 (ib-400g, nominal) = 9x."

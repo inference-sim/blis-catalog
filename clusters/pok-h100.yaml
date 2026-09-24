@@ -1,0 +1,5 @@
+# POK HGX H100 pool.
+hardware: h100
+network: ib-400g
+provenance: deployment
+_comment: "H100 chips on the InfiniBand NDR 400G fabric (8-NIC HGX config). This is the deployment BLIS's latency coefficients (alpha/beta) were fit on — that calibration is a blis-registry fact, not a catalog one; nothing measured lives here. Derived intra:inter ratio for #1530 = 450 (NVLink 4, nominal) : 50 (ib-400g, nominal) = 9x."

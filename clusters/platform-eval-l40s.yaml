@@ -1,0 +1,5 @@
+# platform-eval L40S cluster.
+hardware: l40s
+network: ethernet-100gbe
+provenance: deployment
+_comment: "L40S chips on a plain 100 GbE Ethernet fabric (TCP, no RDMA) — IBM Cloud gx3-48x240x2l40s. Derived intra:inter ratio for #1530 = 32 (PCIe Gen4 x16, no NVLink, nominal) : 12.5 (ethernet-100gbe, nominal) = 2.6x — a PCIe node is far less penalized by spanning than an NVLink node, its on-node link already being slow."
