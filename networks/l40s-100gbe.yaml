@@ -1,2 +1,0 @@
-_comment_interconnect: "InterNodeBwGBps is a per-GPU EFFECTIVE unidirectional inter-node fabric bandwidth in GB/s; paired with a chip's on-node IntraNodeBwGBps, only their RATIO is used, to price cross-node collective traffic (#1530). Fabric: one 100 GbE port per GPU => 12.5 GB/s. Against the L40S's 32 GB/s on-node PCIe Gen4 x16 link this is a 2.6x intra:inter ratio — a PCIe node is far less penalized by spanning than an NVLink node, because its on-node link is already slow."
-InterNodeBwGBps: 12.5

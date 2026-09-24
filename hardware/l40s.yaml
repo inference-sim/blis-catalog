@@ -3,5 +3,5 @@ TFlopsPeak: 362.05
 TFlopsFP8: 733.0
 BwPeakTBs: 0.864
 MemoryGiB: 48.0
-_comment_interconnect: "IntraNodeBwGBps is the on-package link as a per-GPU EFFECTIVE unidirectional bandwidth in GB/s: no NVLink, so peer-to-peer runs over PCIe Gen4 x16 (~32 GB/s per direction). The inter-node fabric figure and the intra:inter ratio it feeds (#1530) now live with the Network object (networks/l40s-100gbe.yaml)."
+_comment_interconnect: "IntraNodeBwGBps is the on-package link as a per-GPU EFFECTIVE unidirectional bandwidth in GB/s: no NVLink, so peer-to-peer runs over PCIe Gen4 x16 (~32 GB/s per direction). The inter-node fabric figure and the intra:inter ratio it feeds (#1530) now live with the Network object (networks/platform-eval-100gbe.yaml)."
 IntraNodeBwGBps: 32

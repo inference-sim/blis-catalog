@@ -24,7 +24,7 @@ blis-catalog/
 ├── hardware/                   # WHAT A CHIP CAN DO — one file per GPU (vendor specs only)
 │   ├── h100.yaml  h200.yaml  a100-sxm.yaml  a100-80.yaml  l40s.yaml
 ├── networks/                   # WHAT AN INTER-NODE FABRIC CAN DO — one file per cluster network
-│   ├── pok-ib-400g.yaml  hgx-a100-hdr-200g.yaml  l40s-100gbe.yaml
+│   ├── pok-ib-400g.yaml  vllm-d-roce-200g.yaml  platform-eval-100gbe.yaml
 ├── workloads/                  # WHAT TRAFFIC LOOKS LIKE
 │   ├── chatbot.yaml  summarization.yaml  contentgen.yaml  multidoc.yaml
 └── devices/                    # WHAT A STORAGE TIER CAN DO

@@ -1,0 +1,2 @@
+_comment_interconnect: "InterNodeBwGBps is a per-GPU EFFECTIVE unidirectional inter-node fabric bandwidth in GB/s; paired with a chip's on-node IntraNodeBwGBps, only their RATIO is used, to price cross-node collective traffic (#1530). Fabric: one 200 Gb/s ConnectX RoCE (GPUDirect) port per GPU on the vllm-d A100 cluster (IBM Cloud gx2-80x1280x8a100-il-rdma, 8x NVIDIA-A100-SXM4-80GB per node) => 25 GB/s. Against the A100's 300 GB/s on-node NVLink 3 this is a 12x intra:inter ratio. Shared by A100-SXM and its A100-80 alias (same interconnect)."
+InterNodeBwGBps: 25
