@@ -3,5 +3,5 @@ TFlopsPeak: 312
 TFlopsFP8: 0
 BwPeakTBs: 2.039
 MemoryGiB: 80.0
-_comment_interconnect: "IntraNodeBwGBps is the on-package NVLink 3 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s (alias of A100-SXM; same interconnect). vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/roce-200g.yaml), bound to this chip per deployment by a Cluster (clusters/)."
+_comment_interconnect: "IntraNodeBwGBps is the on-package NVLink 3 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s (alias of A100-SXM; same interconnect). vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/roce-200g.yaml), paired with this chip per deployment (a cluster/pool concept, #1662)."
 IntraNodeBwGBps: 300

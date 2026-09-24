@@ -1,5 +1,0 @@
-# vllm-d A100 disaggregated cluster.
-hardware: a100-80
-network: roce-200g
-provenance: deployment
-_comment: "A100-SXM-80GB chips on a 200 Gb/s RoCE (GPUDirect) Ethernet fabric — IBM Cloud gx2-80x1280x8a100-il-rdma, 8x A100-SXM4-80GB per node. Uses the a100-80 hardware alias (defaults.yaml selects A100-80 for A100 entries, BC-14; same die as a100-sxm). Derived intra:inter ratio for #1530 = 300 (NVLink 3, nominal) : 25 (roce-200g, nominal) = 12x."

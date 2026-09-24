@@ -3,5 +3,5 @@ TFlopsPeak: 989.5
 TFlopsFP8: 1979.0
 BwPeakTBs: 4.8
 MemoryGiB: 141.0
-_comment_interconnect: "IntraNodeBwGBps is the on-package NVLink 4 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s: 900 GB/s bidirectional per GPU (NVIDIA H200 datasheet) => 450 unidirectional. vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/ib-400g.yaml), bound to this chip per deployment by a Cluster (clusters/)."
+_comment_interconnect: "IntraNodeBwGBps is the on-package NVLink 4 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s: 900 GB/s bidirectional per GPU (NVIDIA H200 datasheet) => 450 unidirectional. vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/ib-400g.yaml), paired with this chip per deployment (a cluster/pool concept, #1662)."
 IntraNodeBwGBps: 450

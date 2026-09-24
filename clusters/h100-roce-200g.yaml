@@ -1,5 +1,0 @@
-# H100-on-RoCE pool — ILLUSTRATIVE (not a measured deployment).
-hardware: h100
-network: roce-200g
-provenance: hypothetical
-_comment: "The SAME H100 chip as pok-h100, but on the roce-200g fabric instead of ib-400g — the exact scenario inference-sim#1662 targets: one GPU die referenced by two Clusters on two fabrics, so cross-node collective and PD-transfer cost differ by cluster (pok-h100: 50 GB/s nominal; here: 25). Exists to exercise that a fabric is a cluster property, not a die property; it carries no calibration of its own (provenance: hypothetical). Derived intra:inter ratio for #1530 = 450 (NVLink 4, nominal) : 25 (roce-200g, nominal) = 18x, vs 9x for pok-h100 — same chip, different cost."
