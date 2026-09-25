@@ -1,4 +1,5 @@
 _comment: "Alias for A100-SXM — defaults.yaml uses A100-80 for all A100 model entries (BC-14)."
+Provenance: vendor_spec
 TFlopsPeak: 312
 TFlopsFP8: 0
 BwPeakTBs: 2.039

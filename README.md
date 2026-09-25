@@ -87,12 +87,13 @@ defined once here and paired with a chip per deployment. (The **Cluster** object
 that would bind one chip to one fabric is deferred; this change focuses on
 getting the fabric classes themselves right.)
 
-**Provenance, and the catalog/registry line.** Every fabric bandwidth here is
-`Provenance: vendor_spec` — a **nominal** datasheet figure (a NIC line rate ÷ 8,
-or NVLink bidirectional ÷ 2), **not a measurement**. Real payload throughput
-runs below nominal; the *measured overhead/correction factor* (effective ÷
-nominal) is a per-deployment number and lives in `blis-registry`, not here. That
-is what keeps "nothing measured or fitted" true of this repo.
+**Provenance, and the catalog/registry line.** Both `hardware/` chips and
+`networks/` fabrics carry a structured `Provenance: vendor_spec` field: every
+quantity here is a **nominal** datasheet figure (a NIC line rate ÷ 8, or NVLink
+bidirectional ÷ 2), **not a measurement**. Real payload throughput runs below
+nominal; the *measured overhead/correction factor* (effective ÷ nominal) is a
+per-deployment number and lives in `blis-registry`, not here. That is what keeps
+"nothing measured or fitted" true of this repo.
 
 - **PD KV-transfer** rides the fabric: its transfer bandwidth **is** that
   fabric's nominal `InterNodeBwGBps` (there is no separate figure), so different
