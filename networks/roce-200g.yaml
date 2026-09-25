@@ -1,7 +1,7 @@
 # RoCE (RDMA over Converged Ethernet, 200 Gb/s) — reusable inter-node fabric CLASS.
 # Per inference-sim#1662 a fabric is a property of the cluster/pool, not of the
 # GPU die, so it is defined once here and paired with a chip per deployment.
-provenance: vendor_spec
+Provenance: vendor_spec
 InterNodeBwGBps: 25
 PDTransferBaseLatencyMs: 0
 _comment_interconnect: "RoCE (GPUDirect RDMA over Converged Ethernet): one 200 Gb/s ConnectX RoCE port per GPU. InterNodeBwGBps is the NOMINAL datasheet figure — 200 Gb/s / 8 = 25 GB/s per GPU, per direction — NOT a measurement; real RDMA payload throughput runs below nominal (inference-sim#1632). The measured overhead/correction factor (effective / nominal) is a per-deployment number and lives in blis-registry, not in the catalog. Paired with a chip's on-node IntraNodeBwGBps, only the RATIO prices cross-node collective traffic (#1530); that ratio is a per-deployment (chip + fabric) quantity, resolved wherever a chip and fabric are paired."

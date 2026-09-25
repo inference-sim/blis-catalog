@@ -88,7 +88,7 @@ that would bind one chip to one fabric is deferred; this change focuses on
 getting the fabric classes themselves right.)
 
 **Provenance, and the catalog/registry line.** Every fabric bandwidth here is
-`provenance: vendor_spec` — a **nominal** datasheet figure (a NIC line rate ÷ 8,
+`Provenance: vendor_spec` — a **nominal** datasheet figure (a NIC line rate ÷ 8,
 or NVLink bidirectional ÷ 2), **not a measurement**. Real payload throughput
 runs below nominal; the *measured overhead/correction factor* (effective ÷
 nominal) is a per-deployment number and lives in `blis-registry`, not here. That
