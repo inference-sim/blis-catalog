@@ -97,7 +97,7 @@ is what keeps "nothing measured or fitted" true of this repo.
 - **PD KV-transfer** rides the fabric: its transfer bandwidth **is** that
   fabric's nominal `InterNodeBwGBps` (there is no separate figure), so different
   fabrics disaggregate at different cost. The fabric's
-  `pd_transfer_base_latency_ms` is `0` (the catalog declares no inherent base
+  `PDTransferBaseLatencyMs` is `0` (the catalog declares no inherent base
   latency); the `0.05 ms` `--pd-transfer-base-latency` default is a modeling
   placeholder that belongs in `blis-registry`. The `--pd-transfer-*` CLI flags
   remain overrides, so a run that resolves no fabric is byte-identical.
