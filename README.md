@@ -1,11 +1,13 @@
 # blis-catalog
 
 The authoritative catalog for [BLIS](https://github.com/inference-sim/inference-sim):
-models, hardware, networks, workload types, and storage devices. Everything here is a
-**declared fact** that a person wrote down — nothing is learned, fitted, or
-inferred. Learned numbers (alpha/beta coefficients, LoRA cost defaults, per-GPU
-MFU prefill/decode estimates) live in `blis-registry`; deployment choices (GPU
-type, tensor-parallel degree) are stated on the command line, not here.
+models, hardware, networks, workload types, and storage devices.
+Everything here is a **declared fact** that a person wrote down — a datasheet or
+vendor spec — nothing is learned, fitted, measured, or inferred. Learned and
+measured numbers (alpha/beta coefficients, LoRA cost defaults, per-GPU MFU
+prefill/decode estimates, measured fabric-overhead corrections, PD-transfer
+estimates) live in `blis-registry`; deployment choices (GPU type,
+tensor-parallel degree) are stated on the command line, not here.
 
 This is the **data half** of the North Star architecture, toward the goal *a
 model runs if and only if it is in the catalog* (invariant NS-6). This repository
@@ -23,17 +25,19 @@ blis-catalog/
 │       └── model.yaml          # identity + provenance (name, source repo/revision)
 ├── hardware/                   # WHAT A CHIP CAN DO — one file per GPU (vendor specs only)
 │   ├── h100.yaml  h200.yaml  a100-sxm.yaml  a100-80.yaml  l40s.yaml
-├── networks/                   # WHAT AN INTER-NODE FABRIC CAN DO — one file per cluster network
-│   ├── pok-ib-400g.yaml  vllm-d-roce-200g.yaml  platform-eval-100gbe.yaml
+├── networks/                   # WHAT AN INTER-NODE FABRIC CAN DO — one file per reusable fabric class
+│   ├── ib-400g.yaml  roce-200g.yaml  ethernet-100gbe.yaml
 ├── workloads/                  # WHAT TRAFFIC LOOKS LIKE
 │   ├── chatbot.yaml  summarization.yaml  contentgen.yaml  multidoc.yaml
 └── devices/                    # WHAT A STORAGE TIER CAN DO
     └── storage.yaml            # nvme_gen4, nvme_gen3, sata_ssd, cpu_dram, s3
 ```
 
-Three things are deliberately **absent**: GPU type and tensor-parallel degree
+A few things are deliberately **absent**: GPU type and tensor-parallel degree
 (deployment choices, stated on the CLI), learned coefficients (`blis-registry`),
-and scenario/candidate objects (introduced by a later release).
+Cluster objects that bind a chip to a fabric (deferred — this change focuses on
+the fabric classes themselves; see Networks below), and scenario/candidate
+objects (introduced by a later release).
 
 ## Usage
 
@@ -71,6 +75,33 @@ Each `config.json` was fetched **fresh and verbatim** from its `source.repo` at
 the recorded `revision` (gated repos required an authenticated token). The
 committed bytes are byte-identical to that revision, so a reviewer with access can
 reproduce the fetch and diff.
+
+## Networks
+
+A **Network** is a *reusable fabric class* — `ib-400g`, `roce-200g`,
+`ethernet-100gbe` — describing an inter-node fabric, not one specific pool. Per
+[inference-sim#1662](https://github.com/inference-sim/inference-sim/issues/1662)
+a fabric is a property of the *cluster/pool*, not of the GPU die: two H100 pools
+can legitimately differ (InfiniBand vs RoCE vs a 100 GbE uplink), so a fabric is
+defined once here and paired with a chip per deployment. (The **Cluster** object
+that would bind one chip to one fabric is deferred; this change focuses on
+getting the fabric classes themselves right.)
+
+**Provenance, and the catalog/registry line.** Both `hardware/` chips and
+`networks/` fabrics carry a structured `Provenance: vendor_spec` field: every
+quantity here is a **nominal** datasheet figure (a NIC line rate ÷ 8, or NVLink
+bidirectional ÷ 2), **not a measurement**. Real payload throughput runs below
+nominal; the *measured overhead/correction factor* (effective ÷ nominal) is a
+per-deployment number and lives in `blis-registry`, not here. That is what keeps
+"nothing measured or fitted" true of this repo.
+
+- **PD KV-transfer** rides the fabric: its transfer bandwidth **is** that
+  fabric's nominal `InterNodeBwGBps` (there is no separate figure), so different
+  fabrics disaggregate at different cost. The fabric's
+  `PDTransferBaseLatencyMs` is `0` (the catalog declares no inherent base
+  latency); the `0.05 ms` `--pd-transfer-base-latency` default is a modeling
+  placeholder that belongs in `blis-registry`. The `--pd-transfer-*` CLI flags
+  remain overrides, so a run that resolves no fabric is byte-identical.
 
 ## Conventions
 
