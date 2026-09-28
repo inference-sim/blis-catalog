@@ -1,0 +1,5 @@
+# Dev/CI dependencies for the catalog structural gate (scripts/validate_catalog.py
+# and its tests). The catalog payload itself is plain YAML/JSON and needs nothing
+# installed to be read; these are only for validation in CI.
+PyYAML>=6.0
+pytest>=7.4

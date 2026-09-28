@@ -88,12 +88,36 @@ that would bind one chip to one fabric is deferred; this change focuses on
 getting the fabric classes themselves right.)
 
 **Provenance, and the catalog/registry line.** Both `hardware/` chips and
-`networks/` fabrics carry a structured `Provenance: vendor_spec` field: every
-quantity here is a **nominal** datasheet figure (a NIC line rate ÷ 8, or NVLink
-bidirectional ÷ 2), **not a measurement**. Real payload throughput runs below
-nominal; the *measured overhead/correction factor* (effective ÷ nominal) is a
-per-deployment number and lives in `blis-registry`, not here. That is what keeps
-"nothing measured or fitted" true of this repo.
+`networks/` fabrics carry a structured `Provenance` field: every quantity here is
+a **nominal** datasheet figure (a NIC line rate ÷ 8, or NVLink bidirectional ÷ 2),
+**not a measurement**. Real payload throughput runs below nominal; the *measured
+overhead/correction factor* (effective ÷ nominal) is a per-deployment number and
+lives in `blis-registry`, not here. That is what keeps "nothing measured or
+fitted" true of this repo.
+
+The allowed set of `Provenance` values is **open** — it admits any *declared*
+(non-measured, non-fitted) provenance, and the [catalog CI gate](#validation)
+validates membership so a typo (`vendor-spec`) or a measured value (`measured`)
+fails at authorship:
+
+- **`vendor_spec`** — a nominal figure taken from a vendor datasheet, including
+  the datasheet's own unit normalisations (a bidirectional figure read per-GPU
+  per-direction, a dense/sparse selection). Every entry in the catalog today is
+  `vendor_spec`.
+- **`derived`** — reserved for a figure *computed* by the catalog from spec(s) via
+  an arithmetic step the datasheet does not itself state — still declared, still
+  non-measured. No entry uses it yet; it is defined and validated so it can be
+  adopted later without a schema change. (Measured or fitted numbers never join
+  this set — they live in `blis-registry`.)
+
+`Provenance` is recorded **per file**, not per field. A finer per-field tag would
+let a file that mixes a stated figure (`TFlopsPeak`) with a computed one distinguish
+them, but per-field tagging is a strictly *additive* refinement that changes no
+value and would alter the single-key contract the strict hardware loader reads
+([inference-sim#1831](https://github.com/inference-sim/inference-sim/issues/1831));
+because every current figure is `vendor_spec`, a file-level tag loses nothing
+today, and the open, validated enum is what lets per-field land later without a
+value change.
 
 - **PD KV-transfer** rides the fabric: its transfer bandwidth **is** that
   fabric's nominal `InterNodeBwGBps` (there is no separate figure), so different
@@ -112,6 +136,45 @@ per-deployment number and lives in `blis-registry`, not here. That is what keeps
   extension, and every directory pattern is anchored to the repo root — one
   unanchored or forgotten pattern and a model would silently drop out of the
   catalog, the failure NS-6 exists to prevent.
-- **Validation is the simulator's.** There is no separate validate command by
-  design: BLIS validates whatever it reads and fails naming the file and the
-  problem.
+- **Two layers of validation.** The catalog has its own [structural CI
+  gate](#validation) so a malformed entry fails *here*; the simulator additionally
+  validates the *semantics* of whatever it loads at run time, failing naming the
+  file and the problem.
+
+## Validation
+
+A malformed or incomplete entry used to be caught only in a downstream `blis run`,
+in the wrong repository. Two complementary gates now cover it, and neither
+re-implements the other's checks:
+
+- **Catalog-side (this repo, `scripts/validate_catalog.py`, run in CI).** The
+  **structural / schema** gate. It validates every committed entry across all
+  namespaces (`models/`, `hardware/`, `networks/`, `workloads/`, `devices/`) and
+  fails CI naming the file and the key when an entry is malformed:
+  - every file parses, and each model pairs a non-empty `config.json` with a
+    `model.yaml` whose `name` matches its directory and whose `source` records
+    `provider` / `repo` / `revision`;
+  - **`hardware/` carries only dimensioned physical quantities** — every value
+    field's name must carry a datasheet **unit** (`TFlops`, `TB/s`, `GiB`,
+    `GB/s`, …). The check tests the field's *units*, not a fixed list of names,
+    so a learned utilisation / MFU-like factor (dimensionless) is rejected even
+    if nobody has seen that field before — keeping "nothing here is learned or
+    fitted" load-bearing rather than aspirational;
+  - **`networks/` fabric classes** carry their required fields
+    (`InterNodeBwGBps`, `Provenance`, `PDTransferBaseLatencyMs`), a **positive**
+    `InterNodeBwGBps`, and a `Provenance` drawn from the allowed enum;
+  - `workloads/` and `devices/` entries carry their required numeric fields with
+    sane bounds (token min ≤ max; positive bandwidths).
+- **Simulator-side ([inference-sim#1750](https://github.com/inference-sim/inference-sim/issues/1750)).**
+  The **loader-semantics** gate: it loads every catalog entry through the *real
+  simulator loader* (the `blis run` code path), catching anything the loader's
+  semantics reject. Structural facts live here in the repo that owns the data;
+  loader-semantics live in `inference-sim`.
+
+To run the catalog gate locally:
+
+```sh
+pip install -r requirements-dev.txt
+python3 scripts/validate_catalog.py    # validates this checkout; exits non-zero on any problem
+python3 -m pytest tests/               # exercises the gate's own good/bad fixtures
+```
