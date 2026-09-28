@@ -350,12 +350,23 @@ def test_coerce_number_rejects_non_finite():
     assert vc._coerce_number("7.0e3") == 7000.0  # the real-data coercion still works
 
 
-def test_hardware_numeric_underscore_key_is_flagged(good_catalog):
+@pytest.mark.parametrize("value", [0.85, "0.85"])
+def test_hardware_non_comment_underscore_key_is_flagged(good_catalog, value):
+    # a dimensionless factor hiding under an underscore — numeric OR string-numeric.
+    # Only `_comment*` is exempt; every other underscore key is a data field.
     hw = good_catalog / "hardware/h100.yaml"
     data = yaml.safe_load(hw.read_text())
-    data["_mfu"] = 0.85  # a dimensionless factor hiding under an underscore
+    data["_mfu"] = value
     _write_yaml(hw, data)
     _assert_flags(good_catalog, substrings=["hardware/h100.yaml", "_mfu"])
+
+
+def test_hardware_non_string_comment_value_is_flagged(good_catalog):
+    hw = good_catalog / "hardware/h100.yaml"
+    data = yaml.safe_load(hw.read_text())
+    data["_comment_bad"] = 5  # a _comment* key must be prose (a string)
+    _write_yaml(hw, data)
+    _assert_flags(good_catalog, substrings=["hardware/h100.yaml", "_comment_bad"])
 
 
 def test_hardware_structured_underscore_key_is_flagged(good_catalog):

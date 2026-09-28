@@ -252,16 +252,17 @@ def validate_hardware(hardware_dir: Path, root: Path) -> list[str]:
         if "Provenance" not in data:
             errors.append(f"{_rel(path, root)}: Provenance: required field is missing")
         for key, val in data.items():
-            if key.startswith("_"):
-                # `_comment*` keys are free-form PROSE and exempt — but only when
-                # the value is a string. A numeric or structured value under an
-                # underscore is not a comment; it must not slip past the units
-                # check (a hidden `_mfu: 0.85` would otherwise pass).
+            if key.startswith("_comment"):
+                # `_comment*` is the catalog's documented free-form PROSE
+                # convention (`_comment`, `_comment_interconnect`, …); it must be a
+                # string. EVERY other key — including any other underscore-prefixed
+                # key — is treated as a data field and validated below, so a
+                # dimensionless value cannot hide under an underscore (a `_mfu`,
+                # numeric or string, still fails the units check).
                 if not isinstance(val, str):
                     errors.append(
-                        f"{_rel(path, root)}: {key}: an underscore-prefixed key is a prose "
-                        f"comment and must have a string value; a non-string here bypasses "
-                        f"the units check"
+                        f"{_rel(path, root)}: {key}: a _comment* key is a prose comment and "
+                        f"must have a string value"
                     )
                 continue
             if key == "Provenance":
