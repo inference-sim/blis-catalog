@@ -399,6 +399,51 @@ def test_field_has_unit_rejects_midword_lookalikes(name):
     assert not vc.field_has_unit(name)
 
 
-@pytest.mark.parametrize("name", ["MemoryGB", "PeakTBps", "ClockMHz", "TdpMilliWatts"])
+@pytest.mark.parametrize("name", ["MemoryGB", "PeakTBps", "ClockMHz", "TdpMilliWatts",
+                                  "GFlopsPeak", "PFlopsPeak"])
 def test_field_has_unit_accepts_more_suffixes(name):
     assert vc.field_has_unit(name)
+
+
+# --- compute-token hole (susiejojo review on blis-catalog#11) --------------- #
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["FlopsUtilization", "PeakFlopsRatio", "FlopsEfficiency", "mfuFlops",
+     "TFlopsRatio", "TFlopsUtilisation", "BwPeakTBsRatio", "MemoryGiBFraction"],
+)
+def test_field_has_unit_rejects_flops_and_unit_ratios(name):
+    # bare/mid-word Flops without a scale prefix, and any name carrying a
+    # dimensionless descriptor even with a real unit token, must be rejected.
+    assert not vc.field_has_unit(name)
+
+
+def test_hardware_flops_utilisation_field_is_flagged(good_catalog):
+    hw = good_catalog / "hardware/h100.yaml"
+    data = yaml.safe_load(hw.read_text())
+    data["FlopsUtilization"] = 0.85  # a learned utilisation carrying "Flops"
+    _write_yaml(hw, data)
+    _assert_flags(good_catalog, substrings=["hardware/h100.yaml", "FlopsUtilization", "dimensionless"])
+
+
+# --- networks closed schema (susiejojo review on blis-catalog#11) ----------- #
+
+
+def test_networks_unknown_field_is_flagged(good_catalog):
+    net = good_catalog / "networks/ib-400g.yaml"
+    data = yaml.safe_load(net.read_text())
+    data["DerateFactor"] = 0.85  # a fitted correction has no place in the catalog
+    _write_yaml(net, data)
+    _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "DerateFactor", "unknown field"])
+
+
+def test_networks_comment_key_allowed_but_must_be_string(good_catalog):
+    net = good_catalog / "networks/ib-400g.yaml"
+    data = yaml.safe_load(net.read_text())
+    data["_comment_note"] = "prose is fine"
+    _write_yaml(net, data)
+    assert vc.validate_catalog(good_catalog) == []
+    data["_comment_note"] = 5  # a numeric _comment is not prose
+    _write_yaml(net, data)
+    _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "_comment_note"])

@@ -73,12 +73,15 @@ PROVENANCE_ENUM = ("vendor_spec", "derived")
 # measured, or inferred" load-bearing: a learned utilisation cannot drift back
 # in beside the specifications.
 #
-# `Flops` is matched anywhere in the name (compute throughput is written
-# `TFlopsPeak`, `TFlopsFP8`, …); every other unit is matched as a trailing
-# segment (`BwPeakTBs`, `MemoryGiB`, `IntraNodeBwGBps`), which is the catalog's
-# PascalCase-unit-suffix convention and avoids mid-word collisions (e.g. a
-# hypothetical count field would not be mistaken for a physical quantity).
-_COMPUTE_TOKENS = ("Flops",)
+# Compute throughput is matched anywhere in the name because it is written
+# scale-prefixed and mid-name (`TFlopsPeak`, `TFlopsFP8`, …). The token must
+# carry a scale prefix: bare `Flops` is NOT a unit, or a dimensionless
+# `FlopsUtilization` / `PeakFlopsRatio` / `mfuFlops` would slip through the very
+# guarantee this check defends. Every other unit is matched as a trailing
+# segment (`BwPeakTBs`, `MemoryGiB`, `IntraNodeBwGBps`) — the catalog's
+# PascalCase-unit-suffix convention — which avoids mid-word collisions (a count
+# field is not mistaken for a physical quantity).
+_COMPUTE_TOKENS = ("KFlops", "MFlops", "GFlops", "TFlops", "PFlops", "EFlops")
 _SUFFIX_UNITS = (
     # bandwidth (bytes / second)
     "TBps", "GBps", "MBps", "KBps", "TBs", "GBs", "MBs",
@@ -90,9 +93,25 @@ _SUFFIX_UNITS = (
     "THz", "GHz", "MHz", "Hz",
 )
 
+# A name carrying one of these is dimensionless by construction (a ratio, a
+# fraction, an efficiency, an achieved utilisation) and is rejected even when it
+# also carries a unit token — so a `TFlopsUtilization` / `BwPeakTBsRatio` cannot
+# ride a real unit past the check. This closes the compute-token hole at its
+# root (blis-catalog#11 review).
+_DIMENSIONLESS_DESCRIPTORS = (
+    "Ratio", "Efficiency", "Utilisation", "Utilization", "Fraction", "Percent",
+)
+
 
 def field_has_unit(name: str) -> bool:
-    """Return True iff the field NAME carries a recognised physical-unit token."""
+    """Return True iff the field NAME carries a recognised physical-unit token.
+
+    A dimensionless descriptor (`…Ratio`, `…Efficiency`, `…Utilisation`, …)
+    disqualifies the name outright, even scale-prefixed compute names, so a
+    learned factor cannot ride a unit token in.
+    """
+    if any(desc in name for desc in _DIMENSIONLESS_DESCRIPTORS):
+        return False
     if any(tok in name for tok in _COMPUTE_TOKENS):
         return True
     return any(name.endswith(tok) for tok in _SUFFIX_UNITS)
@@ -285,7 +304,14 @@ def validate_hardware(hardware_dir: Path, root: Path) -> list[str]:
 
 
 def validate_networks(networks_dir: Path, root: Path) -> list[str]:
-    """networks/*.yaml: reusable inter-node fabric classes (blis-catalog#7/#10)."""
+    """networks/*.yaml: reusable inter-node fabric classes (blis-catalog#7/#10).
+
+    Unlike ``hardware/`` (open by unit vocabulary), a fabric class is a **closed**
+    schema: exactly the three fields below, plus ``_comment*`` prose. Any other
+    key is rejected, so a fitted/measured field (a `DerateFactor`) cannot hide
+    here either — making the README's "nothing measured or fitted" line
+    load-bearing for fabrics as well as chips (blis-catalog#11 review).
+    """
     errors: list[str] = []
     if not networks_dir.is_dir():
         return errors
@@ -298,6 +324,22 @@ def validate_networks(networks_dir: Path, root: Path) -> list[str]:
         for key in required:
             if key not in data:
                 errors.append(f"{_rel(path, root)}: {key}: required field is missing")
+
+        for key, val in data.items():
+            if key in required:
+                continue
+            if key.startswith("_comment"):  # prose; must be a string (as in hardware/)
+                if not isinstance(val, str):
+                    errors.append(
+                        f"{_rel(path, root)}: {key}: a _comment* key is a prose comment and "
+                        f"must have a string value"
+                    )
+                continue
+            errors.append(
+                f"{_rel(path, root)}: {key}: unknown field — a fabric class is a closed schema "
+                f"of {list(required)} (+ _comment* prose); a fitted/measured value belongs in "
+                f"blis-registry"
+            )
 
         prov = data.get("Provenance")
         if "Provenance" in data and prov not in PROVENANCE_ENUM:
