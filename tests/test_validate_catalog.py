@@ -438,6 +438,31 @@ def test_networks_unknown_field_is_flagged(good_catalog):
     _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "DerateFactor", "unknown field"])
 
 
+# --- duplicate keys + root guard (susiejojo re-review on blis-catalog#11) --- #
+
+
+def test_duplicate_key_in_yaml_is_rejected(good_catalog):
+    # PyYAML would silently keep the last value; a malformed dup must fail.
+    net = good_catalog / "networks/ib-400g.yaml"
+    net.write_text(
+        "Provenance: vendor-spec\nProvenance: vendor_spec\n"
+        "InterNodeBwGBps: 50\nPDTransferBaseLatencyMs: 0\n",
+        encoding="utf-8",
+    )
+    _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "duplicate key"])
+
+
+def test_nonexistent_root_is_rejected():
+    errors = vc.validate_catalog("/path/that/does/not/exist")
+    assert errors and "does not exist" in "\n".join(errors)
+
+
+def test_directory_that_is_not_a_catalog_is_rejected(tmp_path):
+    (tmp_path / "unrelated.txt").write_text("hi", encoding="utf-8")
+    errors = vc.validate_catalog(tmp_path)
+    assert errors and "not a catalog root" in "\n".join(errors)
+
+
 def test_networks_comment_key_allowed_but_must_be_string(good_catalog):
     net = good_catalog / "networks/ib-400g.yaml"
     data = yaml.safe_load(net.read_text())

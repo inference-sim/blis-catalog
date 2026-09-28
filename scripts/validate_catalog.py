@@ -163,6 +163,25 @@ def _is_number(value: Any) -> bool:
 _PARSE_ERROR: Any = object()
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """A SafeLoader that rejects duplicate mapping keys instead of silently
+    keeping the last (PyYAML's default). A file with `Provenance: vendor-spec`
+    then `Provenance: vendor_spec` is malformed and must fail the gate, not pass
+    on whichever value happened to win (blis-catalog#11 re-review)."""
+
+    def construct_mapping(self, node, deep=False):
+        seen: set = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    f"found duplicate key {key!r}", key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def _rel(path: Path, root: Path) -> str:
     try:
         # POSIX-style so a diagnostic reads identically on every platform.
@@ -174,7 +193,7 @@ def _rel(path: Path, root: Path) -> str:
 def _load_yaml(path: Path, root: Path, errors: list[str]) -> Any:
     try:
         with path.open("r", encoding="utf-8") as fh:
-            return yaml.safe_load(fh)
+            return yaml.load(fh, Loader=_UniqueKeyLoader)
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         errors.append(f"{_rel(path, root)}: not valid YAML: {exc}")
         return _PARSE_ERROR
@@ -459,10 +478,22 @@ def validate_devices(devices_dir: Path, root: Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+NAMESPACES = ("models", "hardware", "networks", "workloads", "devices")
+
+
 def validate_catalog(root: Path) -> list[str]:
     """Validate every committed entry across all namespaces; return error lines."""
     root = Path(root)
+    # A missing root, or a directory that is no catalog at all (none of the
+    # namespaces present), must fail loudly — otherwise a mistyped root would
+    # report "every entry is well-formed" and exit 0 (blis-catalog#11 re-review).
+    if not root.is_dir():
+        return [f"{root.as_posix()}: catalog root does not exist or is not a directory"]
     errors: list[str] = []
+    if not any((root / ns).is_dir() for ns in NAMESPACES):
+        errors.append(
+            f"{root.as_posix()}: not a catalog root — none of {list(NAMESPACES)} found"
+        )
     errors += validate_models(root / "models", root)
     errors += validate_hardware(root / "hardware", root)
     errors += validate_networks(root / "networks", root)
