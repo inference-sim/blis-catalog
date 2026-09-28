@@ -326,15 +326,21 @@ def validate_networks(networks_dir: Path, root: Path) -> list[str]:
     """networks/*.yaml: reusable inter-node fabric classes (blis-catalog#7/#10).
 
     Unlike ``hardware/`` (open by unit vocabulary), a fabric class is a **closed**
-    schema: exactly the three fields below, plus ``_comment*`` prose. Any other
+    schema: exactly the two fields below, plus ``_comment*`` prose. Any other
     key is rejected, so a fitted/measured field (a `DerateFactor`) cannot hide
     here either — making the README's "nothing measured or fitted" line
     load-bearing for fabrics as well as chips (blis-catalog#11 review).
+
+    ``PDTransferBaseLatencyMs`` used to be required here, always ``0`` (the
+    catalog states no inherent fabric base latency); the 0.05 ms
+    ``--pd-transfer-base-latency`` modeling placeholder is a registry number
+    (blis-registry#10), so the field was dropped from the catalog entirely
+    (blis-catalog#12) and now reads as a rejected unknown key.
     """
     errors: list[str] = []
     if not networks_dir.is_dir():
         return errors
-    required = ("Provenance", "InterNodeBwGBps", "PDTransferBaseLatencyMs")
+    required = ("Provenance", "InterNodeBwGBps")
     for path in sorted(networks_dir.glob("*.yaml")):
         data = _as_mapping(_load_yaml(path, root, errors), path, root, errors)
         if data is None:
@@ -374,16 +380,6 @@ def validate_networks(networks_dir: Path, root: Path) -> list[str]:
                 errors.append(
                     f"{_rel(path, root)}: InterNodeBwGBps: must be positive "
                     f"(got {data['InterNodeBwGBps']})"
-                )
-
-        if "PDTransferBaseLatencyMs" in data:
-            base = _coerce_number(data["PDTransferBaseLatencyMs"])
-            if base is None:
-                errors.append(f"{_rel(path, root)}: PDTransferBaseLatencyMs: must be a number")
-            elif base < 0:
-                errors.append(
-                    f"{_rel(path, root)}: PDTransferBaseLatencyMs: must be non-negative "
-                    f"(got {data['PDTransferBaseLatencyMs']})"
                 )
     return errors
 
