@@ -1,0 +1,33 @@
+name: catalog-ci
+
+# Catalog-side structural gate (R2H3 — inference-sim/blis-catalog#8).
+# A malformed or incomplete entry fails CI HERE, in the repo that owns the data,
+# instead of surfacing later in a downstream `blis run`. This is the structural /
+# schema half; the loader-semantics half lives in inference-sim#1750 (which loads
+# every entry through the real simulator loader). The two do not duplicate checks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate catalog entries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Validate every committed catalog entry
+        # THE gate: fails naming the file and key if any entry is malformed.
+        run: python3 scripts/validate_catalog.py
+      - name: Run the gate's own test suite
+        # Proves the checks actually fire (good data passes, bad data is rejected).
+        run: python3 -m pytest tests/ -q
