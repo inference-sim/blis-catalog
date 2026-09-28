@@ -304,3 +304,90 @@ def test_devices_missing_field_fails(good_catalog):
     del data["cpu_dram"]["base_latency"]
     _write_yaml(dev, data)
     _assert_flags(good_catalog, substrings=["devices/storage.yaml", "cpu_dram.base_latency"])
+
+
+# --------------------------------------------------------------------------- #
+# Robustness: empty documents, non-finite numbers, hidden fields, bad bytes    #
+# (qa-review PR #11: F1 / G2 / G5 / G6 / G16)                                  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["hardware/h100.yaml", "networks/ib-400g.yaml", "workloads/chatbot.yaml",
+     "devices/storage.yaml", "models/qwen3-14b/model.yaml"],
+)
+@pytest.mark.parametrize("content", ["", "# only a comment\n", "null\n"])
+def test_empty_or_comment_only_yaml_is_flagged_not_skipped(good_catalog, rel, content):
+    (good_catalog / rel).write_text(content, encoding="utf-8")
+    _assert_flags(good_catalog, substrings=[rel])
+
+
+@pytest.mark.parametrize("bad", [".nan", ".inf", "-.inf", '"nan"', '"inf"'])
+def test_workloads_non_finite_value_fails(good_catalog, bad):
+    wl = good_catalog / "workloads/chatbot.yaml"
+    # write raw so YAML resolves `.nan`/`.inf` (safe_dump would quote a Python float);
+    # replace the line rather than append a duplicate key
+    lines = [ln for ln in wl.read_text().splitlines() if not ln.startswith("prompt_tokens_stdev")]
+    lines.append(f"prompt_tokens_stdev: {bad}")
+    wl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prompt_tokens_stdev"])
+
+
+def test_networks_non_finite_bandwidth_fails(good_catalog):
+    net = good_catalog / "networks/ib-400g.yaml"
+    lines = [ln for ln in net.read_text().splitlines() if not ln.startswith("InterNodeBwGBps")]
+    lines.append("InterNodeBwGBps: .nan")
+    net.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "InterNodeBwGBps"])
+
+
+def test_coerce_number_rejects_non_finite():
+    assert vc._coerce_number(float("nan")) is None
+    assert vc._coerce_number(float("inf")) is None
+    assert vc._coerce_number(".nan") is None
+    assert vc._coerce_number("inf") is None
+    assert vc._coerce_number("7.0e3") == 7000.0  # the real-data coercion still works
+
+
+def test_hardware_numeric_underscore_key_is_flagged(good_catalog):
+    hw = good_catalog / "hardware/h100.yaml"
+    data = yaml.safe_load(hw.read_text())
+    data["_mfu"] = 0.85  # a dimensionless factor hiding under an underscore
+    _write_yaml(hw, data)
+    _assert_flags(good_catalog, substrings=["hardware/h100.yaml", "_mfu"])
+
+
+def test_hardware_structured_underscore_key_is_flagged(good_catalog):
+    hw = good_catalog / "hardware/h100.yaml"
+    data = yaml.safe_load(hw.read_text())
+    data["_payload"] = {"factor": 0.85}
+    _write_yaml(hw, data)
+    _assert_flags(good_catalog, substrings=["hardware/h100.yaml", "_payload"])
+
+
+def test_hardware_string_comment_key_still_exempt(good_catalog):
+    hw = good_catalog / "hardware/h100.yaml"
+    data = yaml.safe_load(hw.read_text())
+    data["_comment_extra"] = "prose stays exempt"
+    _write_yaml(hw, data)
+    assert vc.validate_catalog(good_catalog) == []
+
+
+def test_non_utf8_config_is_reported_not_crashed(good_catalog):
+    (good_catalog / "models/qwen3-14b/config.json").write_bytes(b"\xff\xfe not utf-8")
+    # must not raise; must name the file
+    errors = vc.validate_catalog(good_catalog)
+    joined = "\n".join(errors)
+    assert "models/qwen3-14b/config.json" in joined
+
+
+@pytest.mark.parametrize("name", ["FooGBCount", "TotalItems", "SlotUsPercent", "NumCPUs"])
+def test_field_has_unit_rejects_midword_lookalikes(name):
+    # a unit token buried mid-word (not a trailing segment) is NOT a real unit
+    assert not vc.field_has_unit(name)
+
+
+@pytest.mark.parametrize("name", ["MemoryGB", "PeakTBps", "ClockMHz", "TdpMilliWatts"])
+def test_field_has_unit_accepts_more_suffixes(name):
+    assert vc.field_has_unit(name)

@@ -35,6 +35,7 @@ This task adds no simulation number; it is a CI gate (R2 is value-preserving).
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -105,19 +106,25 @@ def _coerce_number(value: Any) -> float | None:
     such as ``7.0e3`` as a number (it needs ``7.0e+3`` or ``7000.0``), yet the
     Go loader that actually consumes these files reads it as a float. Coercing
     here keeps the gate faithful to that data without editing the verbatim
-    values (R2 is value-preserving). YAML booleans are int subclasses and are
-    rejected.
+    values (R2 is value-preserving).
+
+    Non-finite values are rejected: YAML booleans are int subclasses, and NaN /
+    infinity (``.nan``, ``.inf``, or their string spellings) are not physical
+    quantities — treating them as "not a number" stops them slipping past a
+    ``>= 0`` bound, which is true for neither NaN nor a comparison it poisons.
     """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        number = float(value)
+    elif isinstance(value, str):
         try:
-            return float(value)
+            number = float(value)
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _is_number(value: Any) -> bool:
@@ -130,29 +137,53 @@ def _is_number(value: Any) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+# Returned by the loaders when a file could not be read/parsed (the error is
+# already recorded). It is distinct from a successfully parsed ``None`` — an
+# empty or comment-only document — which the callers must still flag rather than
+# silently skip.
+_PARSE_ERROR: Any = object()
+
+
 def _rel(path: Path, root: Path) -> str:
     try:
-        return str(path.relative_to(root))
+        # POSIX-style so a diagnostic reads identically on every platform.
+        return path.relative_to(root).as_posix()
     except ValueError:
-        return str(path)
+        return path.as_posix()
 
 
-def _load_yaml(path: Path, root: Path, errors: list[str]) -> Any | None:
+def _load_yaml(path: Path, root: Path, errors: list[str]) -> Any:
     try:
         with path.open("r", encoding="utf-8") as fh:
             return yaml.safe_load(fh)
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         errors.append(f"{_rel(path, root)}: not valid YAML: {exc}")
-        return None
+        return _PARSE_ERROR
 
 
-def _load_json(path: Path, root: Path, errors: list[str]) -> Any | None:
+def _load_json(path: Path, root: Path, errors: list[str]) -> Any:
     try:
         with path.open("r", encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         errors.append(f"{_rel(path, root)}: not valid JSON: {exc}")
+        return _PARSE_ERROR
+
+
+def _as_mapping(data: Any, path: Path, root: Path, errors: list[str]) -> dict | None:
+    """Return ``data`` as a non-empty mapping, else None (recording an error).
+
+    A parse failure was already reported by the loader (the sentinel), so it is
+    skipped here. A document that parsed to ``None`` (empty / comment-only /
+    explicit null) or to a non-mapping is a malformed entry and is flagged —
+    never silently skipped.
+    """
+    if data is _PARSE_ERROR:
         return None
+    if not isinstance(data, dict) or not data:
+        errors.append(f"{_rel(path, root)}: must be a non-empty YAML mapping")
+        return None
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -176,18 +207,15 @@ def validate_models(models_dir: Path, root: Path) -> list[str]:
             errors.append(f"{_rel(cfg, root)}: missing (a model entry needs config.json)")
         else:
             data = _load_json(cfg, root, errors)
-            if data is not None and (not isinstance(data, dict) or not data):
+            if data is not _PARSE_ERROR and (not isinstance(data, dict) or not data):
                 errors.append(f"{_rel(cfg, root)}: must be a non-empty JSON object")
 
         # model.yaml: identity + provenance.
         if not myaml.is_file():
             errors.append(f"{_rel(myaml, root)}: missing (a model entry needs model.yaml)")
             continue
-        meta = _load_yaml(myaml, root, errors)
+        meta = _as_mapping(_load_yaml(myaml, root, errors), myaml, root, errors)
         if meta is None:
-            continue
-        if not isinstance(meta, dict):
-            errors.append(f"{_rel(myaml, root)}: must be a YAML mapping")
             continue
 
         got_name = meta.get("name")
@@ -217,17 +245,24 @@ def validate_hardware(hardware_dir: Path, root: Path) -> list[str]:
     if not hardware_dir.is_dir():
         return errors
     for path in sorted(hardware_dir.glob("*.yaml")):
-        data = _load_yaml(path, root, errors)
+        data = _as_mapping(_load_yaml(path, root, errors), path, root, errors)
         if data is None:
-            continue
-        if not isinstance(data, dict):
-            errors.append(f"{_rel(path, root)}: must be a YAML mapping")
             continue
 
         if "Provenance" not in data:
             errors.append(f"{_rel(path, root)}: Provenance: required field is missing")
         for key, val in data.items():
-            if key.startswith("_"):  # _comment* — free-form prose, exempt
+            if key.startswith("_"):
+                # `_comment*` keys are free-form PROSE and exempt — but only when
+                # the value is a string. A numeric or structured value under an
+                # underscore is not a comment; it must not slip past the units
+                # check (a hidden `_mfu: 0.85` would otherwise pass).
+                if not isinstance(val, str):
+                    errors.append(
+                        f"{_rel(path, root)}: {key}: an underscore-prefixed key is a prose "
+                        f"comment and must have a string value; a non-string here bypasses "
+                        f"the units check"
+                    )
                 continue
             if key == "Provenance":
                 if val not in PROVENANCE_ENUM:
@@ -255,11 +290,8 @@ def validate_networks(networks_dir: Path, root: Path) -> list[str]:
         return errors
     required = ("Provenance", "InterNodeBwGBps", "PDTransferBaseLatencyMs")
     for path in sorted(networks_dir.glob("*.yaml")):
-        data = _load_yaml(path, root, errors)
+        data = _as_mapping(_load_yaml(path, root, errors), path, root, errors)
         if data is None:
-            continue
-        if not isinstance(data, dict):
-            errors.append(f"{_rel(path, root)}: must be a YAML mapping")
             continue
 
         for key in required:
@@ -306,11 +338,8 @@ def validate_workloads(workloads_dir: Path, root: Path) -> list[str]:
         "output_tokens", "output_tokens_stdev", "output_tokens_min", "output_tokens_max",
     )
     for path in sorted(workloads_dir.glob("*.yaml")):
-        data = _load_yaml(path, root, errors)
+        data = _as_mapping(_load_yaml(path, root, errors), path, root, errors)
         if data is None:
-            continue
-        if not isinstance(data, dict):
-            errors.append(f"{_rel(path, root)}: must be a YAML mapping")
             continue
 
         for key in required:
@@ -350,11 +379,8 @@ def validate_devices(devices_dir: Path, root: Path) -> list[str]:
     if not devices_dir.is_dir():
         return errors
     for path in sorted(devices_dir.glob("*.yaml")):
-        data = _load_yaml(path, root, errors)
+        data = _as_mapping(_load_yaml(path, root, errors), path, root, errors)
         if data is None:
-            continue
-        if not isinstance(data, dict) or not data:
-            errors.append(f"{_rel(path, root)}: must be a non-empty YAML mapping of tiers")
             continue
         for tier, spec in data.items():
             if not isinstance(spec, dict):
