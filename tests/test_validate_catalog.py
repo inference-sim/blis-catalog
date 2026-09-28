@@ -65,7 +65,7 @@ def good_catalog(tmp_path: Path) -> Path:
     # networks/ib-400g
     _write_yaml(
         root / "networks/ib-400g.yaml",
-        {"Provenance": "vendor_spec", "InterNodeBwGBps": 50, "PDTransferBaseLatencyMs": 0},
+        {"Provenance": "vendor_spec", "InterNodeBwGBps": 50},
     )
     # workloads/chatbot
     _write_yaml(
@@ -197,7 +197,7 @@ def test_networks_non_positive_bandwidth_fails(good_catalog, bad_bw):
     _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "InterNodeBwGBps", "positive"])
 
 
-@pytest.mark.parametrize("field", ["InterNodeBwGBps", "Provenance", "PDTransferBaseLatencyMs"])
+@pytest.mark.parametrize("field", ["InterNodeBwGBps", "Provenance"])
 def test_networks_missing_required_field_fails(good_catalog, field):
     net = good_catalog / "networks/ib-400g.yaml"
     data = yaml.safe_load(net.read_text())
@@ -438,6 +438,21 @@ def test_networks_unknown_field_is_flagged(good_catalog):
     _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "DerateFactor", "unknown field"])
 
 
+def test_networks_pd_transfer_base_latency_is_now_rejected(good_catalog):
+    # blis-catalog#12 dropped PDTransferBaseLatencyMs from the catalog: the nominal
+    # fabric base latency is always 0, and the 0.05 ms --pd-transfer-base-latency
+    # modeling placeholder is a registry number (blis-registry#10). The closed fabric
+    # schema now rejects the field outright, so a stale entry still carrying it fails.
+    net = good_catalog / "networks/ib-400g.yaml"
+    data = yaml.safe_load(net.read_text())
+    data["PDTransferBaseLatencyMs"] = 0
+    _write_yaml(net, data)
+    _assert_flags(
+        good_catalog,
+        substrings=["networks/ib-400g.yaml", "PDTransferBaseLatencyMs", "unknown field"],
+    )
+
+
 # --- duplicate keys + root guard (susiejojo re-review on blis-catalog#11) --- #
 
 
@@ -446,7 +461,7 @@ def test_duplicate_key_in_yaml_is_rejected(good_catalog):
     net = good_catalog / "networks/ib-400g.yaml"
     net.write_text(
         "Provenance: vendor-spec\nProvenance: vendor_spec\n"
-        "InterNodeBwGBps: 50\nPDTransferBaseLatencyMs: 0\n",
+        "InterNodeBwGBps: 50\n",
         encoding="utf-8",
     )
     _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "duplicate key"])

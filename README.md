@@ -121,11 +121,13 @@ value change.
 
 - **PD KV-transfer** rides the fabric: its transfer bandwidth **is** that
   fabric's nominal `InterNodeBwGBps` (there is no separate figure), so different
-  fabrics disaggregate at different cost. The fabric's
-  `PDTransferBaseLatencyMs` is `0` (the catalog declares no inherent base
-  latency); the `0.05 ms` `--pd-transfer-base-latency` default is a modeling
-  placeholder that belongs in `blis-registry`. The `--pd-transfer-*` CLI flags
-  remain overrides, so a run that resolves no fabric is byte-identical.
+  fabrics disaggregate at different cost. The fabric carries **no** PD
+  base-latency field — the catalog states no inherent fabric base latency, and
+  the nominal figure would only ever be `0`; the `0.05 ms`
+  `--pd-transfer-base-latency` default is a modeling placeholder that belongs in
+  `blis-registry` ([blis-registry#10](https://github.com/inference-sim/blis-registry/issues/10)).
+  The `--pd-transfer-*` CLI flags remain overrides, so a run that resolves no
+  fabric is byte-identical.
 
 ## Conventions
 
@@ -161,8 +163,8 @@ re-implements the other's checks:
     if nobody has seen that field before — keeping "nothing here is learned or
     fitted" load-bearing rather than aspirational;
   - **`networks/` fabric classes** carry their required fields
-    (`InterNodeBwGBps`, `Provenance`, `PDTransferBaseLatencyMs`), a **positive**
-    `InterNodeBwGBps`, and a `Provenance` drawn from the allowed enum;
+    (`InterNodeBwGBps`, `Provenance`), a **positive** `InterNodeBwGBps`, and a
+    `Provenance` drawn from the allowed enum;
   - `workloads/` and `devices/` entries carry their required numeric fields with
     sane bounds (token min ≤ max; positive bandwidths).
 - **Simulator-side ([inference-sim#1750](https://github.com/inference-sim/inference-sim/issues/1750)).**
