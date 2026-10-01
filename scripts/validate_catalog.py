@@ -102,6 +102,27 @@ _DIMENSIONLESS_DESCRIPTORS = (
     "Ratio", "Efficiency", "Utilisation", "Utilization", "Fraction", "Percent",
 )
 
+# A dimensioned COUNT: its unit is one of the things counted. `SMCount` is 132
+# SMs on a GH100 die and `GPUsPerNode` is 8 GPUs on an HGX baseboard — both are
+# datasheet integers, as declared as a bandwidth figure and no more learned. So a
+# count belongs in the catalog, and the units check has to admit one.
+#
+# The vocabulary is a CLOSED list of whole names rather than a suffix rule, which
+# is what keeps it from becoming the hole the rest of this check exists to close.
+# A suffix rule on `Count` would admit `FooGBCount` and any other name ending in
+# the word, and `Count` says nothing about what was counted — it is the generic
+# shape a fitted quantity would borrow. Naming each field outright means a new
+# count is a deliberate edit here, reviewed like the physical fields are.
+#
+# A count is additionally required to be a positive whole number of parts, so a
+# fitted 0.91 cannot enter under one of these names either.
+_COUNT_FIELDS = frozenset({"SMCount", "GPUsPerNode", "GPUsPerRack"})
+
+
+def field_is_count(name: str) -> bool:
+    """Return True iff the field NAME is one of the declared part counts."""
+    return name in _COUNT_FIELDS
+
 
 def field_has_unit(name: str) -> bool:
     """Return True iff the field NAME carries a recognised physical-unit token.
@@ -114,7 +135,9 @@ def field_has_unit(name: str) -> bool:
         return False
     if any(tok in name for tok in _COMPUTE_TOKENS):
         return True
-    return any(name.endswith(tok) for tok in _SUFFIX_UNITS)
+    if any(name.endswith(tok) for tok in _SUFFIX_UNITS):
+        return True
+    return field_is_count(name)
 
 
 def _coerce_number(value: Any) -> float | None:
@@ -319,6 +342,16 @@ def validate_hardware(hardware_dir: Path, root: Path) -> list[str]:
                 )
             if not _is_number(val):
                 errors.append(f"{_rel(path, root)}: {key}: physical field must be a number")
+            elif field_is_count(key):
+                # A count names a whole number of physical parts. Requiring that
+                # closes the hole the count vocabulary would otherwise open: a
+                # fitted 0.91 cannot enter as an `SMCount`.
+                n = _coerce_number(val)
+                if n is None or n <= 0 or n != int(n):
+                    errors.append(
+                        f"{_rel(path, root)}: {key}: a count must be a positive whole "
+                        f"number of parts, not {val!r}"
+                    )
     return errors
 
 

@@ -1,0 +1,124 @@
+kind: ModelGraph
+name: kimi-k3
+derived_from:
+  format: hf_config_json
+  path: config.json
+  sha256: 9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213
+  deriver_version: 1
+global:
+  hidden_size: 7168
+  vocab_size: 163840
+  tie_word_embeddings: false
+  weight_dtype: mxfp4
+layer_kinds:
+- id: kda_moe
+  nodes:
+  - op: Elementwise
+    role: input_norm
+  - op: RecurrentUpdate
+    recurrent_kind: kda
+    n_heads: 96
+    state_size: 128
+    state_dtype: fp32
+  - op: AllReduce
+    role: mixer_out
+    emit: tensor_parallel
+  - op: Elementwise
+    role: post_attn_norm
+  - op: GroupedGEMM
+    role: experts
+    n: 3072
+    k: 7168
+    experts: 896
+    top_k: 16
+    shared_experts: 2
+  - op: All2All
+    role: moe_dispatch_combine
+    emit: expert_parallel
+  - op: AllReduce
+    role: mlp_out
+    emit: tensor_parallel_unless_sp_moe
+  edges:
+  - - 0
+    - 1
+  - - 1
+    - 2
+  - - 2
+    - 3
+  - - 3
+    - 4
+  - - 4
+    - 5
+  - - 5
+    - 6
+- id: mla_moe
+  nodes:
+  - op: Elementwise
+    role: input_norm
+  - op: GEMM
+    role: qkv_proj
+    n: 18432
+    k: 7168
+  - op: Attention
+    kind: mla
+    n_q: 96
+    n_kv: 1
+    d_h: 576
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - op: GEMM
+    role: o_proj
+    n: 7168
+    k: 12288
+  - op: AllReduce
+    role: attn_out
+    emit: tensor_parallel
+  - op: Elementwise
+    role: post_attn_norm
+  - op: GroupedGEMM
+    role: experts
+    n: 3072
+    k: 7168
+    experts: 896
+    top_k: 16
+    shared_experts: 2
+  - op: All2All
+    role: moe_dispatch_combine
+    emit: expert_parallel
+  - op: AllReduce
+    role: mlp_out
+    emit: tensor_parallel_unless_sp_moe
+  edges:
+  - - 0
+    - 1
+  - - 1
+    - 2
+  - - 2
+    - 3
+  - - 3
+    - 4
+  - - 4
+    - 5
+  - - 5
+    - 6
+  - - 6
+    - 7
+  - - 7
+    - 8
+stack:
+  pattern:
+  - kda_moe
+  - kda_moe
+  - kda_moe
+  - mla_moe
+  repeat: 23
+  epilogue:
+  - mla_moe
+modality: text_decoder_of_multimodal
+head:
+- op: Elementwise
+  role: final_norm
+- op: GEMM
+  role: lm_head
+  n: 163840
+  k: 7168

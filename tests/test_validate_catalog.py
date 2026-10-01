@@ -487,3 +487,56 @@ def test_networks_comment_key_allowed_but_must_be_string(good_catalog):
     data["_comment_note"] = 5  # a numeric _comment is not prose
     _write_yaml(net, data)
     _assert_flags(good_catalog, substrings=["networks/ib-400g.yaml", "_comment_note"])
+
+
+# --------------------------------------------------------------------------- #
+# Counts: a declared number of physical parts is admitted; a fitted factor is  #
+# not, even when it borrows a count-shaped name.                              #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("name", ["SMCount", "GPUsPerNode", "GPUsPerRack"])
+def test_declared_part_counts_are_admitted(name):
+    assert vc.field_has_unit(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["SMCountRatio", "GPUsPerNodeFraction", "ScalingFactor", "achieved", "NodeCount"],
+)
+def test_a_count_shaped_name_outside_the_closed_list_is_rejected(name):
+    """The count vocabulary is a closed list, not a suffix rule: a name that
+    merely ends in the word does not become a declared part count."""
+    assert not vc.field_has_unit(name)
+
+
+@pytest.mark.parametrize("value", [131.5, 0, -8, 0.91])
+def test_a_count_that_is_not_a_whole_number_of_parts_is_flagged(good_catalog, value):
+    chip = good_catalog / "hardware/h100.yaml"
+    data = yaml.safe_load(chip.read_text())
+    data["SMCount"] = value
+    _write_yaml(chip, data)
+    _assert_flags(good_catalog, substrings=["hardware/h100.yaml", "whole"])
+
+
+def test_a_whole_part_count_passes_the_gate(good_catalog):
+    chip = good_catalog / "hardware/h100.yaml"
+    data = yaml.safe_load(chip.read_text())
+    data["SMCount"] = 132
+    data["GPUsPerNode"] = 8
+    _write_yaml(chip, data)
+    assert vc.validate_catalog(good_catalog) == []
+
+
+def test_the_real_catalog_declares_an_sm_count_for_every_chip():
+    """Every chip needs an SM count and a node width: the cost model's 12-SM
+    Triton-fetch derate is a fraction of the first, and whether a collective
+    group crosses a node boundary is decided by the second. A chip missing
+    either cannot price an offload run or a multi-node one."""
+    root = Path(__file__).resolve().parent.parent
+    chips = sorted((root / "hardware").glob("*.yaml"))
+    assert chips, "no chips found to check"
+    for chip in chips:
+        data = yaml.safe_load(chip.read_text())
+        assert data.get("SMCount", 0) > 0, f"{chip.name} declares no SMCount"
+        assert data.get("GPUsPerNode", 0) > 0, f"{chip.name} declares no GPUsPerNode"

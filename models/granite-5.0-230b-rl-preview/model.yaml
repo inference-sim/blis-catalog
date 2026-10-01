@@ -1,0 +1,10 @@
+name: granite-5.0-230b-rl-preview
+source:
+  provider: huggingface
+  repo: ibm-granite/granite-5.0-230b-rl-preview
+  # The local snapshot this entry was built from carries no commit identifier: it is a
+  # working copy of the repository files, not a clone. The config digest below pins the
+  # exact bytes the graph was derived from, which is what a re-derivation checks; the
+  # upstream revision should replace this string once the model is cloned properly.
+  revision: "sha256:6311999e2e8cd52324148889702cd58e857714b427b09be7c567379a16846df3"
+  retrieved: 2026-09-29
