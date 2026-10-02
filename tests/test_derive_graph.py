@@ -119,13 +119,22 @@ def test_attention_shape_matches_config(d: Path):
     for n in nodes:
         if n.get("role") == "block_index_scores":
             # A block-sparse layer runs a second, much narrower attention to score which
-            # blocks the first one reads. Its head geometry is the indexer's own
-            # (sparse_num_index_heads over sparse_index_dim), not the model's, so
-            # asserting the model's head count here would require the deriver to
-            # misreport it. Checked against the config it does come from instead.
-            sparse = t["sparse_attention_config"]
-            assert n["n_q"] == sparse["sparse_num_index_heads"]
-            assert n["d_h"] == sparse["sparse_index_dim"]
+            # blocks the first one reads. Its head geometry is the indexer's own, not the
+            # model's, so asserting the model's head count here would require the deriver
+            # to misreport it. Checked against the config it does come from instead.
+            #
+            # Two families spell those fields differently: MiniMax-M3 nests them in
+            # sparse_attention_config, DeepSeek-V4 states index_n_heads and
+            # index_head_dim at the top level. Both are read, and a config declaring
+            # neither fails rather than skipping the check.
+            sparse = t.get("sparse_attention_config") or {}
+            heads = sparse.get("sparse_num_index_heads", t.get("index_n_heads"))
+            dim = sparse.get("sparse_index_dim", t.get("index_head_dim"))
+            assert heads is not None and dim is not None, (
+                "an indexer node whose config states no index head geometry"
+            )
+            assert n["n_q"] == heads
+            assert n["d_h"] == dim
             continue
         assert n["n_q"] == t["num_attention_heads"]
         if n["kind"] in ("mla", "sparse_mla"):
@@ -435,3 +444,101 @@ def test_m3_prices_differently_from_its_gqa_sibling():
     if not d2.is_dir():
         pytest.skip("minimax-m2.5 not in the catalog")
     assert cost_signature(g3) != cost_signature(graph_of(d2))
+
+
+# --- DeepSeek-V4-Pro: compressed sparse attention at two ratios -------------------
+
+
+def _v4():
+    d = ROOT / "models" / "deepseek-v4-pro"
+    if not d.is_dir():
+        pytest.skip("deepseek-v4-pro not in the catalog")
+    return graph_of(d), text_config(config_of(d))
+
+
+def test_v4_has_one_layer_kind_per_compression_ratio():
+    """The config's compress_ratios vector names two ratios, and they cost differently.
+
+    vLLM's compressor asserts compress_ratio in [4, 128] and sizes each layer's read
+    from it, so a graph collapsing them to one kind would price 30 of 61 layers with
+    the other one's bound. Asserted through the bound rather than the kind id: an id is
+    a label, a window is a cost."""
+    g, t = _v4()
+    ratios = sorted(set(t["compress_ratios"][: t["num_hidden_layers"]]))
+    assert len(ratios) == 2, f"expected two ratios, config states {ratios}"
+    windows = set()
+    for k in g["layer_kinds"]:
+        for n in k["nodes"]:
+            if n["op"] == "Attention" and n.get("role") != "block_index_scores":
+                windows.add(n["window"])
+    assert len(windows) == len(ratios), (
+        f"two compression ratios must give two distinct read bounds, got {windows}"
+    )
+
+
+def test_v4_higher_compression_reads_less():
+    """A larger compression ratio must bound the read tighter.
+
+    This is the direction the measured tables show -- the ratio-128 kernel is flat in
+    context where the ratio-4 one grows -- and a graph that inverted it would make the
+    cheap layers expensive and vice versa, while still having two distinct kinds."""
+    g, t = _v4()
+    layers = t["num_hidden_layers"]
+    by_ratio = {}
+    seq = layer_sequence(g["stack"])
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    for idx, ratio in enumerate(t["compress_ratios"][:layers]):
+        k = kinds[seq[idx]]
+        for n in k["nodes"]:
+            if n["op"] == "Attention" and n.get("role") != "block_index_scores":
+                by_ratio.setdefault(ratio, set()).add(n["window"])
+    assert all(len(v) == 1 for v in by_ratio.values()), (
+        f"a ratio maps to more than one bound: {by_ratio}"
+    )
+    flat = {r: v.pop() for r, v in by_ratio.items()}
+    lo, hi = min(flat), max(flat)
+    assert flat[hi] < flat[lo], (
+        f"ratio {hi} should read less than ratio {lo}, got {flat[hi]} vs {flat[lo]}"
+    )
+
+
+def test_v4_head_dim_is_not_summed_with_rope():
+    """head_dim is the inclusive per-token width, not the part outside RoPE.
+
+    vLLM's compressor derives nope_head_dim = head_dim - rope_head_dim
+    (models/deepseek_v4/compressor.py), so adding qk_rope_head_dim to head_dim would
+    overstate this model's KV cache by an eighth. There is no kv_lora_rank to
+    reconstruct it from, which is why the MLA branch cannot price this family."""
+    g, t = _v4()
+    main = [n for k in g["layer_kinds"] for n in k["nodes"]
+            if n["op"] == "Attention" and n.get("role") != "block_index_scores"]
+    assert main
+    for n in main:
+        assert n["d_h"] == t["head_dim"]
+        assert n["d_h"] != t["head_dim"] + t["qk_rope_head_dim"]
+
+
+def test_v4_indexer_is_unbounded_where_the_attention_is_bounded():
+    """The measured split: the indexer grows 3.53x over a 12x context increase where the
+    attention it feeds moves 1.18x. One node cannot carry both."""
+    g, _ = _v4()
+    for k in g["layer_kinds"]:
+        idx = [n for n in k["nodes"] if n.get("role") == "block_index_scores"]
+        main = [n for n in k["nodes"]
+                if n["op"] == "Attention" and n.get("role") != "block_index_scores"]
+        assert len(idx) == 1 and len(main) == 1, f"{k['id']}: expected one of each"
+        assert "window" not in idx[0], "a bounded indexer would make selection free"
+        assert main[0]["window"] > 0, "an unbounded read would track the full context"
+
+
+def test_v4_prices_differently_from_deepseek_v3():
+    """V3 is dense MLA with kv_lora_rank; V4 is compressed sparse with an indexer.
+
+    Both are DeepSeek MoE models, so a handler registered against the wrong architecture
+    would be easy to miss -- and sending V4 through handler_moe is precisely what the
+    registry comment warns derives kind=swa window=128 off sliding_window."""
+    g4, _ = _v4()
+    d3 = ROOT / "models" / "deepseek-v3"
+    if not d3.is_dir():
+        pytest.skip("deepseek-v3 not in the catalog")
+    assert cost_signature(g4) != cost_signature(graph_of(d3))

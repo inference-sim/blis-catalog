@@ -610,6 +610,107 @@ def handler_minimax_m2(cfg, raw, model):
     return handler_moe(cfg, raw, model)
 
 
+def handler_deepseek_v4(cfg, raw, model):
+    """DeepSeek-V4: compressed sparse attention at two ratios, a top-k indexer, and a
+    routed expert layer.
+
+    Three facts decide the representation, all read from vLLM's own implementation in
+    `vllm/models/deepseek_v4/` rather than inferred from field names.
+
+    `head_dim` is INCLUSIVE of the RoPE width. compressor.py derives
+    `nope_head_dim = head_dim - rope_head_dim`, so the 512 this config states already
+    contains qk_rope_head_dim 64; treating them as additive would overstate the cache
+    by an eighth. There is no kv_lora_rank here, which is why the MLA branch of
+    `attention()` cannot price this family -- it reconstructs the per-token width as
+    lora + rope, and this config states the total directly.
+
+    The per-layer `compress_ratios` vector selects between two bounds on ONE kernel.
+    Both are kernel_source FLASHMLA_SPARSE_DSV4 in the measured tables, differing only
+    in compress_ratio, and sparse_mla.py sizes the read as
+    `next_power_of_2(max_seq_len / compress_ratio)` floored at a 128-token alignment.
+    So ratio 128 reads a stream that never exceeds that floor -- measured flat, 126.0
+    to 124.6 us across a 16x context increase -- while ratio 4 grows as ctx/4 and
+    measures 1.18x over the same range.
+
+    The indexer is a separate node because it is the ONLY context-proportional term,
+    measuring 3.53x over a 12x context increase where the attention it feeds moves
+    1.18x. Folding it in would charge a context scan at a bounded rate.
+    """
+    hidden = int(require(cfg, "hidden_size", model))
+    layers = int(require(cfg, "num_layers", model))
+
+    ratios = cfg.get("compress_ratios")
+    if not ratios:
+        raise DeriveError(
+            f"{model}: no compress_ratios vector. This family's attention read is "
+            f"bounded by a per-layer compression ratio, and pricing every layer alike "
+            f"would misprice whichever kind it did not pick"
+        )
+    # The vector carries a trailing entry for the MTP module, which is not one of the
+    # transformer layers num_hidden_layers counts. vLLM indexes it by layer, so the
+    # extra entry is only ever read for the draft module.
+    if len(ratios) == layers + 1:
+        ratios = ratios[:layers]
+    elif len(ratios) != layers:
+        raise DeriveError(
+            f"{model}: compress_ratios has {len(ratios)} entries for {layers} layers; "
+            f"expected {layers}, or {layers + 1} with a trailing draft entry"
+        )
+    unknown = sorted(set(ratios) - {4, 128})
+    if unknown:
+        raise DeriveError(
+            f"{model}: compress_ratios names {unknown}, which this handler cannot "
+            f"price. vLLM's compressor asserts compress_ratio in [4, 128] "
+            f"(models/deepseek_v4/compressor.py); a third ratio needs its own bound "
+            f"rather than the nearer of these two"
+        )
+
+    topk = int(require_key(cfg, "index_topk", model))
+    index_heads = int(require_key(cfg, "index_n_heads", model))
+    index_dim = int(require_key(cfg, "index_head_dim", model))
+    rope = int(require(cfg, "qk_rope_head_dim", model))
+    total_dim = int(require(cfg, "head_dim", model))
+    if total_dim <= rope:
+        raise DeriveError(
+            f"{model}: head_dim {total_dim} does not exceed qk_rope_head_dim {rope}, "
+            f"so it cannot be the inclusive width vLLM's compressor splits"
+        )
+
+    indexer = {
+        "op": "Attention",
+        "role": "block_index_scores",
+        "kind": "gqa",
+        "n_q": index_heads,
+        "n_kv": 1,
+        "d_h": index_dim,
+    }
+
+    def layer_for(ratio):
+        # The read is a top-k over a stream compressed by this ratio, so a larger ratio
+        # bounds it tighter. index_topk caps both.
+        window = max(1, min(topk, topk // ratio))
+        nodes = attention_block(cfg, model, hidden, kind="swa", window=window)
+        at = next(i for i, n in enumerate(nodes) if n.get("op") == "Attention")
+        nodes = nodes[:at] + [
+            gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
+            dict(indexer),
+        ] + nodes[at:]
+        nodes += [
+            norm("post_attn_norm"),
+            moe(cfg, model, hidden),
+            collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+            collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
+        ]
+        return nodes
+
+    kinds = []
+    for ratio in sorted(set(ratios)):
+        nodes = layer_for(ratio)
+        kinds.append({"id": f"csa{ratio}_moe", "nodes": nodes, "edges": chain(nodes)})
+    sequence = [f"csa{r}_moe" for r in ratios]
+    return kinds, compress(sequence)
+
+
 def handler_minimax_m3(cfg, raw, model):
     """MiniMax-M3: block-sparse attention with a learned indexer, over a MoE stack whose
     first three layers are dense.
@@ -966,13 +1067,15 @@ HANDLERS = {
     # kinds. Registered explicitly rather than by a prefix match, because a default is what
     # this registry exists to prevent.
     #
-    # V4-Pro is deliberately NOT registered. It carries index_n_heads, index_head_dim and
-    # num_hash_layers, which drive a separate indexer attention module in vLLM
-    # (model_executor/models/deepseek_v2.py), and it declares no kv_lora_rank. Sent through
-    # this handler it derives as kind=swa off its sliding_window field, pricing a sparse
-    # indexer as sliding-window attention. That is the misprice this registry exists to
-    # prevent, so it needs its own handler and a node for the indexer.
+    # DeepseekV4ForCausalLM has its own handler rather than this one. It declares no
+    # kv_lora_rank and states an inclusive head_dim, so the MLA branch here cannot
+    # reconstruct its per-token width; and its sliding_window field is 128 where the
+    # read is actually bounded by index_topk over a compressed stream, so this handler
+    # would derive kind=swa window=128 and misprice every layer. See
+    # handler_deepseek_v4, which reads the bound from compress_ratios and index_topk and
+    # gives the indexer its own node.
     "DeepseekV3ForCausalLM": handler_moe,
+    "DeepseekV4ForCausalLM": handler_deepseek_v4,
     "GlmMoeDsaForCausalLM": handler_moe,
     "InklingForConditionalGeneration": handler_moe,
     "GptOssForCausalLM": handler_moe,
@@ -1094,6 +1197,12 @@ SPEC_METHODS = {
     # deepseek_v32 and glm_moe_dsa, and maps deepseek_v4 to the same method on its own
     # branch (architectures DeepSeekMTPModel and DeepSeekV4MTPModel respectively).
     "DeepseekV3ForCausalLM": "deepseek_mtp",
+    # vLLM rewrites model_type deepseek_v4 to deepseek_mtp and reads n_predict from
+    # num_nextn_predict_layers, NOT from num_mtp_modules the way MiniMax-M3 does
+    # (config/speculative.py:664-669, architectures DeepSeekV4MTPModel). The alias table
+    # already resolves that field, so this architecture needs no entry in
+    # MTP_MODULE_ARCHS.
+    "DeepseekV4ForCausalLM": "deepseek_mtp",
     "Qwen3_5MoeForConditionalGeneration": "qwen3_5_mtp",
     # vLLM resolves both the VL wrapper and the text decoder to one method, reading
     # n_predict from num_mtp_modules rather than num_nextn_predict_layers

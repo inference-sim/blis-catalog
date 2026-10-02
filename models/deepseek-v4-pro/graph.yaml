@@ -1,0 +1,168 @@
+kind: ModelGraph
+name: deepseek-v4-pro
+derived_from:
+  format: hf_config_json
+  path: config.json
+  sha256: 5fe4568daee51c208cb8a79538eaeda090ae011ade1dee2c386aa95f569c810e
+  deriver_version: 1
+global:
+  hidden_size: 7168
+  vocab_size: 129280
+  tie_word_embeddings: false
+  weight_dtype: fp8
+layer_kinds:
+- id: csa4_moe
+  nodes:
+  - op: Elementwise
+    role: input_norm
+  - op: GEMM
+    role: qkv_proj
+    n: 66560
+    k: 7168
+  - op: GEMM
+    role: index_qk_proj
+    n: 8320
+    k: 7168
+  - op: Attention
+    role: block_index_scores
+    kind: gqa
+    n_q: 64
+    n_kv: 1
+    d_h: 128
+  - op: Attention
+    kind: swa
+    n_q: 128
+    n_kv: 1
+    d_h: 512
+    window: 256
+  - op: GEMM
+    role: o_proj
+    n: 7168
+    k: 65536
+  - op: AllReduce
+    role: attn_out
+    emit: tensor_parallel
+  - op: Elementwise
+    role: post_attn_norm
+  - op: GroupedGEMM
+    role: experts
+    n: 3072
+    k: 7168
+    experts: 384
+    top_k: 6
+    shared_experts: 1
+  - op: All2All
+    role: moe_dispatch_combine
+    emit: expert_parallel
+  - op: AllReduce
+    role: mlp_out
+    emit: tensor_parallel_unless_sp_moe
+  edges:
+  - - 0
+    - 1
+  - - 1
+    - 2
+  - - 2
+    - 3
+  - - 3
+    - 4
+  - - 4
+    - 5
+  - - 5
+    - 6
+  - - 6
+    - 7
+  - - 7
+    - 8
+  - - 8
+    - 9
+  - - 9
+    - 10
+- id: csa128_moe
+  nodes:
+  - op: Elementwise
+    role: input_norm
+  - op: GEMM
+    role: qkv_proj
+    n: 66560
+    k: 7168
+  - op: GEMM
+    role: index_qk_proj
+    n: 8320
+    k: 7168
+  - op: Attention
+    role: block_index_scores
+    kind: gqa
+    n_q: 64
+    n_kv: 1
+    d_h: 128
+  - op: Attention
+    kind: swa
+    n_q: 128
+    n_kv: 1
+    d_h: 512
+    window: 8
+  - op: GEMM
+    role: o_proj
+    n: 7168
+    k: 65536
+  - op: AllReduce
+    role: attn_out
+    emit: tensor_parallel
+  - op: Elementwise
+    role: post_attn_norm
+  - op: GroupedGEMM
+    role: experts
+    n: 3072
+    k: 7168
+    experts: 384
+    top_k: 6
+    shared_experts: 1
+  - op: All2All
+    role: moe_dispatch_combine
+    emit: expert_parallel
+  - op: AllReduce
+    role: mlp_out
+    emit: tensor_parallel_unless_sp_moe
+  edges:
+  - - 0
+    - 1
+  - - 1
+    - 2
+  - - 2
+    - 3
+  - - 3
+    - 4
+  - - 4
+    - 5
+  - - 5
+    - 6
+  - - 6
+    - 7
+  - - 7
+    - 8
+  - - 8
+    - 9
+  - - 9
+    - 10
+stack:
+  prologue:
+  - csa128_moe
+  pattern:
+  - csa128_moe
+  - csa4_moe
+  repeat: 30
+head:
+- op: Elementwise
+  role: final_norm
+- op: GEMM
+  role: lm_head
+  n: 129280
+  k: 7168
+speculator:
+  method: deepseek_mtp
+  num_spec_tokens: 1
+  stack:
+    pattern:
+    - csa128_moe
+    repeat: 1
