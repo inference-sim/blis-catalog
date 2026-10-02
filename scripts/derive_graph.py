@@ -191,6 +191,12 @@ def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
                     return "fp8"
                 if bits == 8 and kind == "int":
                     return "int8"
+                # A 4-bit INT group needs no format string to disambiguate, unlike the
+                # 4-bit floats above: there is one integer grid, and the per-group scale
+                # count follows group_size rather than being fixed by the format. Kimi-K2.5
+                # ships this as num_bits 4, type "int", group_size 32.
+                if bits == 4 and kind == "int":
+                    return "int4"
                 raise DeriveError(
                     f"{model}: a {bits}-bit {kind!r} weight group has no dtype in this "
                     f"schema's vocabulary"
@@ -837,6 +843,15 @@ HANDLERS = {
     "NemotronHForCausalLM": handler_nemotron_h,
     "Qwen3_5MoeForConditionalGeneration": handler_qwen3_5_moe,
     "KimiK3ForConditionalGeneration": handler_kimi_k3,
+    # Kimi-K2.5 is a vision-language model whose TEXT decoder vLLM instantiates as
+    # DeepseekV2ForCausalLM over config.text_config
+    # (model_executor/models/kimi_k25.py:371-376, architectures=["DeepseekV2ForCausalLM"]),
+    # and whose text_config names DeepseekV3ForCausalLM itself. Either way the shape is the
+    # DeepSeek family handler_moe already prices: MLA with kv_lora_rank 512, routed experts,
+    # a dense prologue from first_k_dense_replace. The vision tower is not priced, which the
+    # graph records as modality text_decoder_of_multimodal; the corpus's workloads are all
+    # text (1024:1024, 1024:8192, 8192:1024), so the tower never runs in these measurements.
+    "KimiK25ForConditionalGeneration": handler_moe,
 }
 
 
