@@ -816,6 +816,20 @@ HANDLERS = {
     "Llama4ForConditionalGeneration": handler_moe,
     "GraniteMoeForCausalLM": handler_moe,
     "DeepseekV2ForCausalLM": handler_moe,
+    # V3 is the same shape family as V2: MLA attention keyed by kv_lora_rank, a routed
+    # expert layer, and a dense prologue named by first_k_dense_replace. Every difference
+    # between the committed V2-Lite config and V3 is a VALUE -- depth, hidden size, expert
+    # count, scoring function -- not a structure, so the handler prices it with no new node
+    # kinds. Registered explicitly rather than by a prefix match, because a default is what
+    # this registry exists to prevent.
+    #
+    # V4-Pro is deliberately NOT registered. It carries index_n_heads, index_head_dim and
+    # num_hash_layers, which drive a separate indexer attention module in vLLM
+    # (model_executor/models/deepseek_v2.py), and it declares no kv_lora_rank. Sent through
+    # this handler it derives as kind=swa off its sliding_window field, pricing a sparse
+    # indexer as sliding-window attention. That is the misprice this registry exists to
+    # prevent, so it needs its own handler and a node for the indexer.
+    "DeepseekV3ForCausalLM": handler_moe,
     "GlmMoeDsaForCausalLM": handler_moe,
     "InklingForConditionalGeneration": handler_moe,
     "GptOssForCausalLM": handler_moe,
@@ -907,6 +921,11 @@ SPEC_METHODS = {
     "NemotronHForCausalLM": "nemotron_h_mtp",
     "InklingForConditionalGeneration": "inkling_mtp",
     "DeepseekV2ForCausalLM": "deepseek_mtp",
+    # Both verified in vLLM's own resolution rather than inferred from the family name:
+    # config/speculative.py maps model_type deepseek_v3 to deepseek_mtp alongside
+    # deepseek_v32 and glm_moe_dsa, and maps deepseek_v4 to the same method on its own
+    # branch (architectures DeepSeekMTPModel and DeepSeekV4MTPModel respectively).
+    "DeepseekV3ForCausalLM": "deepseek_mtp",
     "Qwen3_5MoeForConditionalGeneration": "qwen3_5_mtp",
 }
 
