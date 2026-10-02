@@ -117,6 +117,16 @@ def test_attention_shape_matches_config(d: Path):
     if not nodes:
         pytest.skip("no attention layer")
     for n in nodes:
+        if n.get("role") == "block_index_scores":
+            # A block-sparse layer runs a second, much narrower attention to score which
+            # blocks the first one reads. Its head geometry is the indexer's own
+            # (sparse_num_index_heads over sparse_index_dim), not the model's, so
+            # asserting the model's head count here would require the deriver to
+            # misreport it. Checked against the config it does come from instead.
+            sparse = t["sparse_attention_config"]
+            assert n["n_q"] == sparse["sparse_num_index_heads"]
+            assert n["d_h"] == sparse["sparse_index_dim"]
+            continue
         assert n["n_q"] == t["num_attention_heads"]
         if n["kind"] in ("mla", "sparse_mla"):
             # A latent cache holds one vector per token whatever the config's KV head
@@ -335,3 +345,93 @@ def _change_kv_heads(g: dict) -> None:
                 n["n_kv"] = max(1, n["n_kv"] // 2)
                 return
     pytest.skip("no attention node")
+
+
+# --- MiniMax-M3: block-sparse attention ------------------------------------------
+
+
+def _m3():
+    d = ROOT / "models" / "minimax-m3"
+    if not d.is_dir():
+        pytest.skip("minimax-m3 not in the catalog")
+    return graph_of(d), text_config(config_of(d))
+
+
+def test_m3_bounded_read_is_cheaper_than_full_attention_at_long_context():
+    """The point of block-sparse attention is a read that stops growing with context.
+
+    Asserted as a cost difference rather than a field value: a graph that recorded
+    the bound but left the kind full would read the whole context, and only a
+    comparison catches that. The bound is in tokens, so at any context beyond it the
+    sparse layer reads strictly fewer KV bytes than a full-attention layer of the
+    same shape.
+    """
+    g, t = _m3()
+    main = [n for k in g["layer_kinds"] for n in k["nodes"]
+            if n["op"] == "Attention" and n.get("role") != "block_index_scores"
+            and n["kind"] == "swa"]
+    assert main, "no bounded attention node; a sparse layer would read the full context"
+    sparse = t["sparse_attention_config"]
+    bound = (sparse["sparse_topk_blocks"] + sparse["sparse_local_block"]
+             + sparse["sparse_init_block"]) * sparse["sparse_block_size"]
+    for n in main:
+        per_token = 2 * n["n_kv"] * n["d_h"]
+        for context in (8192, 131072, 1048576):
+            bounded = min(context, n["window"]) * per_token
+            full = context * per_token
+            assert bounded < full, (
+                f"at context {context} the bounded read is not cheaper than a full one"
+            )
+            assert bounded == bound * per_token, (
+                f"the bound should saturate at {bound} tokens, not track context"
+            )
+
+
+def test_m3_indexer_read_is_not_bounded():
+    """The indexer scores every block to choose the top k, so its read tracks context.
+
+    If the indexer were given the same bound as the attention it feeds, the model would
+    charge nothing for selection and a long-context step would come out too fast. The
+    distinction is the whole reason it is a separate node."""
+    g, _ = _m3()
+    idx = [n for k in g["layer_kinds"] for n in k["nodes"]
+           if n.get("role") == "block_index_scores"]
+    assert idx, "no indexer node; block selection would be free"
+    for n in idx:
+        assert "window" not in n, (
+            "the indexer carries a window, which would bound a read that must scan the "
+            "whole context to rank blocks"
+        )
+        assert n["kind"] == "gqa"
+
+
+def test_m3_dense_prologue_is_wider_than_a_routed_expert():
+    """The first three layers are dense MLPs at dense_intermediate_size.
+
+    Both widths are declared and they differ by 4x, so a handler that reached for
+    intermediate_size would make the prologue a quarter of its true cost. Asserted
+    as the inequality the weights show rather than as the literal number."""
+    g, t = _m3()
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    dense_up = [n for n in kinds["dense"]["nodes"]
+                if n.get("role") == "mlp_gate_up"][0]
+    expert = [n for n in kinds["sparse_attn_moe"]["nodes"]
+              if n["op"] == "GroupedGEMM"][0]
+    assert dense_up["n"] == 2 * t["dense_intermediate_size"]
+    assert expert["n"] == t["intermediate_size"]
+    assert dense_up["n"] > 2 * expert["n"], (
+        "the dense prologue should be wider than a routed expert on this config"
+    )
+
+
+def test_m3_prices_differently_from_its_gqa_sibling():
+    """M2.5 and M3 are both MiniMax MoE models and must not price alike.
+
+    M2.5 is dense-attention GQA throughout; M3 bounds its attention read and adds
+    an indexer. A handler registered against the wrong architecture would collapse
+    the two."""
+    g3, _ = _m3()
+    d2 = ROOT / "models" / "minimax-m2.5"
+    if not d2.is_dir():
+        pytest.skip("minimax-m2.5 not in the catalog")
+    assert cost_signature(g3) != cost_signature(graph_of(d2))

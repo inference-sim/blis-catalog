@@ -610,6 +610,143 @@ def handler_minimax_m2(cfg, raw, model):
     return handler_moe(cfg, raw, model)
 
 
+def handler_minimax_m3(cfg, raw, model):
+    """MiniMax-M3: block-sparse attention with a learned indexer, over a MoE stack whose
+    first three layers are dense.
+
+    Two layer kinds, ordered by the config's own per-layer vectors. `moe_layer_freq`
+    and `sparse_attention_config.sparse_attention_freq` are checked to be the same
+    vector rather than assumed to be: they are two statements of one fact on the
+    published weights, and a variant that decoupled them would need its kinds named
+    rather than collapsed.
+
+    The attention kind is `swa`. What the schema's SWA means is a per-token read
+    bounded by something other than context length, and M3's bound is
+    `sparse_topk_blocks * sparse_block_size` tokens. The bound is the part a KV-byte
+    cost model reads, and the arithmetic is the same for a contiguous window as for
+    scattered blocks. What is NOT the same is which positions those are: SWA reads the
+    most recent window, M3 reads blocks chosen per query. That does not change the bytes
+    read, so it does not change this node; it shows up as the indexer below.
+
+    The indexer is its own Attention node rather than a term folded into the main one.
+    It has its own projections on the published weights -- index_q_proj [512, 6144] and
+    index_k_proj [128, 6144], i.e. `sparse_num_index_heads` heads of `sparse_index_dim`
+    for the query and one such head for the key -- so it maintains a second, narrow KV
+    cache and scores every block to pick the top k. Its read is bounded by context, not
+    by the top-k, which is why it cannot ride inside a node whose read is bounded.
+
+    The dense layers' MLP width is `dense_intermediate_size`, not `intermediate_size`.
+    Both are declared and they differ by 4x; the published weights settle which is which
+    (`layers.0.mlp.gate_proj` is [12288, 6144] where a routed expert's w1 is
+    [3072, 6144]).
+    """
+    hidden = int(require(cfg, "hidden_size", model))
+    layers = int(require(cfg, "num_layers", model))
+
+    sparse = cfg.get("sparse_attention_config")
+    if not sparse:
+        raise DeriveError(
+            f"{model}: no sparse_attention_config. This family's attention read is "
+            f"bounded by a block top-k, and pricing it as dense GQA would overstate "
+            f"every sparse layer's KV read"
+        )
+    if sparse.get("use_sparse_attention") is not True:
+        raise DeriveError(
+            f"{model}: sparse_attention_config present but use_sparse_attention is "
+            f"{sparse.get('use_sparse_attention')!r}; a declared-but-off bound is a "
+            f"different model and this handler will not guess which"
+        )
+
+    attn_freq = sparse.get("sparse_attention_freq")
+    moe_freq = cfg.get("moe_layer_freq")
+    if not attn_freq or not moe_freq:
+        raise DeriveError(
+            f"{model}: needs both sparse_attention_freq and moe_layer_freq to order "
+            f"its layer kinds"
+        )
+    pairs = (("sparse_attention_freq", attn_freq),
+             ("moe_layer_freq", moe_freq))
+    for name, vec in pairs:
+        if len(vec) != layers:
+            raise DeriveError(
+                f"{model}: {name} has {len(vec)} entries for {layers} layers"
+            )
+    if list(attn_freq) != list(moe_freq):
+        raise DeriveError(
+            f"{model}: sparse_attention_freq and moe_layer_freq differ. This handler "
+            f"prices one dense prologue and one sparse-plus-routed body; a stack that "
+            f"mixed them independently needs its kinds named rather than paired"
+        )
+    unknown = set(attn_freq) - {0, 1}
+    if unknown:
+        raise DeriveError(
+            f"{model}: sparse_attention_freq names {sorted(unknown)}, which this "
+            f"handler cannot price; add the kind rather than defaulting it"
+        )
+
+    # A stated dense-prologue length and the vector state the same fact. Read by
+    # literal name: only this family declares it, so it has no cross-dialect concept.
+    first_dense = cfg.get("first_k_dense_replace")
+    if first_dense is not None:
+        expected = [0] * int(first_dense) + [1] * (layers - int(first_dense))
+        if expected != list(attn_freq):
+            raise DeriveError(
+                f"{model}: first_k_dense_replace {first_dense} disagrees with the "
+                f"per-layer vector; the two state one fact and this handler will not "
+                f"choose between them"
+            )
+
+    topk_blocks = int(require_key(sparse, "sparse_topk_blocks", model))
+    block = int(require_key(sparse, "sparse_block_size", model))
+    index_heads = int(require_key(sparse, "sparse_num_index_heads", model))
+    index_dim = int(require_key(sparse, "sparse_index_dim", model))
+    local = int(sparse.get("sparse_local_block") or 0)
+    init = int(sparse.get("sparse_init_block") or 0)
+    # Every block the kernel is guaranteed to read: the top-k plus the always-resident
+    # local and initial blocks. Counted in tokens because that is what a KV read costs.
+    bound = (topk_blocks + local + init) * block
+
+    dense_attn = attention_block(cfg, model, hidden)
+    dense_ffn = int(require_key(cfg, "dense_intermediate_size", model))
+    dense_nodes = dense_attn + [
+        norm("post_attn_norm"),
+        gemm("mlp_gate_up", 2 * dense_ffn, hidden),
+        gemm("mlp_down", hidden, dense_ffn),
+        collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
+    ]
+
+    sparse_attn = attention_block(cfg, model, hidden, kind="swa", window=bound)
+    # The indexer scores the whole context to choose blocks, so its read is bounded by
+    # context rather than by the top-k. It is placed BEFORE the bounded attention node,
+    # which is the order it runs in: its scores pick the blocks that node then reads.
+    indexer = {
+        "op": "Attention",
+        "role": "block_index_scores",
+        "kind": "gqa",
+        "n_q": index_heads,
+        "n_kv": 1,
+        "d_h": index_dim,
+    }
+    at = next(i for i, n in enumerate(sparse_attn) if n.get("op") == "Attention")
+    sparse_nodes = sparse_attn[:at] + [
+        gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
+        indexer,
+    ] + sparse_attn[at:]
+    sparse_nodes += [
+        norm("post_attn_norm"),
+        moe(cfg, model, hidden),
+        collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+        collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
+    ]
+
+    kinds = [
+        {"id": "dense", "nodes": dense_nodes, "edges": chain(dense_nodes)},
+        {"id": "sparse_attn_moe", "nodes": sparse_nodes, "edges": chain(sparse_nodes)},
+    ]
+    sequence = ["sparse_attn_moe" if f else "dense" for f in attn_freq]
+    return kinds, compress(sequence)
+
+
 def handler_qwen3_5_moe(cfg, raw, model):
     """Qwen3.5-MoE: a Gated DeltaNet linear-attention layer on most layers, full attention
     on every fourth, and a routed expert MLP with a shared expert on all of them.
@@ -840,6 +977,8 @@ HANDLERS = {
     "InklingForConditionalGeneration": handler_moe,
     "GptOssForCausalLM": handler_moe,
     "MiniMaxM2ForCausalLM": handler_minimax_m2,
+    "MiniMaxM3SparseForCausalLM": handler_minimax_m3,
+    "MiniMaxM3SparseForConditionalGeneration": handler_minimax_m3,
     "NemotronHForCausalLM": handler_nemotron_h,
     "Qwen3_5MoeForConditionalGeneration": handler_qwen3_5_moe,
     "KimiK3ForConditionalGeneration": handler_kimi_k3,
@@ -909,6 +1048,20 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
     ]
 
     spec = pick(cfg, "num_spec_tokens")
+    # num_mtp_modules is NOT in the alias table: it is not a cross-family spelling of
+    # "draft layers". vLLM reads it for n_predict only on the families whose speculative
+    # method consumes it (config/speculative.py:958-984 for MiniMax-M3), and
+    # MiniMax-M2.5 declares num_mtp_modules 3 while vLLM registers no minimax_m2_mtp
+    # method at all -- its only draft path is a separate Eagle3 checkpoint. Reading the
+    # field globally would invent a draft stack for every such config.
+    if arch in MTP_MODULE_ARCHS:
+        modules = cfg.get("num_mtp_modules")
+        if modules is None:
+            raise DeriveError(
+                f"{model}: {arch} takes its draft length from num_mtp_modules and the "
+                f"config declares none"
+            )
+        spec = modules
     if spec and int(spec) > 0:
         # A draft module is its own stack: for an MoE target the draft pass is a second
         # MoE, which a scalar draft length would hide. Its layer composition is declared
@@ -942,7 +1095,21 @@ SPEC_METHODS = {
     # branch (architectures DeepSeekMTPModel and DeepSeekV4MTPModel respectively).
     "DeepseekV3ForCausalLM": "deepseek_mtp",
     "Qwen3_5MoeForConditionalGeneration": "qwen3_5_mtp",
+    # vLLM resolves both the VL wrapper and the text decoder to one method, reading
+    # n_predict from num_mtp_modules rather than num_nextn_predict_layers
+    # (config/speculative.py:958-974, and "minimax_m3_mtp" in its valid-method list).
+    "MiniMaxM3SparseForConditionalGeneration": "minimax_m3_mtp",
+    "MiniMaxM3SparseForCausalLM": "minimax_m3_mtp",
 }
+
+
+# Architectures whose speculative method takes its draft length from num_mtp_modules
+# rather than from num_nextn_predict_layers. Named rather than pattern-matched: the two
+# fields disagree on MiniMax-M3 (7 against 1), so which one is read changes the graph.
+MTP_MODULE_ARCHS = frozenset({
+    "MiniMaxM3SparseForConditionalGeneration",
+    "MiniMaxM3SparseForCausalLM",
+})
 
 
 def speculative_method(arch: str, model: str) -> str:
