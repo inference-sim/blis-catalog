@@ -317,6 +317,17 @@ def dense_mlp(cfg: dict[str, Any], model: str, hidden: int) -> list[dict[str, An
     ]
 
 
+# A checkpoint storing its routed experts at a different width from the rest states it in
+# expert_dtype, and vLLM resolves that NAME rather than reading it as a dtype:
+# models/deepseek_v4/quant_config.py documents "fp4" as MXFP4 experts with ue8m0 scales
+# and "fp8" as FP8-block experts, the linear and attention layers being FP8 block either
+# way. So this mapping is vLLM's, not an inference from the string.
+EXPERT_DTYPES = {
+    "fp4": "mxfp4",
+    "fp8": "fp8",
+}
+
+
 def moe(cfg: dict[str, Any], model: str, hidden: int) -> dict[str, Any]:
     """Build the grouped-GEMM node for a routed expert layer."""
     experts = int(require(cfg, "num_experts", model))
@@ -343,6 +354,24 @@ def moe(cfg: dict[str, Any], model: str, hidden: int) -> dict[str, Any]:
         node["shared_experts"] = int(shared)
         if shared_inner and int(shared_inner) != int(inner):
             node["shared_intermediate_size"] = int(shared_inner)
+    # The expert width where the checkpoint states one, which is not always the global
+    # weight dtype. DeepSeek-V4-Pro declares expert_dtype fp4 beside an fp8
+    # quantization_config: pricing its 384 experts at the global width doubles them from
+    # 720 GiB to 1,441 GiB, which puts 180 GiB per rank on a 141 GiB H200 and makes a
+    # deployment InferenceX ran at tp=8 on 8 GPUs look impossible. An unrecognized value
+    # raises rather than falling back to the global width: falling back is the bug.
+    expert_dtype = cfg.get("expert_dtype")
+    if expert_dtype is not None:
+        mapped = EXPERT_DTYPES.get(str(expert_dtype))
+        if mapped is None:
+            raise DeriveError(
+                f"{model}: expert_dtype {expert_dtype!r} is not one this deriver maps; "
+                f"add it to EXPERT_DTYPES with the width vLLM resolves it to rather "
+                f"than letting the global dtype stand in"
+            )
+        if mapped != DTYPES.get(str(pick(cfg, "dtype") or "").lower()):
+            node["weight_dtype"] = mapped
+
     latent = pick(cfg, "moe_latent_size")
     if latent:
         # A projection to a narrower space runs before the routed experts, so the

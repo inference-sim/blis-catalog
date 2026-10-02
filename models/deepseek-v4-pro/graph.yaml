@@ -51,6 +51,7 @@ layer_kinds:
     experts: 384
     top_k: 6
     shared_experts: 1
+    weight_dtype: mxfp4
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -118,6 +119,7 @@ layer_kinds:
     experts: 384
     top_k: 6
     shared_experts: 1
+    weight_dtype: mxfp4
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel

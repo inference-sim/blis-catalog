@@ -542,3 +542,56 @@ def test_v4_prices_differently_from_deepseek_v3():
     if not d3.is_dir():
         pytest.skip("deepseek-v3 not in the catalog")
     assert cost_signature(g4) != cost_signature(graph_of(d3))
+
+
+def test_v4_experts_are_priced_at_their_own_declared_width():
+    """A checkpoint storing experts at a different width from the rest must say so.
+
+    DeepSeek-V4-Pro declares expert_dtype fp4 beside an fp8 quantization_config, and
+    vLLM resolves that name to MXFP4 experts (models/deepseek_v4/quant_config.py).
+    Pricing them at the global fp8 width doubles 384 experts from 720 GiB to 1,441 GiB,
+    which puts 180 GiB per rank on a 141 GiB H200 and makes a deployment InferenceX ran
+    at tp=8 on 8 GPUs look impossible. Asserted through the occupancy as well as the
+    field, because the field is a label and the bytes are the cost."""
+    g, t = _v4()
+    assert t.get("expert_dtype") == "fp4", "this test is about a config that states one"
+    experts = [n for k in g["layer_kinds"] for n in k["nodes"]
+               if n["op"] == "GroupedGEMM"]
+    assert experts, "no expert node"
+    for n in experts:
+        assert n.get("weight_dtype") == "mxfp4", (
+            f"expert node carries weight_dtype {n.get('weight_dtype')!r}; vLLM "
+            f"resolves expert_dtype fp4 to mxfp4"
+        )
+    # The occupancy that width decides: 0.5 bytes per parameter, against fp8's 1.
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    gib = 0.0
+    for lid in layer_sequence(g["stack"]):
+        for n in kinds[lid]["nodes"]:
+            if n["op"] == "GroupedGEMM":
+                gib += 3 * n["n"] * n["k"] * n["experts"] * 0.5 / 2**30
+    per_rank = gib / 8
+    assert per_rank < 141 * 0.9, (
+        f"{per_rank:.1f} GiB per rank at tp=8 does not fit a 141 GiB H200, so this "
+        f"deployment would be refused"
+    )
+
+
+def test_an_unmapped_expert_dtype_is_an_error_not_a_fallback():
+    """Falling back to the global width is the bug this field exists to fix.
+
+    A width the deriver does not recognize must stop the derivation rather than quietly
+    pricing the experts at the checkpoint's other dtype."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "dg", ROOT / "scripts" / "derive_graph.py")
+    dg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dg)
+    cfg = {"hidden_size": 7168, "num_local_experts": 8, "num_experts_per_tok": 2,
+           "intermediate_size": 1024, "expert_dtype": "fp6"}
+    try:
+        dg.moe(cfg, "synthetic", 7168)
+    except dg.DeriveError as exc:
+        assert "fp6" in str(exc)
+        return
+    raise AssertionError("an unmapped expert_dtype was accepted")
