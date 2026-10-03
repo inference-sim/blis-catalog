@@ -168,6 +168,12 @@ def test_expert_shape_matches_config(d: Path):
 EXPECTED_IDENTICAL = {
     frozenset({"nemotron-3-ultra-550b-a55b-bf16", "nemotron-3-ultra-550b-a55b-nvfp4"}):
         "the same architecture at two weight dtypes",
+    frozenset({"minimax-m2.5", "minimax-m2.7"}):
+        "one architecture across two MiniMax-M2 generations. Every cost-relevant field is "
+        "identical: 62 layers, hidden 3072, 256 experts at top-8, intermediate 1536, 48 "
+        "query heads over 8 KV heads at head_dim 128, vocab 200064, fp8 weights. The two "
+        "configs differ only in max_position_embeddings (196608 against 204800) and a "
+        "dtype label, neither of which the cost model reads",
     frozenset({"nemotron-3.5-lightning-30b-a3b-bf16",
                "nemotron-3.5-lightning-30b-a3b-nvfp4"}):
         "the same architecture at two weight dtypes",
