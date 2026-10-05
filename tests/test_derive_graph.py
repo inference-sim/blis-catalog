@@ -389,6 +389,289 @@ def _change_kv_heads(g: dict) -> None:
     pytest.skip("no attention node")
 
 
+# --- The hybrid handlers' specific structure ---------------------------------------
+# The property tests above confirm the catalog HAS variety -- layer counts agree, dtypes
+# differ, attention shapes come from the config. None of them asserts that a given model
+# resolved to the RIGHT structure: which layers are attention and which are recurrent,
+# and what state geometry the recurrent ones carry. For a handler that detects an index
+# base or parses a character vector, that is the part most likely to be off by one.
+
+
+def test_kimi_k3_resolves_its_full_attention_layers_one_based():
+    """The off-by-one this handler detects rather than assumes.
+
+    Kimi-K3 declares linear_attn_config.full_attn_layers as a 1-based list against a
+    1-indexed layer numbering. Read as 0-based, every attention layer shifts by one and
+    the model is still 93 layers of the right two kinds -- so the layer-count and
+    attention-shape property tests both pass on a graph where every KDA and MLA layer
+    sits one position off. The handler detects the base (a 0-based list would contain 0)
+    and this pins the result: the declared index n must be the MLA layer at 0-based
+    position n-1, and the position before it must be KDA."""
+    d = ROOT / "models" / "kimi-k3"
+    if not d.is_dir():
+        pytest.skip("kimi-k3 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    declared = [int(i) for i in t["linear_attn_config"]["full_attn_layers"]]
+    assert 0 not in declared, (
+        "this config's list is 1-based; a 0-based one would make the assertions below "
+        "describe the wrong positions")
+    seq = layer_sequence(g["stack"])
+    assert len(seq) == t["num_hidden_layers"]
+
+    mla = {i for i, k in enumerate(seq) if k == "mla_moe"}
+    expected = {n - 1 for n in declared}
+    assert mla == expected, (
+        f"MLA layers sit at 0-based {sorted(mla)[:6]}...; the config's 1-based list "
+        f"{declared[:6]}... puts them at {sorted(expected)[:6]}...")
+    # The concrete consequence, stated so a failure reads as the off-by-one it is:
+    # index 4 declared means position 3 is attention and position 4 is not.
+    assert seq[declared[0] - 1] == "mla_moe"
+    assert seq[declared[0]] == "kda_moe", (
+        "the layer after the first declared attention layer is attention too, which is "
+        "the signature of a 0-based read")
+    assert set(seq) == {"kda_moe", "mla_moe"}
+
+
+def test_kimi_k3_kda_state_geometry_comes_from_the_config():
+    """The recurrent node's shape, which decides its state bytes and its step cost."""
+    d = ROOT / "models" / "kimi-k3"
+    if not d.is_dir():
+        pytest.skip("kimi-k3 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    kda = [n for k in g["layer_kinds"] if k["id"] == "kda_moe"
+           for n in k["nodes"] if n["op"] == "RecurrentUpdate"]
+    assert len(kda) == 1, f"expected one recurrent node in a KDA layer, got {len(kda)}"
+    n = kda[0]
+    assert n["recurrent_kind"] == "kda"
+    assert n["n_heads"] == t["num_attention_heads"]
+    assert n["state_size"] == t["linear_attn_config"]["head_dim"]
+    assert n["state_dtype"] == "fp32", (
+        "a recurrent state carried at the weight dtype would understate its bytes")
+
+
+def test_qwen3_5_resolves_full_attention_on_the_declared_vector():
+    """Which layers are GDN and which are full attention, from layer_types.
+
+    The handler reads the vector rather than full_attention_interval, so this asserts
+    against the vector: a graph built from the interval would agree here only while the
+    two agree, which is the point of preferring the vector."""
+    d = ROOT / "models" / "qwen3.5-397b-a17b"
+    if not d.is_dir():
+        pytest.skip("qwen3.5-397b-a17b is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    types = t["layer_types"]
+    seq = layer_sequence(g["stack"])
+    assert len(seq) == len(types)
+    expected = ["attn_moe" if x == "full_attention" else "gdn_moe" for x in types]
+    assert seq == expected, "the stack does not follow the declared layer_types vector"
+    # The interval is a generator for the common case; the first full-attention layer
+    # sits at the end of the first period, not the start of it.
+    interval = int(t["full_attention_interval"])
+    assert seq[interval - 1] == "attn_moe"
+    assert seq[0] == "gdn_moe", (
+        "layer 0 is full attention, which is what reading the interval as 1-based at "
+        "the start of each period would produce")
+
+
+def test_qwen3_5_gdn_state_geometry_follows_vllm_calculator():
+    """The GDN state shape, which vLLM's own calculator defines.
+
+    A convolutional state of width 2*k_heads*k_dim + v_heads*v_dim, and a temporal state
+    whose per-head geometry is k_dim over v_heads heads. These are the numbers that decide
+    the recurrent state's bytes per sequence, so a transposed head count or a key/value
+    dim swap misprices every GDN layer and no other test would see it."""
+    d = ROOT / "models" / "qwen3.5-397b-a17b"
+    if not d.is_dir():
+        pytest.skip("qwen3.5-397b-a17b is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    gdn = [n for k in g["layer_kinds"] if k["id"] == "gdn_moe"
+           for n in k["nodes"] if n["op"] == "RecurrentUpdate"]
+    assert len(gdn) == 1
+    n = gdn[0]
+    k_heads, v_heads = t["linear_num_key_heads"], t["linear_num_value_heads"]
+    k_dim, v_dim = t["linear_key_head_dim"], t["linear_value_head_dim"]
+    assert n["recurrent_kind"] == "gdn"
+    assert n["n_heads"] == v_heads, (
+        f"n_heads is {n['n_heads']}; the temporal state is per VALUE head ({v_heads}), "
+        f"not per key head ({k_heads})")
+    assert n["state_size"] == k_dim, (
+        f"state_size is {n['state_size']}; the temporal state's per-head width is the "
+        f"KEY dim ({k_dim})")
+    assert n["conv_kernel"] == t["linear_conv_kernel_dim"]
+    assert n["intermediate_size"] == 2 * k_heads * k_dim + v_heads * v_dim, (
+        "intermediate_size must be the convolution's width, "
+        "2*k_heads*k_dim + v_heads*v_dim")
+
+
+def test_qwen3_5_gdn_state_size_is_the_key_dim_not_the_value_dim():
+    """The committed config cannot tell these two apart, so this uses one that can.
+
+    Qwen3.5-397B declares linear_key_head_dim and linear_value_head_dim both 128, so an
+    assertion against the real config passes whichever of the two the handler reads --
+    verified by mutation: swapping them in the deriver leaves the whole suite green. The
+    distinction is real (vLLM's gated_delta_net_state_shape takes the temporal state's
+    per-head width from the KEY dim) and it decides the recurrent state's bytes, so it is
+    pinned here on a config where the two differ."""
+    dg = _dg()
+    cfg = {
+        "hidden_size": 4096, "vocab_size": 128000, "num_hidden_layers": 4,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+        "intermediate_size": 8192, "num_local_experts": 8, "num_experts_per_tok": 2,
+        "moe_intermediate_size": 1024,
+        "layer_types": ["linear_attention", "linear_attention",
+                        "linear_attention", "full_attention"],
+        "full_attention_interval": 4,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 32,
+        "linear_key_head_dim": 64, "linear_value_head_dim": 256,
+        "linear_conv_kernel_dim": 4,
+    }
+    kinds, _ = dg.handler_qwen3_5_moe(cfg, cfg, "synthetic")
+    n = next(x for k in kinds if k["id"] == "gdn_moe"
+             for x in k["nodes"] if x["op"] == "RecurrentUpdate")
+    assert n["state_size"] == 64, (
+        f"state_size is {n['state_size']}; the temporal state's per-head width is the "
+        f"key dim (64), not the value dim (256)")
+    assert n["n_heads"] == 32, (
+        f"n_heads is {n['n_heads']}; the temporal state is per value head (32), not per "
+        f"key head (16)")
+    assert n["intermediate_size"] == 2 * 16 * 64 + 32 * 256
+
+
+def test_nemotron_h_depth_and_kinds_come_from_the_layer_vector():
+    """Depth from a vector, on a config that states no layer count at all.
+
+    Nemotron-3-Ultra declares no num_hidden_layers: its depth IS the length of
+    layers_block_type, and the MoE entries are MLP layers rather than separate blocks,
+    which is why the vector is longer than a reader expecting a transformer depth would
+    guess. This asserts both the depth and the per-position kind."""
+    d = ROOT / "models" / "nemotron-3-ultra-550b-a55b-bf16"
+    if not d.is_dir():
+        pytest.skip("nemotron-3-ultra is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    vector = t["layers_block_type"]
+    assert t.get("num_hidden_layers") is None, (
+        "this test is about the config that states no layer count; it now states one")
+    seq = layer_sequence(g["stack"])
+    assert seq == list(vector), "the stack must be the declared vector, position by position"
+    assert {k["id"] for k in g["layer_kinds"]} == set(vector)
+
+
+def test_nemotron_h_parses_the_character_form_of_the_layer_vector():
+    """The M/*/-/E character form, which no committed config exercises.
+
+    handler_nemotron_h accepts either a list of names or a character string, and every
+    config in the catalog today uses the list. The character branch is therefore live
+    code that real data does not reach, so it is tested directly: M state-space,
+    * attention, - MLP, E MoE, and an unknown character must raise rather than default."""
+    dg = _dg()
+    cfg = {
+        "hidden_size": 4096, "vocab_size": 128000, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "head_dim": 128, "intermediate_size": 8192,
+        "num_local_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 1024,
+        "mamba_num_heads": 64, "ssm_state_size": 128, "conv_kernel": 4,
+        "mamba_head_dim": 64, "n_groups": 8,
+        "hybrid_override_pattern": "M-*E",
+    }
+    kinds, stack = dg.handler_nemotron_h(cfg, cfg, "synthetic")
+    assert layer_sequence(stack) == ["mamba", "mlp", "attention", "moe"], (
+        "the character form must map M/-/*/E to state-space, MLP, attention and MoE")
+    assert {k["id"] for k in kinds} == {"mamba", "mlp", "attention", "moe"}
+
+    bad = dict(cfg, hybrid_override_pattern="M-*X")
+    with pytest.raises(dg.DeriveError) as exc:
+        dg.handler_nemotron_h(bad, bad, "synthetic")
+    assert "X" in str(exc.value), (
+        "an unknown layer character must be named in the error rather than defaulted")
+
+
+# --- Where the collectives land ----------------------------------------------------
+# A collective's `emit` condition is excluded from cost_signature on purpose: it selects
+# whether the node exists in a given deployment, which is a layout property rather than a
+# model one. That leaves it verified nowhere, which these cover structurally. This is the
+# dense-vs-MoE distinction the behavioural signature deliberately cannot see.
+
+
+def test_collectives_land_where_the_parallelism_needs_them():
+    """Every layer reduces its MLP output; only a routed layer dispatches to experts.
+
+    A dense layer under tensor parallelism reduces after its MLP. A routed layer also
+    exchanges tokens with the ranks holding the experts, which is an All2All under expert
+    parallelism. An All2All on a dense layer would price traffic that never moves; a
+    missing one on a routed layer would drop the dominant collective of an MoE step."""
+    checked_dense = checked_moe = 0
+    for d in model_dirs():
+        g = graph_of(d)
+        for kind in g["layer_kinds"]:
+            ops = [n for n in kind["nodes"] if n["op"] in ("AllReduce", "All2All")]
+            all2all = [n for n in ops if n["op"] == "All2All"]
+            allreduce = [n for n in ops if n["op"] == "AllReduce"]
+            has_experts = any(n["op"] == "GroupedGEMM" for n in kind["nodes"])
+            where = f"{d.name}/{kind['id']}"
+
+            assert allreduce, f"{where}: a layer that reduces nothing"
+            assert any(n["emit"] in ("tensor_parallel", "tensor_parallel_unless_sp_moe")
+                       for n in allreduce), (
+                f"{where}: no AllReduce conditioned on tensor parallelism")
+
+            if has_experts:
+                assert len(all2all) == 1, (
+                    f"{where}: a routed layer with {len(all2all)} All2All nodes; an MoE "
+                    f"step dispatches to the expert ranks exactly once")
+                assert all2all[0]["emit"] == "expert_parallel", (
+                    f"{where}: All2All emits on {all2all[0]['emit']!r}, but expert "
+                    f"dispatch is what expert parallelism conditions")
+                assert any(n["emit"] == "tensor_parallel_unless_sp_moe"
+                           for n in allreduce), (
+                    f"{where}: a routed layer's MLP reduction must stand down under "
+                    f"sequence-parallel MoE, which is what the _unless_sp_moe form says")
+                checked_moe += 1
+            else:
+                assert not all2all, (
+                    f"{where}: a layer with no routed experts emits All2All "
+                    f"{[n['role'] for n in all2all]}, pricing traffic that never moves")
+                checked_dense += 1
+    assert checked_dense and checked_moe, (
+        f"the catalog must exercise both shapes; saw {checked_dense} dense and "
+        f"{checked_moe} routed layer kinds")
+
+
+def test_every_emit_condition_is_one_a_resolver_knows():
+    """The closed set is the point: a graph cannot state a condition nothing evaluates.
+
+    The deriver's three EMIT_ constants are the whole vocabulary, so a committed graph
+    naming anything else would reach a resolver with no branch for it."""
+    dg = _dg()
+    known = {dg.EMIT_TENSOR_PARALLEL, dg.EMIT_EXPERT_PARALLEL,
+             dg.EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE}
+    for d in model_dirs():
+        for kind in graph_of(d)["layer_kinds"]:
+            for n in kind["nodes"]:
+                if "emit" not in n:
+                    continue
+                assert n["emit"] in known, (
+                    f"{d.name}/{kind['id']}: emit {n['emit']!r} is not in the closed set "
+                    f"{sorted(known)}")
+
+
+def test_a_recurrent_layer_reduces_its_mixer_output():
+    """A recurrent mixer is tensor-parallel the same way attention is.
+
+    Its output projection is sharded, so it reduces unconditionally under TP rather than
+    under the MoE-aware form an MLP output uses."""
+    seen = 0
+    for d in model_dirs():
+        for kind in graph_of(d)["layer_kinds"]:
+            if not any(n["op"] == "RecurrentUpdate" for n in kind["nodes"]):
+                continue
+            reduces = [n for n in kind["nodes"] if n["op"] == "AllReduce"]
+            assert any(n["emit"] == "tensor_parallel" for n in reduces), (
+                f"{d.name}/{kind['id']}: a recurrent layer with no unconditional "
+                f"tensor-parallel reduction of its mixer output")
+            seen += 1
+    if not seen:
+        pytest.skip("no recurrent layers in the catalog")
+
+
 # --- The speculator block ----------------------------------------------------------
 # A draft stack is work a deployment pays for on every step, so a wrong draft length or
 # a draft stack mirrored from the wrong layer kind misprices the model. The source field
