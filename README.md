@@ -76,6 +76,25 @@ the recorded `revision` (gated repos required an authenticated token). The
 committed bytes are byte-identical to that revision, so a reviewer with access can
 reproduce the fetch and diff.
 
+`graph.yaml` sits beside them: the model expressed as the cost primitives a forward
+pass launches, which is what a cost model prices. It is **generated, never
+hand-written** — `scripts/derive_graph.py` reads `config.json` and writes it,
+recording the SHA-256 of the config it derived from. Re-derive after adding or
+changing a config:
+
+```bash
+python3 scripts/derive_graph.py --model <name>   # one model
+python3 scripts/derive_graph.py                  # all
+python3 scripts/derive_graph.py --check          # verify, write nothing (CI runs this)
+```
+
+`--check` re-derives every graph and fails on any that differs from what is
+committed, which catches both a hand-edited graph and a config changed without
+re-deriving. The `ModelGraph` type itself is defined in
+[`blis-schemas`](https://github.com/inference-sim/blis-schemas) (`spec/model`); for how
+the repositories fit together, see
+[The BLIS Repositories](https://github.com/inference-sim/inference-sim/blob/main/docs/concepts/blis-repositories.md).
+
 ## Networks
 
 A **Network** is a *reusable fabric class* — `ib-400g`, `roce-200g`,
