@@ -149,7 +149,11 @@ def test_attention_shape_matches_config(d: Path):
 def test_expert_shape_matches_config(d: Path):
     """Expert count and top-k must come from the config, under whichever alias."""
     g, t = graph_of(d), text_config(config_of(d))
-    nodes = [n for k in g["layer_kinds"] for n in k["nodes"] if n["op"] == "GroupedGEMM"]
+    # The ROUTED expert node. A shared-expert node is a separate grouped GEMM where the
+    # checkpoint stores the two at different widths, and it is sized by the shared count
+    # rather than the routed one, so it is checked below instead.
+    nodes = [n for k in g["layer_kinds"] for n in k["nodes"]
+             if n["op"] == "GroupedGEMM" and n.get("role") != "shared_experts"]
     experts = (t.get("num_local_experts") or t.get("n_routed_experts")
                or t.get("num_experts"))
     if not nodes:
@@ -161,22 +165,30 @@ def test_expert_shape_matches_config(d: Path):
         assert n["top_k"] == top_k
         assert n["top_k"] <= n["experts"]
 
+    # Where a shared-expert node exists, it must carry the config's SHARED count, and
+    # every token passes through all of them rather than a routed subset.
+    shared_nodes = [n for k in g["layer_kinds"] for n in k["nodes"]
+                    if n.get("role") == "shared_experts"]
+    shared = t.get("n_shared_experts") or t.get("num_shared_experts")
+    for n in shared_nodes:
+        assert n["experts"] == shared, (
+            f"shared-expert node states {n['experts']}, config says {shared}")
+        assert n["top_k"] == n["experts"], (
+            "a shared expert is dense: every token passes through all of them")
+
 
 # Architecture families expected to produce identical layer structures, with the reason.
 # Every other pair of models must differ: a deriver that emitted one template for
 # everything would pass every per-model check above.
 EXPECTED_IDENTICAL = {
-    frozenset({"nemotron-3-ultra-550b-a55b-bf16", "nemotron-3-ultra-550b-a55b-nvfp4"}):
-        "the same architecture at two weight dtypes",
+
     frozenset({"minimax-m2.5", "minimax-m2.7"}):
         "one architecture across two MiniMax-M2 generations. Every cost-relevant field is "
         "identical: 62 layers, hidden 3072, 256 experts at top-8, intermediate 1536, 48 "
         "query heads over 8 KV heads at head_dim 128, vocab 200064, fp8 weights. The two "
         "configs differ only in max_position_embeddings (196608 against 204800) and a "
         "dtype label, neither of which the cost model reads",
-    frozenset({"nemotron-3.5-lightning-30b-a3b-bf16",
-               "nemotron-3.5-lightning-30b-a3b-nvfp4"}):
-        "the same architecture at two weight dtypes",
+
     frozenset({"glm-5", "glm-5.2", "glm-5.2-fp8", "glm-5.3"}):
         "one architecture across three GLM-5 generations. Every cost-relevant field is "
         "identical: 78 layers, hidden 6144, 256 experts at top-8, moe_intermediate 2048, "
@@ -247,6 +259,13 @@ def node_cost(n: dict) -> tuple:
         n.get("recurrent_kind"), n.get("state_size"), n.get("n_heads"),
         n.get("n_groups"), n.get("conv_kernel"), n.get("intermediate_size"),
         n.get("window"), n.get("index_topk"),
+        # compress_ratio bounds the compressed half of a sparse latent read, and a
+        # per-node weight_dtype overrides the global width for the tensors it names.
+        # Both change what a node costs, and both are distinctions this suite relies on
+        # elsewhere -- the C4A/C128A split and gpt-oss's expert-only MXFP4 -- so leaving
+        # them out made the collision tests blind to exactly the cases they were added
+        # to protect.
+        n.get("compress_ratio"), n.get("weight_dtype"),
     )
 
 
@@ -289,8 +308,17 @@ def test_expected_identical_groups_still_cost_the_same():
 
 
 def test_weight_dtypes_vary_across_the_catalog():
-    """A deriver that defaulted every dtype would pass the per-model checks."""
+    """A deriver that defaulted every dtype would pass the per-model checks.
+
+    Reads node overrides as well as the global, because a checkpoint that states its
+    mixed-precision layout explicitly keeps the BASE dtype global and carries the
+    quantized widths on the nodes they apply to. Looking only at the global would miss
+    nvfp4 entirely now that the Nemotron variants express it that way."""
     seen = {graph_of(d)["global"]["weight_dtype"] for d in model_dirs()}
+    for d in model_dirs():
+        g = graph_of(d)
+        seen |= {n["weight_dtype"] for k in g["layer_kinds"] for n in k["nodes"]
+                 if n.get("weight_dtype")}
     assert len(seen) >= 4, f"only {seen} appear; a default is suspected"
     # mxfp4 and nvfp4 are distinct formats, not spellings of one another, and both are in
     # the catalog. Collapsing them would misprice one.
@@ -358,6 +386,7 @@ def test_signature_ignores_layer_kind_identifiers():
     (lambda g: _widen_first_gemm(g), "widening one projection"),
     (lambda g: g["stack"].update(repeat=g["stack"]["repeat"] - 1), "dropping a layer"),
     (lambda g: _change_kv_heads(g), "changing the KV head count"),
+    (lambda g: _narrow_first_gemm_dtype(g), "narrowing one node's weight dtype"),
 ])
 def test_signature_notices_changes_that_cost_something(mutate, description):
     import copy
@@ -380,6 +409,16 @@ def _widen_first_gemm(g: dict) -> None:
     pytest.skip("no GEMM node to widen")
 
 
+def _narrow_first_gemm_dtype(g: dict) -> None:
+    """A per-node dtype override changes that node's weight bytes fourfold."""
+    for k in g["layer_kinds"]:
+        for n in k["nodes"]:
+            if n["op"] == "GEMM":
+                n["weight_dtype"] = "mxfp4"
+                return
+    pytest.skip("no GEMM node")
+
+
 def _change_kv_heads(g: dict) -> None:
     for k in g["layer_kinds"]:
         for n in k["nodes"]:
@@ -387,6 +426,40 @@ def _change_kv_heads(g: dict) -> None:
                 n["n_kv"] = max(1, n["n_kv"] // 2)
                 return
     pytest.skip("no attention node")
+
+
+@pytest.mark.parametrize("model,field,value,description", [
+    ("deepseek-v4-pro", "compress_ratio", 4,
+     "retuning a compressed stream's ratio"),
+    ("gpt-oss-120b", "weight_dtype", "bf16",
+     "widening a node's weight dtype"),
+])
+def test_signature_notices_a_changed_node_parameter(model, field, value, description):
+    """cost_signature must see the two fields its contract most depends on.
+
+    Both were omitted from node_cost: mutating either left the signature unchanged, so
+    the collision tests were blind to exactly the distinctions this suite relies on --
+    the C4A/C128A compression split, and gpt-oss's expert-only MXFP4 scope. A signature
+    that cannot see them would let a graph with the wrong one collide with a correct
+    graph and pass."""
+    import copy
+
+    d = ROOT / "models" / model
+    if not d.is_dir():
+        pytest.skip(f"{model} is not in the catalog")
+    g = graph_of(d)
+    before = cost_signature(g)
+    variant = copy.deepcopy(g)
+    changed = False
+    for k in variant["layer_kinds"]:
+        for n in k["nodes"]:
+            if field in n and n[field] != value:
+                n[field] = value
+                changed = True
+    assert changed, f"no node in {model} carries {field} to mutate"
+    assert cost_signature(variant) != before, (
+        f"{description} left the cost signature unchanged, so a graph with the wrong "
+        f"{field} would pass the collision tests")
 
 
 # --- Fidelity to the pinned implementations ---------------------------------------
@@ -465,7 +538,8 @@ def test_v4_only_ratio_4_layers_have_an_indexer():
     for idx, ratio in enumerate(t["compress_ratios"][: t["num_hidden_layers"]]):
         nodes = kinds[seq[idx]]["nodes"]
         has = any(n.get("role") == "block_index_scores" for n in nodes)
-        proj = any(n.get("role") == "index_qk_proj" for n in nodes)
+        proj = any(str(n.get("role", "")).startswith(("index_qk_proj", "index_wq_proj"))
+                   for n in nodes)
         assert has == proj, (
             f"layer {idx}: an indexer and its projection must appear together")
         seen.setdefault(ratio, set()).add(has)
@@ -634,7 +708,8 @@ def test_a_sparse_latent_read_prices_the_selection_it_claims():
                 f"{d.name}/{k['id']}: index_topk "
                 f"{selects[0]['index_topk']} asserts a top-k selection, but the layer "
                 f"has no block_index_scores node to charge for making it")
-            assert any(n.get("role") == "index_qk_proj" for n in k["nodes"]), (
+            assert any(str(n.get("role", "")).startswith(
+                ("index_qk_proj", "index_wq_proj")) for n in k["nodes"]), (
                 f"{d.name}/{k['id']}: an indexer with no projection to feed it")
             for n in scorers:
                 assert "window" not in n, (
@@ -754,6 +829,187 @@ def test_llama4_chunked_attention_is_a_recorded_gap_not_a_silent_one():
     assert "KNOWN GAP (Llama-4)" in src, (
         "the handler no longer records the chunked-attention gap; either close it or "
         "keep the note that explains why it is open")
+
+
+BYTES_PER_PARAM = {"bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0,
+                   "nvfp4": 0.5, "mxfp4": 0.5, "int4": 0.5}
+
+
+def weight_bytes(g: dict) -> float:
+    """Total weight bytes the stack holds, honouring per-node dtype overrides."""
+    base = g["global"]["weight_dtype"]
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    total = 0.0
+    for lid in layer_sequence(g["stack"]):
+        for n in kinds[lid]["nodes"]:
+            w = BYTES_PER_PARAM[n.get("weight_dtype") or base]
+            if n["op"] == "GEMM":
+                total += n["n"] * n["k"] * w
+            elif n["op"] == "GroupedGEMM":
+                total += 3 * n["n"] * n["k"] * n["experts"] * w
+    return total
+
+
+def test_nemotron_nvfp4_keeps_its_declared_mixed_precision_layout():
+    """An explicit quantized_layers map states a LAYOUT, not one width.
+
+    nemotron-3-ultra-nvfp4 names 49,152 routed-expert matrices NVFP4, 192 Mamba and
+    shared-expert matrices FP8, and ignores 243 more -- attention, the latent
+    projections, embeddings and the head -- which stay at the declared bf16 base.
+    Collapsing that to a single dominant width priced every ignored tensor at four
+    bits, including the latent projections ModelOpt explicitly excludes."""
+    d = ROOT / "models" / "nemotron-3-ultra-550b-a55b-nvfp4"
+    if not d.is_dir():
+        pytest.skip("nemotron-3-ultra-nvfp4 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    quant = t.get("quantization_config") or {}
+    assert quant.get("quantized_layers"), "this test is about a config stating the map"
+
+    assert g["global"]["weight_dtype"] == "bf16", (
+        "the base dtype stays global; the quantized widths ride on their own nodes")
+
+    by_role = {}
+    for k in g["layer_kinds"]:
+        for n in k["nodes"]:
+            if n["op"] in ("GEMM", "GroupedGEMM"):
+                by_role[n.get("role")] = n.get("weight_dtype")
+
+    assert by_role.get("experts") == "nvfp4", "the routed experts are the NVFP4 tensors"
+    assert by_role.get("shared_experts") == "fp8", (
+        "the shared experts are stored at FP8, so they cannot ride on the routed node")
+    assert by_role.get("mixer_out") == "fp8", "the Mamba projections are FP8"
+    for role in ("qkv_proj", "o_proj", "routed_expert_down_proj",
+                 "routed_expert_up_proj"):
+        if role in by_role:
+            assert by_role[role] is None, (
+                f"{role} is in the checkpoint's ignore list and must keep the bf16 "
+                f"base, not {by_role[role]!r}")
+
+
+def test_nemotron_nvfp4_occupies_more_than_a_uniform_four_bit_reading():
+    """The occupancy the layout decides, which is the cost of getting it wrong.
+
+    Asserted through bytes rather than labels: pricing the whole checkpoint at NVFP4
+    understates it, and pricing it all at bf16 overstates it, so the mixed reading must
+    land strictly between."""
+    d = ROOT / "models" / "nemotron-3-ultra-550b-a55b-nvfp4"
+    if not d.is_dir():
+        pytest.skip("nemotron-3-ultra-nvfp4 is not in the catalog")
+    g = graph_of(d)
+    mixed = weight_bytes(g)
+
+    import copy
+    all_four_bit = copy.deepcopy(g)
+    all_four_bit["global"]["weight_dtype"] = "nvfp4"
+    for k in all_four_bit["layer_kinds"]:
+        for n in k["nodes"]:
+            n.pop("weight_dtype", None)
+    uniform = weight_bytes(all_four_bit)
+
+    all_base = copy.deepcopy(g)
+    for k in all_base["layer_kinds"]:
+        for n in k["nodes"]:
+            n.pop("weight_dtype", None)
+    base = weight_bytes(all_base)
+
+    assert uniform < mixed < base, (
+        f"the mixed layout must sit between a uniform 4-bit reading "
+        f"({uniform / 2**30:.1f} GiB) and a uniform bf16 one ({base / 2**30:.1f} GiB), "
+        f"got {mixed / 2**30:.1f} GiB")
+
+
+def test_v4_projections_are_low_rank_stages_not_dense_rectangles():
+    """DeepSeek-V4's projection path is low-rank on both sides, with a norm between.
+
+    The input is fused_wqa_wkv (hidden -> q_lora_rank + head_dim), then q_norm, then
+    wq_b (q_lora_rank -> n_heads*head_dim). The output is a grouped wo_a then wo_b. A
+    single hidden-width rectangle overstated the input side 4.1x and the output side
+    2.5x -- about 39B parameters of phantom weight over 61 layers -- and the
+    intervening norm means the input stages cannot be fused into one GEMM anyway."""
+    g, t = _v4()
+    hidden, nq = t["hidden_size"], t["num_attention_heads"]
+    hd, q_lora = t["head_dim"], t["q_lora_rank"]
+    o_lora, o_groups = t["o_lora_rank"], t["o_groups"]
+
+    for k in g["layer_kinds"]:
+        roles = {n.get("role"): n for n in k["nodes"] if n["op"] == "GEMM"}
+        assert "qkv_proj" not in roles, (
+            f"{k['id']}: a dense QKV rectangle is not this family's projection path")
+        assert "o_proj" not in roles, (
+            f"{k['id']}: a dense output rectangle is not this family's output path")
+
+        fused, wq_b = roles["fused_wqa_wkv"], roles["wq_b"]
+        assert (fused["n"], fused["k"]) == (q_lora + hd, hidden)
+        assert (wq_b["n"], wq_b["k"]) == (nq * hd, q_lora)
+
+        wo_a, wo_b = roles["wo_a"], roles["wo_b"]
+        assert (wo_a["n"], wo_a["k"]) == (o_groups * o_lora, nq * hd // o_groups)
+        assert (wo_b["n"], wo_b["k"]) == (hidden, o_groups * o_lora)
+
+        # The norm between the two input stages, without which they would be one GEMM.
+        assert any(n.get("role") == "q_norm" for n in k["nodes"]), (
+            f"{k['id']}: no q_norm between the q-LoRA down- and up-projections")
+
+    # The totals, so a future refactor cannot drift while keeping the role names.
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    k0 = kinds[layer_sequence(g["stack"])[0]]
+    roles = {n.get("role"): n for n in k0["nodes"] if n["op"] == "GEMM"}
+    assert (roles["fused_wqa_wkv"]["n"] * roles["fused_wqa_wkv"]["k"]
+            + roles["wq_b"]["n"] * roles["wq_b"]["k"]) == 115_343_360
+    assert (roles["wo_a"]["n"] * roles["wo_a"]["k"]
+            + roles["wo_b"]["n"] * roles["wo_b"]["k"]) == 184_549_376
+
+
+def test_kimi_k3_kda_layer_prices_its_mixer_projections():
+    """A RecurrentUpdate carries no N or K, so the projections must be their own nodes.
+
+    The KDA mixer emitted only RecurrentUpdate and an AllReduce -- not even a producer
+    GEMM for the reduction that followed it -- dropping 443,580,416 parameters per layer
+    over 69 KDA layers, about 30.6B, plus their FLOPs.
+
+    Shapes from the pinned KimiDeltaAttention: three separate q/k/v projections, a
+    low-rank decay gate through head_dim, one beta scalar per head, a full-rank output
+    gate because this config sets use_full_rank_gate, and an output projection."""
+    d = ROOT / "models" / "kimi-k3"
+    if not d.is_dir():
+        pytest.skip("kimi-k3 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    linear = t["linear_attn_config"]
+    hidden = t["hidden_size"]
+    heads, dim = linear["num_heads"], linear["head_dim"]
+    inner = heads * dim
+
+    kda = next(k for k in g["layer_kinds"] if k["id"].startswith("kda_"))
+    roles = {n.get("role"): n for n in kda["nodes"] if n["op"] == "GEMM"}
+    expected = {
+        "kda_q_proj": (inner, hidden),
+        "kda_k_proj": (inner, hidden),
+        "kda_v_proj": (inner, hidden),
+        "kda_f_a_proj": (dim, hidden),
+        "kda_f_b_proj": (inner, dim),
+        "kda_b_proj": (heads, hidden),
+        "kda_o_proj": (hidden, inner),
+    }
+    if linear.get("use_full_rank_gate"):
+        expected["kda_g_proj"] = (inner, hidden)
+    else:
+        expected["kda_g_a_proj"] = (dim, hidden)
+        expected["kda_g_b_proj"] = (inner, dim)
+
+    for role, (n, k) in expected.items():
+        assert role in roles, f"the KDA mixer omits {role}"
+        assert (roles[role]["n"], roles[role]["k"]) == (n, k), (
+            f"{role} is {roles[role]['n']}x{roles[role]['k']}, expected {n}x{k}")
+
+    total = sum(roles[r]["n"] * roles[r]["k"] for r in expected)
+    assert total == 443_580_416, (
+        f"the KDA mixer prices {total:,} projection parameters per layer, expected "
+        f"443,580,416")
+
+    # The reduction must have something producing the value it reduces.
+    ops = [n["op"] for n in kda["nodes"]]
+    assert ops.index("GEMM") < ops.index("AllReduce"), (
+        "the mixer reduces an output no node in the layer produced")
 
 
 # --- The hybrid handlers' specific structure ---------------------------------------

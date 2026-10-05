@@ -150,6 +150,74 @@ def raw_quant(cfg: dict[str, Any], model: str) -> dict[str, Any]:
     return quant if isinstance(quant, dict) else {}
 
 
+# A role's dtype class, for a checkpoint that states its mixed-precision layout
+# explicitly. The map is keyed by the tensor-name fragment the vendor uses and valued by
+# the graph role it prices, so a width read from the checkpoint lands on the right node.
+QUANT_ROLE_CLASSES = {
+    "experts.": "routed_experts",
+    "shared_experts.": "shared_experts",
+    "mixer.in_proj": "recurrent_in",
+    "mixer.out_proj": "recurrent_out",
+}
+
+# Vendor quant-algo spellings to the graph's dtype vocabulary.
+QUANT_ALGOS = {
+    "NVFP4": "nvfp4",
+    "MXFP4": "mxfp4",
+    "FP8": "fp8",
+    "INT8": "int8",
+    "INT4": "int4",
+    # A W{weights}A{activations} spelling names both widths; the graph prices WEIGHT
+    # bytes, so the W half is what it reads. nemotron-3.5-lightning-nvfp4 ships
+    # W4A16_NVFP4 -- four-bit NVFP4 weights against bf16 activations -- which stores
+    # the same bytes per parameter as the plain NVFP4 spelling.
+    "W4A16_NVFP4": "nvfp4",
+    "W4A16_MXFP4": "mxfp4",
+    "W8A8_FP8": "fp8",
+    "W8A16_INT8": "int8",
+}
+
+
+def quantized_classes(cfg: dict[str, Any], model: str) -> dict[str, str]:
+    """Map each role class to its stored width, from an explicit per-tensor map.
+
+    A checkpoint that enumerates its quantized tensors states a LAYOUT, not a single
+    width: nemotron-3-ultra-nvfp4 names 49,152 routed-expert matrices as NVFP4, 192
+    Mamba and shared-expert matrices as FP8, and ignores 243 more -- attention, the
+    latent projections, embeddings and the head -- which stay at the declared bf16 base.
+    Collapsing that to one dominant width prices every ignored tensor at four bits.
+
+    Returns an empty mapping where the config states no such map, which leaves the
+    single-width path untouched for every other model."""
+    quant = raw_quant(cfg, model)
+    layers = quant.get("quantized_layers")
+    if not isinstance(layers, dict) or not layers:
+        return {}
+    found: dict[str, set[str]] = {}
+    for name, spec in layers.items():
+        algo = spec.get("quant_algo") if isinstance(spec, dict) else spec
+        width = QUANT_ALGOS.get(str(algo).upper())
+        if width is None:
+            raise DeriveError(
+                f"{model}: quantized_layers names algo {algo!r}, which this deriver "
+                f"does not map; add it to QUANT_ALGOS rather than letting the tensor "
+                f"take a width the checkpoint does not state")
+        # Longest fragment wins, so shared_experts does not match the experts rule.
+        match = max((frag for frag in QUANT_ROLE_CLASSES if frag in name),
+                    key=len, default=None)
+        if match is None:
+            continue
+        found.setdefault(QUANT_ROLE_CLASSES[match], set()).add(width)
+    out = {}
+    for role, widths in found.items():
+        if len(widths) > 1:
+            raise DeriveError(
+                f"{model}: role class {role!r} is quantized at more than one width "
+                f"{sorted(widths)}; a single node cannot price both")
+        out[role] = widths.pop()
+    return out
+
+
 def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
     """Return the graph's dtype name for the model's parameters.
 
@@ -158,6 +226,11 @@ def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
     per parameter would overstate both occupancy and decode-time traffic."""
     quant = raw.get("quantization_config") or cfg.get("quantization_config") or {}
     if isinstance(quant, dict) and quant:
+        # A checkpoint that enumerates its quantized tensors states a layout rather than
+        # a width. The base dtype stays global and the per-tensor widths ride on the
+        # nodes they apply to, so the tensors the map IGNORES keep the base.
+        if quantized_classes(cfg, model):
+            return base_dtype(cfg, raw, model)
         fmt = str(quant.get("quant_method", "")).lower()
         if "nvfp4" in fmt or "modelopt_fp4" in fmt:
             return "nvfp4"
@@ -443,6 +516,9 @@ def moe(cfg: dict[str, Any], model: str, hidden: int) -> dict[str, Any]:
         fmt = str(quant.get("quant_method", "")).lower()
         if fmt in ("mxfp4", "nvfp4") and quant.get("modules_to_not_convert"):
             node["weight_dtype"] = fmt
+    classes = quantized_classes(cfg, model)
+    if classes.get("routed_experts"):
+        node["weight_dtype"] = classes["routed_experts"]
 
     expert_dtype = cfg.get("expert_dtype")
     if expert_dtype is not None:
@@ -480,12 +556,39 @@ def moe_block(cfg: dict[str, Any], model: str, hidden: int) -> list[dict[str, An
     `self.shared_experts(identity)` after the up-projection -- so neither is affected by
     the latent width, which is why shared_intermediate_size stays as moe() states it."""
     node = moe(cfg, model, hidden)
+    nodes = [node]
+
+    # A shared expert stored at a DIFFERENT width from the routed ones cannot ride on
+    # the routed node: shared_experts/shared_intermediate_size describe work priced at
+    # the node's own weight_dtype. nemotron-3-ultra-nvfp4 is the case in hand -- routed
+    # experts NVFP4, shared experts FP8 -- so the shared half becomes its own node and
+    # the routed node stops claiming it.
+    classes = quantized_classes(cfg, model)
+    shared_width = classes.get("shared_experts")
+    if shared_width and shared_width != node.get("weight_dtype") and node.get(
+            "shared_experts"):
+        inner = int(node.get("shared_intermediate_size") or node["n"])
+        shared = {
+            "op": "GroupedGEMM",
+            "role": "shared_experts",
+            "n": inner,
+            "k": node["k"],
+            "experts": int(node["shared_experts"]),
+            "top_k": int(node["shared_experts"]),
+            "weight_dtype": shared_width,
+        }
+        if node.get("latent_size"):
+            shared["latent_size"] = node["latent_size"]
+        node.pop("shared_experts", None)
+        node.pop("shared_intermediate_size", None)
+        nodes.append(shared)
+
     latent = node.get("latent_size")
     if not latent:
-        return [node]
+        return nodes
     return [
         gemm("routed_expert_down_proj", int(latent), hidden),
-        node,
+        *nodes,
         gemm("routed_expert_up_proj", hidden, int(latent)),
     ]
 
@@ -914,6 +1017,41 @@ def handler_deepseek_v4(cfg, raw, model):
 
     swa_window = int(require(cfg, "sliding_window", model))
 
+    # The projection path is LOW-RANK on both sides, and an RMSNorm sits between the
+    # two input stages, so neither side can be folded into one hidden-width rectangle.
+    # Shapes from the pinned DeepseekV4Attention (attention.py:248-284):
+    #
+    #   fused_wqa_wkv : hidden -> q_lora_rank + head_dim   (fused q-LoRA down + KV)
+    #   q_norm        : over q_lora_rank
+    #   wq_b          : q_lora_rank -> n_heads * head_dim
+    #   wo_a          : grouped, (n_heads*head_dim)/o_groups -> o_groups*o_lora_rank
+    #   wo_b          : o_groups*o_lora_rank -> hidden
+    #
+    # Pricing these as one dense QKV and one dense output rectangle overstated the input
+    # side 4.1x (473,432,064 against 115,343,360) and the output side 2.5x (469,762,048
+    # against 184,549,376), which over 61 layers is tens of billions of parameters in
+    # both weight bytes and FLOPs.
+    q_lora = int(require_key(cfg, "q_lora_rank", model))
+    o_lora = int(require_key(cfg, "o_lora_rank", model))
+    o_groups = int(require_key(cfg, "o_groups", model))
+    q_heads = int(require(cfg, "num_q_heads", model))
+    if (q_heads * total_dim) % o_groups:
+        raise DeriveError(
+            f"{model}: o_groups {o_groups} does not divide the {q_heads * total_dim}-wide "
+            f"head concatenation, so the grouped output projection has no shape")
+
+    def projection_nodes():
+        return [
+            gemm("fused_wqa_wkv", q_lora + total_dim, hidden),
+            norm("q_norm"),
+            gemm("wq_b", q_heads * total_dim, q_lora),
+        ], [
+            # wo_a is a batched matmul over o_groups groups; N and K are the per-call
+            # shape the consumer prices, and the group count rides in the role.
+            gemm("wo_a", o_groups * o_lora, q_heads * total_dim // o_groups),
+            gemm("wo_b", hidden, o_groups * o_lora),
+        ]
+
     def layer_for(ratio):
         # The read set is the UNION of the retained sliding window and the compressed
         # positions, not a choice between them: every layer keeps its SWA window
@@ -928,25 +1066,41 @@ def handler_deepseek_v4(cfg, raw, model):
         # (position + 1) // compress_ratio), which no fixed token count expresses,
         # hence compress_ratio in the graph.
         selects_topk = ratio == 4
-        nodes = attention_block(
-            cfg, model, hidden,
+        attn = attention(
+            cfg, model,
             kind="sparse_mla" if ratio > 1 else "mla",
             latent_width=total_dim,
             window=swa_window,
             compress_ratio=ratio if ratio > 1 else None,
             index_topk=topk if selects_topk else None,
         )
+        inp, out = projection_nodes()
+        nodes = [norm("input_norm"), *inp]
+        if ratio > 1:
+            # The compressor runs whenever compress_ratio > 1 -- a broader condition
+            # than the indexer's -- and its fused KV-and-gate projection is work of its
+            # own, applied to the hidden states (attention.py, fused_wkv_wgate).
+            nodes.append(gemm("compressor_fused_wkv_wgate", total_dim + 1, hidden))
         if selects_topk:
             # The indexer exists ONLY on ratio-4 layers: vLLM builds one under
             # `if self.compress_ratio == 4`, noting "Only C4A uses sparse attention and
             # hence has indexer" (attention.py:297-317). A ratio-128 layer has a
             # compressor but no indexer, and pricing one there charges a
             # context-proportional scan the layer never runs.
-            at = next(i for i, n in enumerate(nodes) if n.get("op") == "Attention")
-            nodes = nodes[:at] + [
-                gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
+            #
+            # Its wq_b reads the q-LoRA rank, not the hidden size, and it carries its
+            # own compressor and a per-head weights projection.
+            nodes += [
+                gemm("index_wq_proj", index_heads * index_dim, q_lora),
+                gemm("index_weights_proj", index_heads, hidden),
+                gemm("index_compressor_fused_wkv_wgate", index_dim + 1, hidden),
                 dict(indexer),
-            ] + nodes[at:]
+            ]
+        nodes += [
+            attn,
+            *out,
+            collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
+        ]
         nodes += [
             norm("post_attn_norm"),
             *moe_block(cfg, model, hidden),
@@ -1239,6 +1393,16 @@ def handler_nemotron_h(cfg, raw, model):
              int(cfg["mamba_num_heads"]) * int(cfg["mamba_head_dim"])),
         collective("AllReduce", "mixer_out", EMIT_TENSOR_PARALLEL),
     ]
+    # The recurrent mixer's projections where the checkpoint states their width. The
+    # nvfp4 variant stores these at FP8 while its routed experts are NVFP4, so they
+    # cannot take the global width either way round.
+    classes = quantized_classes(cfg, model)
+    if classes.get("recurrent_out"):
+        for n in mamba:
+            # Scoped to the projection: the AllReduce that follows shares the role name
+            # and holds no parameters, so a dtype on it describes nothing.
+            if n.get("role") == "mixer_out" and n["op"] == "GEMM":
+                n["weight_dtype"] = classes["recurrent_out"]
     moe_nodes = [
         norm("input_norm"),
         *moe_block(cfg, model, hidden),
@@ -1296,17 +1460,54 @@ def handler_kimi_k3(cfg, raw, model):
               collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
 
+    # The KDA mixer's dense projections. RecurrentUpdate carries no N or K, so it
+    # cannot account for these weights: without them the layer had no producer GEMM at
+    # all for the reduction that follows it, dropping 443,580,416 parameters per layer
+    # over 69 KDA layers (about 30.6B) and their FLOPs with them.
+    #
+    # Shapes from the pinned KimiDeltaAttention (modeling_kimi_linear.py:495-541). Q, K
+    # and V are three separate Linears rather than one fused projection, each followed
+    # by its own ShortConvolution; the decay path bottlenecks through head_dim; beta is
+    # one scalar per head; and the output gate is a single dense g_proj here because
+    # this config sets use_full_rank_gate (the low-rank g_a/g_b pair is the default).
+    kda_heads = int(linear.get("num_heads") or require(cfg, "num_q_heads", model))
+    kda_dim = int(linear.get("head_dim") or head_dim(cfg, model))
+    kda_inner = kda_heads * kda_dim
+    kda_proj = [
+        gemm("kda_q_proj", kda_inner, hidden),
+        gemm("kda_k_proj", kda_inner, hidden),
+        gemm("kda_v_proj", kda_inner, hidden),
+        # The decay gate, low-rank through head_dim.
+        gemm("kda_f_a_proj", kda_dim, hidden),
+        gemm("kda_f_b_proj", kda_inner, kda_dim),
+        # One beta scalar per head.
+        gemm("kda_b_proj", kda_heads, hidden),
+    ]
+    if linear.get("use_full_rank_gate"):
+        kda_proj.append(gemm("kda_g_proj", kda_inner, hidden))
+    else:
+        kda_proj += [
+            gemm("kda_g_a_proj", kda_dim, hidden),
+            gemm("kda_g_b_proj", kda_inner, kda_dim),
+        ]
     kda_mixer = [
         norm("input_norm"),
+        *kda_proj,
         {
             "op": "RecurrentUpdate",
             "recurrent_kind": "kda",
-            "n_heads": int(require(cfg, "num_q_heads", model)),
-            "state_size": int(linear.get("head_dim") or head_dim(cfg, model)),
+            "n_heads": kda_heads,
+            "state_size": kda_dim,
+            "conv_kernel": int(linear.get("short_conv_kernel_size") or 0) or None,
             "state_dtype": "fp32",
         },
+        gemm("kda_o_proj", hidden, kda_inner),
         collective("AllReduce", "mixer_out", EMIT_TENSOR_PARALLEL),
     ]
+    # conv_kernel is omitted rather than zeroed where the config states none.
+    kda_mixer = [n if n.get("conv_kernel") is not None or n.get("op") != "RecurrentUpdate"
+                 else {k: v for k, v in n.items() if k != "conv_kernel"}
+                 for n in kda_mixer]
     kda = with_moe(kda_mixer)
     mla = with_moe(attention_block(cfg, model, hidden))
     kinds = [

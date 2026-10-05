@@ -16,12 +16,30 @@ layer_kinds:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
-    n: 66048
+    role: fused_wqa_wkv
+    n: 2048
+    k: 7168
+  - op: Elementwise
+    role: q_norm
+  - op: GEMM
+    role: wq_b
+    n: 65536
+    k: 1536
+  - op: GEMM
+    role: compressor_fused_wkv_wgate
+    n: 513
     k: 7168
   - op: GEMM
-    role: index_qk_proj
-    n: 8320
+    role: index_wq_proj
+    n: 8192
+    k: 1536
+  - op: GEMM
+    role: index_weights_proj
+    n: 64
+    k: 7168
+  - op: GEMM
+    role: index_compressor_fused_wkv_wgate
+    n: 129
     k: 7168
   - op: Attention
     role: block_index_scores
@@ -39,9 +57,13 @@ layer_kinds:
     index_topk: 1024
     compress_ratio: 4
   - op: GEMM
-    role: o_proj
+    role: wo_a
+    n: 16384
+    k: 4096
+  - op: GEMM
+    role: wo_b
     n: 7168
-    k: 65536
+    k: 16384
   - op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -82,13 +104,35 @@ layer_kinds:
     - 9
   - - 9
     - 10
+  - - 10
+    - 11
+  - - 11
+    - 12
+  - - 12
+    - 13
+  - - 13
+    - 14
+  - - 14
+    - 15
+  - - 15
+    - 16
 - id: csa128_moe
   nodes:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
-    n: 66048
+    role: fused_wqa_wkv
+    n: 2048
+    k: 7168
+  - op: Elementwise
+    role: q_norm
+  - op: GEMM
+    role: wq_b
+    n: 65536
+    k: 1536
+  - op: GEMM
+    role: compressor_fused_wkv_wgate
+    n: 513
     k: 7168
   - op: Attention
     kind: sparse_mla
@@ -99,9 +143,13 @@ layer_kinds:
     window: 128
     compress_ratio: 128
   - op: GEMM
-    role: o_proj
+    role: wo_a
+    n: 16384
+    k: 4096
+  - op: GEMM
+    role: wo_b
     n: 7168
-    k: 65536
+    k: 16384
   - op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -138,14 +186,28 @@ layer_kinds:
     - 7
   - - 7
     - 8
+  - - 8
+    - 9
+  - - 9
+    - 10
+  - - 10
+    - 11
+  - - 11
+    - 12
 - id: mtp_moe
   nodes:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
-    n: 66048
+    role: fused_wqa_wkv
+    n: 2048
     k: 7168
+  - op: Elementwise
+    role: q_norm
+  - op: GEMM
+    role: wq_b
+    n: 65536
+    k: 1536
   - op: Attention
     kind: mla
     n_q: 128
@@ -154,9 +216,13 @@ layer_kinds:
     qk_rope_head_dim: 64
     window: 128
   - op: GEMM
-    role: o_proj
+    role: wo_a
+    n: 16384
+    k: 4096
+  - op: GEMM
+    role: wo_b
     n: 7168
-    k: 65536
+    k: 16384
   - op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -193,6 +259,12 @@ layer_kinds:
     - 7
   - - 7
     - 8
+  - - 8
+    - 9
+  - - 9
+    - 10
+  - - 10
+    - 11
 stack:
   prologue:
   - csa128_moe
