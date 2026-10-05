@@ -529,14 +529,28 @@ def test_a_whole_part_count_passes_the_gate(good_catalog):
 
 
 def test_the_real_catalog_declares_an_sm_count_for_every_chip():
-    """Every chip needs an SM count and a node width: the cost model's 12-SM
-    Triton-fetch derate is a fraction of the first, and whether a collective
-    group crosses a node boundary is decided by the second. A chip missing
-    either cannot price an offload run or a multi-node one."""
+    """Every chip needs an SM count: the cost model's 12-SM Triton-fetch derate is a
+    fraction of it, and a chip missing it cannot price an offload run.
+
+    GPUsPerNode is deliberately NOT required here. How many GPUs sit in a node is a
+    property of the deployment, not of the silicon — the same H200 ships on 4- and
+    8-GPU baseboards and in PCIe chassis of several widths — and the value the cost
+    model actually reads comes from the scenario's cluster block
+    (blis-latency-kernel/internal/resolve/layout.go reads s.Cluster.GPUsPerNode, and
+    nothing reads Chip.GPUsPerNode). A chip-level copy would be a default that
+    disagrees silently with the run it is pricing.
+
+    GB200-NVL72 keeps it, because there a tray boundary IS a hardware fact: its node
+    is a Grace-Blackwell tray of 4 GPUs inside a 72-GPU NVLink domain, and
+    blis-schemas checks GPUsPerRack against it."""
     root = Path(__file__).resolve().parent.parent
     chips = sorted((root / "hardware").glob("*.yaml"))
     assert chips, "no chips found to check"
     for chip in chips:
         data = yaml.safe_load(chip.read_text())
         assert data.get("SMCount", 0) > 0, f"{chip.name} declares no SMCount"
-        assert data.get("GPUsPerNode", 0) > 0, f"{chip.name} declares no GPUsPerNode"
+        if data.get("GPUsPerRack", 0) > 0:
+            assert data.get("GPUsPerNode", 0) > 0, (
+                f"{chip.name} declares GPUsPerRack but no GPUsPerNode; the rack tier "
+                f"is expressed as a multiple of the node tier"
+            )
