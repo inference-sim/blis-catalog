@@ -124,7 +124,7 @@ def require_key(cfg: dict[str, Any], key: str, model: str) -> Any:
     """Return a config key by its literal name, or raise.
 
     Distinct from `require`, which resolves a CONCEPT through the alias table. A field
-    that only one family declares — a GDN's head geometry, say — has no cross-dialect
+    that only one family declares -- a GDN's head geometry, say -- has no cross-dialect
     concept to alias, so adding it to ALIASES would imply a generality it does not have.
     Reading it by name keeps the alias table a statement about shared concepts.
     """
@@ -142,6 +142,12 @@ def text_config(raw: dict[str, Any]) -> dict[str, Any]:
     A multimodal config nests them under text_config beside a vision or audio tower.
     The graph prices the decoder, and records that it does so."""
     return raw.get("text_config", raw)
+
+
+def raw_quant(cfg: dict[str, Any], model: str) -> dict[str, Any]:
+    """The quantization block as seen from a config slice, or an empty mapping."""
+    quant = cfg.get("quantization_config") or {}
+    return quant if isinstance(quant, dict) else {}
 
 
 def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
@@ -215,18 +221,48 @@ def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
         # 16-element with an FP8 scale, by definition of each format. gpt-oss declares
         # `quant_method: mxfp4` with no config_groups at all.
         #
-        # Only these two are accepted by name. A method whose name does not fix a width —
-        # "compressed-tensors" is the case in hand — still needs its groups, which is why
+        # Only these two are accepted by name. A method whose name does not fix a width --
+        # "compressed-tensors" is the case in hand -- still needs its groups, which is why
         # this sits after that branch rather than before it.
         if fmt in ("mxfp4", "nvfp4"):
+            # ...but only where it covers the whole checkpoint. modules_to_not_convert
+            # names the tensor sets the method LEAVES ALONE, and gpt-oss excludes
+            # self_attn, the router, the embeddings and lm_head -- so MXFP4 there is the
+            # expert weights only, and returning it as the global width prices every
+            # attention projection and the head at 4 bits instead of 16. The quantized
+            # scope is carried on the expert node instead, the same way an expert_dtype
+            # narrower than the global width is.
+            if quant.get("modules_to_not_convert"):
+                return base_dtype(cfg, raw, model)
             return fmt
         if fmt:
             raise DeriveError(
                 f"{model}: quant_method {fmt!r} with no group widths; the deriver "
                 f"cannot infer the stored width"
             )
+    return base_dtype(cfg, raw, model)
+
+
+# The width a partially-quantized checkpoint stores its UNQUANTIZED tensors in, for a
+# config that states no dtype at all. gpt-oss is the case in hand: it declares neither
+# torch_dtype nor dtype, and its quantization_config covers only the experts, so the
+# non-expert width has to come from somewhere. OpenAI's model card and the InferenceX
+# descriptor this catalog cites for the model both state BF16 for those tensors.
+# Recorded per model rather than defaulted, because a default here would silently price
+# every future dtype-less config at two bytes.
+UNQUANTIZED_BASE = {
+    "gpt-oss-120b": "bf16",
+    "gpt-oss-20b": "bf16",
+}
+
+
+def base_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
+    """The declared parameter dtype, ignoring any quantization block."""
     declared = pick(cfg, "dtype") or pick(raw, "dtype")
     if declared is None:
+        known = UNQUANTIZED_BASE.get(model)
+        if known:
+            return known
         raise DeriveError(f"{model}: no dtype declared")
     name = DTYPES.get(str(declared).lower())
     if name is None:
@@ -398,6 +434,16 @@ def moe(cfg: dict[str, Any], model: str, hidden: int) -> dict[str, Any]:
     # 720 GiB to 1,441 GiB, which puts 180 GiB per rank on a 141 GiB H200 and makes a
     # deployment InferenceX ran at tp=8 on 8 GPUs look impossible. An unrecognized value
     # raises rather than falling back to the global width: falling back is the bug.
+    # A method that quantizes only part of the checkpoint leaves the global width at the
+    # unquantized base, so the experts -- which ARE quantized -- carry the narrow width
+    # here. The mirror of the expert_dtype case below: there the experts are narrower
+    # than a global that is itself quantized; here they are the only narrow thing.
+    quant = raw_quant(cfg, model)
+    if quant:
+        fmt = str(quant.get("quant_method", "")).lower()
+        if fmt in ("mxfp4", "nvfp4") and quant.get("modules_to_not_convert"):
+            node["weight_dtype"] = fmt
+
     expert_dtype = cfg.get("expert_dtype")
     if expert_dtype is not None:
         mapped = EXPERT_DTYPES.get(str(expert_dtype))
@@ -473,7 +519,7 @@ def compress(sequence: list[str]) -> dict[str, Any]:
 
     It is NOT what makes step-time computation fast. A kernel collapses the stack to a
     per-kind layer count once at construction, so its per-step work is proportional to the
-    number of distinct layer kinds — three for the widest model here — whichever way the
+    number of distinct layer kinds -- three for the widest model here -- whichever way the
     sequence was spelled. Compression saves file size and reading effort, not cycles.
 
     The search prefers the fewest stored entries, and declines to store a prologue or
@@ -567,6 +613,36 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
     ]
 
 
+def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
+                      nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Splice a DSA lightning indexer in front of the attention node.
+
+    The indexer is what makes a sparse latent read sparse: it scores every cached
+    position to select the top-k the attention then reads. That makes it the ONLY
+    context-proportional term in such a layer -- measured at 3.53x over a 12x context
+    increase where the attention it feeds moves 1.18x -- so it is its own node, with no
+    window, rather than folded into a bounded attention.
+
+    A graph recording index_topk without this node asserts a selection it does not
+    charge for, which understates the dominant long-context cost. Shared by every family
+    that ships the indexer rather than reimplemented per handler, which is how the
+    GLM-5 family came to declare the full indexer spec and emit none of it."""
+    index_heads = int(require_key(cfg, "index_n_heads", model))
+    index_dim = int(require_key(cfg, "index_head_dim", model))
+    at = next(i for i, n in enumerate(nodes) if n.get("op") == "Attention")
+    return nodes[:at] + [
+        gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
+        {
+            "op": "Attention",
+            "role": "block_index_scores",
+            "kind": "gqa",
+            "n_q": index_heads,
+            "n_kv": 1,
+            "d_h": index_dim,
+        },
+    ] + nodes[at:]
+
+
 # --- Architecture handlers ------------------------------------------------------
 # One handler per family. A family whose layer sequence is uniform returns one layer
 # kind and a repeat; a hybrid returns several kinds and the sequence that orders them.
@@ -600,7 +676,30 @@ def handler_moe(cfg, raw, model):
     plus a routed expert layer.
 
     Where a config alternates dense and sparse MLP layers, the dense ones become a
-    prologue: the sequence has no repeating unit that includes them."""
+    prologue: the sequence has no repeating unit that includes them.
+
+    KNOWN GAP (Llama-4): this family uses chunked local attention bounded by
+    attention_chunk_size on most layers, with periodic full-attention NoPE layers, and
+    this handler prices every layer as unbounded GQA. The split is NOT derivable from the
+    committed Scout checkpoint: transformers reads it from config.layer_types
+    (modeling_llama4.py dispatches create_chunked_causal_mask per layer from that list),
+    and this config declares no layer_types, no moe_layers, and an EMPTY no_rope_layers.
+    Deriving a pattern would mean inventing one, which is what this deriver's handler
+    registry exists to prevent.
+
+    The cost of the gap is not uniform across the catalog's workloads, and is larger than
+    "chunk size exceeds every context" would suggest. At attention_chunk_size 8192,
+    chatbot (512) and contentgen (2048) sit well inside one chunk, where a bounded and an
+    unbounded read coincide exactly. summarization reaches 8704 only at its maximum. But
+    multidoc's TYPICAL context is 11776 and its maximum 22016, so on that workload this
+    handler overstates the per-token read on the chunked layers by roughly the ratio of
+    context to chunk -- about 1.4x typical, 2.7x at the tail.
+
+    Recorded rather than silently accepted: a reader comparing a Llama-4 multidoc
+    prediction against a measurement should suspect this first. Closing it needs the
+    per-layer split, which needs either a checkpoint that declares layer_types or the
+    vendor pattern confirmed against an implementation.
+    """
     hidden = int(require(cfg, "hidden_size", model))
     layers = int(require(cfg, "num_layers", model))
 
@@ -608,15 +707,26 @@ def handler_moe(cfg, raw, model):
     if window and cfg.get("use_sliding_window") is False:
         window = None
 
-    def sparse_nodes(win=None):
+    # A family in this group may ship a DSA lightning indexer: the GLM-5 generations
+    # declare model_type glm_moe_dsa with a full index_n_heads/index_head_dim/index_topk
+    # spec, and attention() reads the topk into kind=sparse_mla. The selection work is
+    # a node of its own, and omitting it leaves the graph asserting a top-k it never
+    # charges for -- which is what happened here across 78 layers per model.
+    indexed = bool(pick(cfg, "index_topk")) and cfg.get("index_n_heads") is not None
+
+    def attn_nodes(win=None):
         n = attention_block(cfg, model, hidden, window=win)
+        return lightning_indexer(cfg, model, hidden, n) if indexed else n
+
+    def sparse_nodes(win=None):
+        n = attn_nodes(win)
         n += [norm("post_attn_norm"), *moe_block(cfg, model, hidden),
               collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
               collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
 
     def dense_nodes(win=None):
-        n = attention_block(cfg, model, hidden, window=win)
+        n = attn_nodes(win)
         n += [norm("post_attn_norm")] + dense_mlp(cfg, model, hidden)
         n += [collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
@@ -702,7 +812,7 @@ def handler_minimax_m2(cfg, raw, model):
 
     The config carries attn_type_list, a per-layer vector, and on the published M2.5
     weights every entry is the same. So the stack is uniform and handler_moe prices it
-    exactly — but the vector is checked rather than ignored, because a later variant that
+    exactly -- but the vector is checked rather than ignored, because a later variant that
     mixed attention kinds would otherwise be priced as though it did not.
     """
     types = cfg.get("attn_type_list")
@@ -1088,7 +1198,7 @@ def handler_qwen3_5_moe(cfg, raw, model):
 
 def handler_nemotron_h(cfg, raw, model):
     """NemotronH: a declared per-layer vector over state-space, MoE and attention
-    layers, with no repeating unit and — on one variant — no stated layer count.
+    layers, with no repeating unit and -- on one variant -- no stated layer count.
 
     Depth is the vector's length. The MoE entries are MLP layers rather than separate
     transformer blocks, which is why the vector is longer than a reader expecting

@@ -610,6 +610,152 @@ def test_a_latent_moe_states_its_projections_wherever_it_appears():
     assert checked, "no latent MoE layers in the catalog to check"
 
 
+def test_a_sparse_latent_read_prices_the_selection_it_claims():
+    """A graph recording index_topk must also charge for the indexer that selects.
+
+    The representation gap behind two defects in opposite directions: DeepSeek-V4
+    priced an indexer on 31 layers that have none, and the GLM-5 family recorded
+    index_topk on all 78 layers and emitted no indexer at all. The indexer is the only
+    context-proportional term in such a layer, so either way the dominant long-context
+    cost is wrong.
+
+    A property over the catalog rather than a per-model assertion, so a future family
+    cannot reintroduce it."""
+    checked = 0
+    for d in model_dirs():
+        g = graph_of(d)
+        for k in g["layer_kinds"]:
+            selects = [n for n in k["nodes"]
+                       if n["op"] == "Attention" and n.get("index_topk")]
+            if not selects:
+                continue
+            scorers = [n for n in k["nodes"] if n.get("role") == "block_index_scores"]
+            assert scorers, (
+                f"{d.name}/{k['id']}: index_topk "
+                f"{selects[0]['index_topk']} asserts a top-k selection, but the layer "
+                f"has no block_index_scores node to charge for making it")
+            assert any(n.get("role") == "index_qk_proj" for n in k["nodes"]), (
+                f"{d.name}/{k['id']}: an indexer with no projection to feed it")
+            for n in scorers:
+                assert "window" not in n, (
+                    f"{d.name}/{k['id']}: the indexer scores the whole cache, so a "
+                    f"window on it would make selection look bounded")
+            checked += 1
+    assert checked, "no selecting layers in the catalog to check"
+
+
+def test_glm5_family_prices_its_dsa_indexer():
+    """GLM-5 is model_type glm_moe_dsa and ships the full lightning-indexer spec.
+
+    It is registered to handler_moe, which had no indexer path, so the selection work
+    was unpriced on every layer of all four generations."""
+    seen = 0
+    for name in ("glm-5", "glm-5.2", "glm-5.2-fp8", "glm-5.3"):
+        d = ROOT / "models" / name
+        if not d.is_dir():
+            continue
+        g, t = graph_of(d), text_config(config_of(d))
+        assert t.get("index_n_heads") and t.get("index_topk"), (
+            f"{name}: this test is about a config declaring an indexer")
+        for k in g["layer_kinds"]:
+            proj = [n for n in k["nodes"] if n.get("role") == "index_qk_proj"]
+            score = [n for n in k["nodes"] if n.get("role") == "block_index_scores"]
+            assert len(proj) == 1 and len(score) == 1, (
+                f"{name}/{k['id']}: expected one indexer projection and one scorer, "
+                f"got {len(proj)} and {len(score)}")
+            # Shaped from the config's own indexer dimensions, not the model's heads.
+            assert score[0]["n_q"] == t["index_n_heads"]
+            assert score[0]["d_h"] == t["index_head_dim"]
+            assert proj[0]["n"] == (t["index_n_heads"] * t["index_head_dim"]
+                                    + t["index_head_dim"])
+            assert proj[0]["k"] == t["hidden_size"]
+            # The read it feeds is bounded; the scoring that selects it is not.
+            assert "window" not in score[0]
+        seen += 1
+    if not seen:
+        pytest.skip("no GLM-5 models in the catalog")
+
+
+def test_gpt_oss_quantizes_only_its_experts():
+    """modules_to_not_convert names what MXFP4 leaves alone, and it must be honored.
+
+    gpt-oss declares quant_method mxfp4 with self_attn, the router, the embeddings and
+    lm_head excluded, so MXFP4 is the expert weights only. Returning it as the global
+    width priced every attention projection and the head at 4 bits instead of 16 -- a
+    4x understatement on the whole non-expert parameter class, about 2.1 GiB here.
+
+    The mirror of the expert_dtype case: there the experts are narrower than a global
+    that is itself quantized; here they are the only narrow thing."""
+    d = ROOT / "models" / "gpt-oss-120b"
+    if not d.is_dir():
+        pytest.skip("gpt-oss-120b is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    quant = t.get("quantization_config") or {}
+    excluded = quant.get("modules_to_not_convert")
+    assert excluded, "this test is about a config that excludes modules from quantization"
+    assert str(quant.get("quant_method")).lower() == "mxfp4"
+
+    assert g["global"]["weight_dtype"] != "mxfp4", (
+        "the global width must be the UNQUANTIZED base, since attention, the router, "
+        "the embeddings and lm_head are all excluded from the MXFP4 scope")
+    assert g["global"]["weight_dtype"] == "bf16"
+
+    # The experts, which ARE in scope, carry the narrow width themselves.
+    experts = [n for k in g["layer_kinds"] for n in k["nodes"]
+               if n["op"] == "GroupedGEMM"]
+    assert experts, "no expert nodes"
+    for n in experts:
+        assert n.get("weight_dtype") == "mxfp4", (
+            f"expert node carries weight_dtype {n.get('weight_dtype')!r}; the MXFP4 "
+            f"scope is exactly these weights")
+
+    # And the excluded tensors are NOT narrowed: no override, so they take the global.
+    for k in g["layer_kinds"]:
+        for n in k["nodes"]:
+            if n["op"] == "GEMM":
+                assert n.get("weight_dtype") in (None, "bf16"), (
+                    f"{k['id']}/{n.get('role')} is priced at "
+                    f"{n.get('weight_dtype')!r}, but self_attn is excluded from the "
+                    f"MXFP4 scope")
+    for n in g["head"]:
+        assert n.get("weight_dtype") in (None, "bf16"), (
+            f"the head's {n.get('role')} is priced at {n.get('weight_dtype')!r}; "
+            f"lm_head is excluded from the MXFP4 scope")
+
+
+def test_llama4_chunked_attention_is_a_recorded_gap_not_a_silent_one():
+    """The decision to price Llama-4 as unbounded must stay deliberate.
+
+    attention_chunk_size 8192 bounds most layers in the implementation, and this
+    checkpoint declares no layer_types, no moe_layers and an empty no_rope_layers, so
+    the per-layer split is not derivable -- deriving one would mean inventing it. The
+    handler says so. This test pins the two halves of that claim: the graph really is
+    unbounded, and the config really does lack the fields that would let it not be. If a
+    future checkpoint declares layer_types, this fails and the gap gets closed."""
+    d = ROOT / "models" / "llama-4-scout-17b-16e-instruct-fp8-dynamic"
+    if not d.is_dir():
+        pytest.skip("llama-4-scout is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    assert t.get("attention_chunk_size"), "this test is about a chunked-attention config"
+    assert not t.get("layer_types"), (
+        "the config now declares layer_types, so the chunked/full split IS derivable "
+        "and handler_moe's recorded gap should be closed rather than documented")
+    assert not t.get("no_rope_layers"), (
+        "no_rope_layers is now populated, so the full-attention layers are enumerated "
+        "and the split should be derived")
+    main = [n for k in g["layer_kinds"] for n in k["nodes"]
+            if n["op"] == "Attention" and n.get("role") != "block_index_scores"]
+    assert main
+    for n in main:
+        assert n["kind"] == "gqa" and "window" not in n, (
+            "a bound appeared here without the config gaining the fields to derive it")
+    # The gap must stay documented in the handler a reader would check.
+    src = (ROOT / "scripts" / "derive_graph.py").read_text()
+    assert "KNOWN GAP (Llama-4)" in src, (
+        "the handler no longer records the chunked-attention gap; either close it or "
+        "keep the note that explains why it is open")
+
+
 # --- The hybrid handlers' specific structure ---------------------------------------
 # The property tests above confirm the catalog HAS variety -- layer counts agree, dtypes
 # differ, attention shapes come from the config. None of them asserts that a given model
