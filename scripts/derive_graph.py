@@ -678,12 +678,8 @@ def handler_moe(cfg, raw, model):
             {"id": "attn_moe", "nodes": sparse, "edges": chain(sparse)},
         ]
         sequence = ["attn_moe" if t == "sparse" else "attn_dense" for t in mlp_types]
-        # Compress a trailing uniform run, which is the common shape: a short dense
-        # prologue then sparse throughout.
-        tail = sequence[-1]
-        head_len = len(sequence)
-        while head_len > 0 and sequence[head_len - 1] == tail:
-            head_len -= 1
+        # compress() finds the trailing uniform run itself, which is the common shape
+        # here: a short dense prologue then sparse throughout.
         return kinds, compress(sequence)
 
     # A first_k_dense_replace count does the same job as a type vector.

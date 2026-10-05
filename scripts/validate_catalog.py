@@ -103,9 +103,9 @@ _DIMENSIONLESS_DESCRIPTORS = (
 )
 
 # A dimensioned COUNT: its unit is one of the things counted. `SMCount` is 132
-# SMs on a GH100 die and `GPUsPerNode` is 8 GPUs on an HGX baseboard — both are
-# datasheet integers, as declared as a bandwidth figure and no more learned. So a
-# count belongs in the catalog, and the units check has to admit one.
+# SMs on a GH100 die and `GPUsPerRack` is 72 GPUs in an NVL72 domain — both are
+# declared integers in the same sense a bandwidth figure is, and no more learned
+# than one. So a count belongs in the catalog, and the units check must admit one.
 #
 # The vocabulary is a CLOSED list of whole names rather than a suffix rule, which
 # is what keeps it from becoming the hole the rest of this check exists to close.
