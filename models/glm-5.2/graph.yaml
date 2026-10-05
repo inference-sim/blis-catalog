@@ -126,9 +126,7 @@ stack:
   - attn_dense
   pattern:
   - attn_moe
-  - attn_moe
-  - attn_moe
-  repeat: 25
+  repeat: 75
 head:
 - op: Elementwise
   role: final_norm

@@ -362,6 +362,103 @@ def _change_kv_heads(g: dict) -> None:
     pytest.skip("no attention node")
 
 
+# --- compress(): the stack's spelling -----------------------------------------------
+# compress decides how a layer sequence is stored, and the deriver runs it on every
+# model. test_signature_ignores_how_the_stack_is_spelled proves the choice is
+# cost-neutral, which is the property a cost model cares about; these tests cover the
+# other half, that the stored form is CORRECT and says what the sequence actually is.
+# A reader inspects the committed stack to see a hybrid's period, so a stack that
+# expands correctly but misreports the period is still wrong for the thing compression
+# exists to do.
+
+
+def _dg():
+    """The deriver as a module, for the functions that take no catalog on disk."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dg", DERIVER)
+    dg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dg)
+    return dg
+
+
+@pytest.mark.parametrize("sequence,expected,description", [
+    (["a"] * 8, {"pattern": ["a"], "repeat": 8},
+     "a uniform run collapses to a period of one"),
+    (["a", "b"] * 5, {"pattern": ["a", "b"], "repeat": 5},
+     "a two-layer period is stored once"),
+    (["d", "d", "d"] + ["s"] * 9,
+     {"prologue": ["d", "d", "d"], "pattern": ["s"], "repeat": 9},
+     "a dense prologue then a uniform sparse tail"),
+    ((["k", "k", "k", "m"] * 23) + ["m"],
+     {"pattern": ["k", "k", "k", "m"], "repeat": 23, "epilogue": ["m"]},
+     "a hybrid period with a trailing odd layer"),
+    (["a", "b", "c", "d", "e"], {"prologue": ["a", "b", "c", "d", "e"]},
+     "a sequence with no repeating unit is stored literally"),
+    (["a"], {"prologue": ["a"]}, "a single layer"),
+    ([], {}, "an empty sequence"),
+])
+def test_compress_stores_the_sequence_it_was_given(sequence, expected, description):
+    assert _dg().compress(list(sequence)) == expected, description
+
+
+def test_compress_prefers_the_true_period_over_a_padded_one():
+    """A period-1 tail must be stored as one entry, not as a multiple of itself.
+
+    This is a regression test. The search used to reject any candidate whose prologue
+    was longer than its period, which rules out the optimal split on the commonest
+    shape in this catalog -- a short dense prologue then a uniform sparse tail -- and
+    left a worse one to win. Four committed graphs (glm-5.2, glm-5.2-fp8, glm-5.3,
+    minimax-m3) stored `pattern: [attn_moe, attn_moe, attn_moe], repeat: 25` for a
+    75-layer run whose period is 1, which reads as a three-layer repeating unit the
+    model does not have. It expanded correctly, so every cost-based test passed.
+
+    The GLM shape itself, at its real depth."""
+    got = _dg().compress(["attn_dense"] * 3 + ["attn_moe"] * 75)
+    assert got == {"prologue": ["attn_dense"] * 3,
+                   "pattern": ["attn_moe"], "repeat": 75}, (
+        f"stored {got}, which spells a period-1 run as a longer unit")
+
+
+def test_compress_declines_a_split_that_stores_no_less_than_the_sequence():
+    """The docstring's readability rule: past a point the literal form is clearer.
+
+    A sequence whose only repeating unit is surrounded by material longer than the
+    saving must come back literal rather than as a split that technically compresses."""
+    seq = ["a", "b"] * 3 + ["x", "y", "z"]
+    got = _dg().compress(list(seq))
+    assert got == {"prologue": list(seq)}, (
+        f"stored {got}; a split saving nothing should fall back to the literal form")
+    assert "pattern" not in got
+
+
+@pytest.mark.parametrize("sequence", [
+    ["a"] * 8,
+    ["a", "b"] * 5,
+    ["d", "d", "d"] + ["s"] * 9,
+    (["k", "k", "k", "m"] * 23) + ["m"],
+    ["m", "e", "m", "e", "m", "a", "e", "m", "e"],
+    ["a", "b", "c", "d", "e"],
+    ["p", "q", "r", "s", "t"] + ["a", "b"] * 3,
+    ["a", "b"] * 3 + ["x", "y", "z"],
+    ["a"],
+])
+def test_compress_round_trips(sequence):
+    """However it is spelled, it must expand to what went in.
+
+    The property that makes compression safe at all: layer_sequence is what every
+    consumer reads the stack through, so a compression it cannot invert would misprice
+    the model however well the stored form reads."""
+    assert layer_sequence(_dg().compress(list(sequence))) == list(sequence)
+
+
+def test_compress_round_trips_every_committed_graph():
+    """The same property against the real catalog rather than hand-built shapes."""
+    dg = _dg()
+    for d in model_dirs():
+        seq = layer_sequence(graph_of(d)["stack"])
+        assert layer_sequence(dg.compress(list(seq))) == seq, d.name
+
+
 # --- MiniMax-M3: block-sparse attention ------------------------------------------
 
 

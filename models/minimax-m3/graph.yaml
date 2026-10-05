@@ -135,9 +135,7 @@ stack:
   - dense
   pattern:
   - sparse_attn_moe
-  - sparse_attn_moe
-  - sparse_attn_moe
-  repeat: 19
+  repeat: 57
 modality: text_decoder_of_multimodal
 head:
 - op: Elementwise

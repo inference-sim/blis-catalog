@@ -426,13 +426,16 @@ def compress(sequence: list[str]) -> dict[str, Any]:
             if body * repeats != rest[:period * repeats]:
                 continue
             tail = rest[period * repeats:]
-            if head > period or len(tail) > period:
-                continue
             stored = head + period + len(tail)
-            if best is None or stored < best[0]:
+            # Fewest stored entries wins; the SHORTEST period breaks a tie, so a stack
+            # whose true period is 1 is not spelled as a longer multiple of it.
+            if best is None or (stored, period) < (best[0], len(best[2])):
                 best = (stored, head, body, repeats, tail)
     if best is None or best[0] >= n:
-        # No split stores less than the literal sequence, so state it literally.
+        # No split stores less than the literal sequence, so state it literally. This is
+        # also what enforces the docstring's readability rule: a prologue or epilogue so
+        # long that the split stores no less than the sequence it describes is not a
+        # compression worth reading, and the literal form is clearer.
         return {"prologue": list(sequence)}
     _, head, body, repeats, tail = best
     out: dict[str, Any] = {}
