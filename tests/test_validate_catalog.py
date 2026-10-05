@@ -554,3 +554,49 @@ def test_the_real_catalog_declares_an_sm_count_for_every_chip():
                 f"{chip.name} declares GPUsPerRack but no GPUsPerNode; the rack tier "
                 f"is expressed as a multiple of the node tier"
             )
+
+
+def test_every_sm_count_cites_a_source():
+    """An SMCount must be traceable, because it is the one physical figure on these
+    chips that no vendor datasheet always publishes.
+
+    The five Hopper/Ampere/Ada entries cite an NVIDIA datasheet URL. The three
+    Blackwell parts cannot — NVIDIA publishes no SM count for them, and the AISimulate
+    and InferenceX descriptors that source their FLOPs and HBM carry none either — so
+    they cite the next most authoritative public source instead. Either way the
+    requirement is the same: a reader must be able to chase the number. Review of this
+    catalog's first Blackwell entries found 148 asserted with no source at all, which
+    is the state this test exists to prevent recurring.
+
+    Deliberately a URL check rather than a wording check: it is the weakest assertion
+    that still cannot pass on an uncited figure."""
+    root = Path(__file__).resolve().parent.parent
+    chips = sorted((root / "hardware").glob("*.yaml"))
+    assert chips, "no chips found to check"
+    uncited = []
+    for chip in chips:
+        data = yaml.safe_load(chip.read_text())
+        if not data.get("SMCount"):
+            continue
+        if "http" not in str(data.get("_comment_sm", "")):
+            uncited.append(chip.name)
+    assert not uncited, (
+        f"these chips state an SMCount with no source to chase in _comment_sm: "
+        f"{uncited}. Cite the NVIDIA datasheet where one publishes the count, and "
+        f"otherwise the most authoritative public source, saying which it is."
+    )
+
+
+def test_an_sm_count_with_no_citation_is_caught(tmp_path):
+    """The negative case for the test above: a check that cannot fail proves nothing."""
+    chip = tmp_path / "hardware" / "fictional.yaml"
+    chip.parent.mkdir(parents=True)
+    chip.write_text(yaml.safe_dump({
+        "Provenance": "vendor_spec",
+        "_comment_sm": "SMCount is the enabled SM count on this part.",
+        "SMCount": 148,
+    }))
+    data = yaml.safe_load(chip.read_text())
+    assert "http" not in str(data.get("_comment_sm", "")), (
+        "the uncited fixture must be uncited, or the positive test above is vacuous"
+    )
