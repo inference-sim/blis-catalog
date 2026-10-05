@@ -204,23 +204,50 @@ def cost_signature(g: dict) -> tuple:
     A structural comparison would report a difference when a deriver renamed a role or
     reordered two independent nodes, neither of which changes a single step time. It would
     also report sameness for two graphs whose stacks happen to have matching patterns but
-    different expansions."""
+    different expansions.
+
+    It covers the speculator's draft stack as well as the target stack, because a draft
+    pass is work a deployment pays for. It does NOT cover the head: every model here has
+    the same final-norm-plus-lm_head shape, and its cost is driven by vocab_size, which
+    test_distinct_architectures_cost_differently is not the right instrument for."""
     kinds = {k["id"]: k for k in g["layer_kinds"]}
     work: collections.Counter = collections.Counter()
     for layer_id in layer_sequence(g["stack"]):
         for n in kinds[layer_id]["nodes"]:
-            # The parameters that change what a primitive costs, and nothing else. `when`
-            # is excluded: it selects whether a node exists in a given deployment, which is
-            # a property of the layout rather than of the model.
-            work[(
-                n["op"], n.get("n"), n.get("k"), n.get("n_q"), n.get("n_kv"), n.get("d_h"),
-                n.get("experts"), n.get("top_k"), n.get("shared_experts"),
-                n.get("shared_intermediate_size"), n.get("latent_size"), n.get("kind"),
-                n.get("recurrent_kind"), n.get("state_size"), n.get("n_heads"),
-                n.get("n_groups"), n.get("conv_kernel"), n.get("intermediate_size"),
-                n.get("window"), n.get("index_topk"),
-            )] += 1
+            work[node_cost(n)] += 1
+
+    # The draft stack a speculative decode runs, which is work the target pays for on
+    # every accepted token and is NOT part of g["stack"]. Tagged as a separate component
+    # rather than folded into the counter above, so a draft layer and a target layer of
+    # the same shape stay distinguishable: moving a layer between the two stacks changes
+    # what a step costs. Excluded from this and verified nowhere, a wrong draft length or
+    # a mirrored-from-the-wrong-kind draft stack collided with a correct graph and passed
+    # every collision test.
+    spec = g.get("speculator")
+    if spec:
+        draft: collections.Counter = collections.Counter()
+        for layer_id in layer_sequence(spec["stack"]):
+            for n in kinds[layer_id]["nodes"]:
+                draft[node_cost(n)] += 1
+        work[("speculator", spec.get("method"), spec.get("num_spec_tokens"),
+              tuple(sorted(draft.items(), key=repr)))] += 1
     return tuple(sorted(work.items(), key=repr))
+
+
+def node_cost(n: dict) -> tuple:
+    """The parameters that change what a primitive costs, and nothing else.
+
+    `emit` is excluded: it selects whether a node exists in a given deployment, which is a
+    property of the layout rather than of the model. Those conditions are checked
+    structurally instead, by test_collectives_land_where_the_parallelism_needs_them."""
+    return (
+        n["op"], n.get("n"), n.get("k"), n.get("n_q"), n.get("n_kv"), n.get("d_h"),
+        n.get("experts"), n.get("top_k"), n.get("shared_experts"),
+        n.get("shared_intermediate_size"), n.get("latent_size"), n.get("kind"),
+        n.get("recurrent_kind"), n.get("state_size"), n.get("n_heads"),
+        n.get("n_groups"), n.get("conv_kernel"), n.get("intermediate_size"),
+        n.get("window"), n.get("index_topk"),
+    )
 
 
 def test_distinct_architectures_cost_differently():
@@ -360,6 +387,175 @@ def _change_kv_heads(g: dict) -> None:
                 n["n_kv"] = max(1, n["n_kv"] // 2)
                 return
     pytest.skip("no attention node")
+
+
+# --- The speculator block ----------------------------------------------------------
+# A draft stack is work a deployment pays for on every step, so a wrong draft length or
+# a draft stack mirrored from the wrong layer kind misprices the model. The source field
+# differs by family and the candidates DISAGREE on a shipped config, so which one is read
+# is a correctness question rather than a spelling one.
+
+
+def test_minimax_m3_takes_its_draft_length_from_num_mtp_modules():
+    """The case that makes the source field a correctness question.
+
+    MiniMax-M3's config declares BOTH num_mtp_modules (7) and
+    num_nextn_predict_layers (1). vLLM reads num_mtp_modules for this family
+    (config/speculative.py, minimax_m3_mtp), so reading the other field would understate
+    the draft stack sevenfold. Asserted against the config rather than against a literal,
+    so the test still means something after a config update."""
+    d = ROOT / "models" / "minimax-m3"
+    if not d.is_dir():
+        pytest.skip("minimax-m3 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    assert t.get("num_mtp_modules") != t.get("num_nextn_predict_layers"), (
+        "this test is about a config whose two draft-length fields disagree; they now "
+        "agree, so it no longer pins the distinction it was written for")
+    spec = g["speculator"]
+    assert spec["method"] == "minimax_m3_mtp"
+    assert spec["num_spec_tokens"] == t["num_mtp_modules"], (
+        f"draft length is {spec['num_spec_tokens']}, and num_mtp_modules is "
+        f"{t['num_mtp_modules']}; num_nextn_predict_layers is "
+        f"{t.get('num_nextn_predict_layers')} and reading it here would be the bug")
+
+
+def test_deepseek_v3_takes_its_draft_length_from_num_nextn_predict_layers():
+    """The other branch: the alias table's field, not num_mtp_modules.
+
+    vLLM maps model_type deepseek_v3 to deepseek_mtp and reads n_predict from
+    num_nextn_predict_layers. DeepseekV3ForCausalLM is deliberately NOT in
+    MTP_MODULE_ARCHS, and this pins that."""
+    d = ROOT / "models" / "deepseek-v3"
+    if not d.is_dir():
+        pytest.skip("deepseek-v3 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    spec = g["speculator"]
+    assert spec["method"] == "deepseek_mtp"
+    assert spec["num_spec_tokens"] == t["num_nextn_predict_layers"]
+    assert "num_mtp_modules" not in t, (
+        "this config states num_mtp_modules too, so the assertion above no longer "
+        "distinguishes the two sources")
+
+
+def test_qwen3_5_takes_its_draft_length_from_mtp_num_hidden_layers():
+    """The third spelling. Qwen3.5 states neither of the other two fields: its draft
+    length rides in mtp_num_hidden_layers, resolved through the alias table."""
+    d = ROOT / "models" / "qwen3.5-397b-a17b"
+    if not d.is_dir():
+        pytest.skip("qwen3.5-397b-a17b is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    spec = g["speculator"]
+    assert spec["method"] == "qwen3_5_mtp"
+    assert spec["num_spec_tokens"] == t["mtp_num_hidden_layers"]
+
+
+def test_a_declared_mtp_module_count_alone_does_not_make_a_speculator():
+    """num_mtp_modules is read only for the families whose method consumes it.
+
+    MiniMax-M2.5 declares num_mtp_modules 3 and vLLM registers no minimax_m2_mtp method
+    at all -- its only draft path is a separate Eagle3 checkpoint -- so this config must
+    derive NO speculator. Reading the field globally would invent a draft stack here,
+    and that invention is what MTP_MODULE_ARCHS being a named set rather than a pattern
+    prevents."""
+    d = ROOT / "models" / "minimax-m2.5"
+    if not d.is_dir():
+        pytest.skip("minimax-m2.5 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    assert t.get("num_mtp_modules"), "this test is about a config that declares one"
+    assert "speculator" not in g, (
+        f"a speculator was derived from num_mtp_modules {t['num_mtp_modules']} for a "
+        f"family with no registered MTP method")
+
+
+def test_a_speculator_mirrors_a_layer_kind_the_graph_defines():
+    """A draft stack naming a kind the graph does not define cannot be priced.
+
+    Property test over the catalog: the draft stack is an MoE pass of its own for an MoE
+    target, which a scalar draft length would hide, so its entries must resolve."""
+    checked = 0
+    for d in model_dirs():
+        g = graph_of(d)
+        spec = g.get("speculator")
+        if not spec:
+            continue
+        defined = {k["id"] for k in g["layer_kinds"]}
+        drafted = layer_sequence(spec["stack"])
+        assert drafted, f"{d.name}: a speculator with an empty draft stack"
+        unknown = set(drafted) - defined
+        assert not unknown, f"{d.name}: draft stack names undefined kinds {unknown}"
+        assert spec["num_spec_tokens"] > 0, f"{d.name}: non-positive draft length"
+        assert spec.get("method"), f"{d.name}: a draft stack with no method"
+        checked += 1
+    assert checked >= 10, f"only {checked} speculators found; expected the catalog's 12"
+
+
+def test_a_declared_mtp_vector_is_what_the_draft_stack_mirrors():
+    """Where a config declares the draft module's layer composition, it is used.
+
+    NemotronH states mtp_layers_block_type, and its draft stack must follow that vector
+    rather than defaulting to the target's last layer kind."""
+    d = ROOT / "models" / "nemotron-3.5-lightning-30b-a3b-bf16"
+    if not d.is_dir():
+        pytest.skip("nemotron-3.5-lightning is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    vector = t.get("mtp_layers_block_type")
+    assert vector, "this test is about a config that declares one"
+    assert layer_sequence(g["speculator"]["stack"]) == list(vector), (
+        f"draft stack is {layer_sequence(g['speculator']['stack'])}, and the config "
+        f"declares {vector}")
+
+
+@pytest.mark.parametrize("mutate,description", [
+    (lambda g: g["speculator"].update(num_spec_tokens=g["speculator"]["num_spec_tokens"] + 6),
+     "lengthening the draft stack"),
+    (lambda g: g["speculator"].update(method="some_other_mtp"),
+     "changing the speculative method"),
+    (lambda g: g["speculator"]["stack"].update(repeat=2),
+     "running the draft stack twice"),
+    (lambda g: g.pop("speculator"),
+     "dropping the speculator entirely"),
+])
+def test_signature_notices_a_changed_speculator(mutate, description):
+    """The gap this block was reported for: the signature must see a draft change.
+
+    cost_signature iterated only the target stack, so a graph with the wrong draft
+    length, the wrong method, or a mis-mirrored draft pattern collided with a correct one
+    and passed test_distinct_architectures_cost_differently -- the strongest test here.
+    These four mutations are the shapes that bug would take."""
+    import copy
+
+    d = ROOT / "models" / "minimax-m3"
+    if not d.is_dir():
+        pytest.skip("minimax-m3 is not in the catalog")
+    g = graph_of(d)
+    assert "speculator" in g, "the reference model must have a speculator"
+    before = cost_signature(g)
+    variant = copy.deepcopy(g)
+    mutate(variant)
+    assert cost_signature(variant) != before, (
+        f"{description} left the cost signature unchanged, so a wrong draft stack would "
+        f"pass the collision tests")
+
+
+def test_signature_separates_draft_work_from_target_work():
+    """A layer moved between the target stack and the draft stack must be visible.
+
+    Without the draft stack tagged as its own component, a counter over both would be
+    blind to the move: the same layer bodies in the same quantity, priced differently
+    because a draft pass runs per speculated token rather than once."""
+    import copy
+
+    d = ROOT / "models" / "minimax-m3"
+    if not d.is_dir():
+        pytest.skip("minimax-m3 is not in the catalog")
+    g = graph_of(d)
+    moved = copy.deepcopy(g)
+    drafted = layer_sequence(g["speculator"]["stack"])
+    # Append the draft layers to the target stack and leave the speculator's own stack
+    # claiming them too: total layer bodies unchanged in kind, but the split differs.
+    moved["stack"] = {"prologue": layer_sequence(g["stack"]) + drafted}
+    assert cost_signature(moved) != cost_signature(g), (
+        "moving layers into the target stack did not change the signature")
 
 
 # --- compress(): the stack's spelling -----------------------------------------------
