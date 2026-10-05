@@ -17,7 +17,7 @@ layer_kinds:
     role: input_norm
   - op: GEMM
     role: qkv_proj
-    n: 66560
+    n: 66048
     k: 7168
   - op: GEMM
     role: index_qk_proj
@@ -30,11 +30,14 @@ layer_kinds:
     n_kv: 1
     d_h: 128
   - op: Attention
-    kind: swa
+    kind: sparse_mla
     n_q: 128
     n_kv: 1
     d_h: 512
-    window: 256
+    qk_rope_head_dim: 64
+    window: 128
+    index_topk: 1024
+    compress_ratio: 4
   - op: GEMM
     role: o_proj
     n: 7168
@@ -85,24 +88,16 @@ layer_kinds:
     role: input_norm
   - op: GEMM
     role: qkv_proj
-    n: 66560
-    k: 7168
-  - op: GEMM
-    role: index_qk_proj
-    n: 8320
+    n: 66048
     k: 7168
   - op: Attention
-    role: block_index_scores
-    kind: gqa
-    n_q: 64
-    n_kv: 1
-    d_h: 128
-  - op: Attention
-    kind: swa
+    kind: sparse_mla
     n_q: 128
     n_kv: 1
     d_h: 512
-    window: 8
+    qk_rope_head_dim: 64
+    window: 128
+    compress_ratio: 128
   - op: GEMM
     role: o_proj
     n: 7168
@@ -143,10 +138,61 @@ layer_kinds:
     - 7
   - - 7
     - 8
-  - - 8
-    - 9
-  - - 9
-    - 10
+- id: mtp_moe
+  nodes:
+  - op: Elementwise
+    role: input_norm
+  - op: GEMM
+    role: qkv_proj
+    n: 66048
+    k: 7168
+  - op: Attention
+    kind: mla
+    n_q: 128
+    n_kv: 1
+    d_h: 512
+    qk_rope_head_dim: 64
+    window: 128
+  - op: GEMM
+    role: o_proj
+    n: 7168
+    k: 65536
+  - op: AllReduce
+    role: attn_out
+    emit: tensor_parallel
+  - op: Elementwise
+    role: post_attn_norm
+  - op: GroupedGEMM
+    role: experts
+    n: 3072
+    k: 7168
+    experts: 384
+    top_k: 6
+    shared_experts: 1
+    weight_dtype: mxfp4
+  - op: All2All
+    role: moe_dispatch_combine
+    emit: expert_parallel
+  - op: AllReduce
+    role: mlp_out
+    emit: tensor_parallel_unless_sp_moe
+  edges:
+  - - 0
+    - 1
+  - - 1
+    - 2
+  - - 2
+    - 3
+  - - 3
+    - 4
+  - - 4
+    - 5
+  - - 5
+    - 6
+  - - 6
+    - 7
+  - - 7
+    - 8
 stack:
   prologue:
   - csa128_moe
@@ -166,5 +212,5 @@ speculator:
   num_spec_tokens: 1
   stack:
     pattern:
-    - csa128_moe
+    - mtp_moe
     repeat: 1

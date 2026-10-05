@@ -67,7 +67,13 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "qk_nope_head_dim": ("qk_nope_head_dim",),
     "v_head_dim": ("v_head_dim",),
     "num_spec_tokens": ("num_nextn_predict_layers", "mtp_num_hidden_layers"),
-    "moe_latent_size": ("moe_latent_size",),
+    # routed_expert_hidden_size is Kimi's spelling of the same concept: its
+    # KimiSparseMoeBlock projects hidden -> this width before routing, runs each expert
+    # at K = this width, and projects back after (modeling_kimi_linear.py:776-832,
+    # gated on `use_latent_moe = routed_expert_hidden_size is not None`). Reading only
+    # the DeepSeek/Nemotron spelling left every Kimi expert priced at the full hidden
+    # size, doubling its K.
+    "moe_latent_size": ("moe_latent_size", "routed_expert_hidden_size"),
     "index_topk": ("index_topk",),
     "dtype": ("torch_dtype", "dtype"),
 }
@@ -261,8 +267,16 @@ def gemm(role: str, n: int, k: int) -> dict[str, Any]:
 
 
 def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
-              window: int | None = None) -> dict[str, Any]:
-    """Build the attention node, choosing the kind from the config's own evidence."""
+              window: int | None = None, compress_ratio: int | None = None,
+              index_topk: int | None = None,
+              latent_width: int | None = None) -> dict[str, Any]:
+    """Build the attention node, choosing the kind from the config's own evidence.
+
+    `latent_width` is the per-token cache width for a family that states it directly
+    rather than as kv_lora_rank + rope. `compress_ratio` and `index_topk` are the two
+    bounds a sparse latent read can carry, and a layer may carry both: the positions it
+    reads are the union of its sliding window and its compressed stream, so `window`
+    is not an alternative to either."""
     nq = int(require(cfg, "num_q_heads", model))
     nkv = int(require(cfg, "num_kv_heads", model))
     lora = pick(cfg, "kv_lora_rank")
@@ -276,6 +290,30 @@ def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
             kind = "gqa"
 
     node: dict[str, Any] = {"op": "Attention", "kind": kind, "n_q": nq}
+
+    if latent_width is not None:
+        # A family that states the per-token latent width inclusively, so there is no
+        # lora rank to add a rope width to. DeepSeek-V4 is the case in hand: its
+        # head_dim already contains qk_rope_head_dim, which is why the branch below
+        # cannot size it.
+        if kind not in ("mla", "sparse_mla"):
+            raise DeriveError(
+                f"{model}: a latent width was given for attention kind {kind!r}, which "
+                f"stores no latent cache")
+        node["n_kv"] = 1
+        node["d_h"] = int(latent_width)
+        node["qk_rope_head_dim"] = int(require(cfg, "qk_rope_head_dim", model))
+        if window:
+            node["window"] = int(window)
+        if index_topk:
+            node["index_topk"] = int(index_topk)
+        if compress_ratio:
+            node["compress_ratio"] = int(compress_ratio)
+        if kind == "sparse_mla" and not (index_topk or compress_ratio):
+            raise DeriveError(
+                f"{model}: a sparse latent read bounded by neither a top-k selection "
+                f"nor a compressed stream describes no real layer")
+        return node
 
     if kind in ("mla", "sparse_mla"):
         # A latent cache holds one vector per token, so the engine pins the KV head
@@ -381,6 +419,31 @@ def moe(cfg: dict[str, Any], model: str, hidden: int) -> dict[str, Any]:
     return node
 
 
+def moe_block(cfg: dict[str, Any], model: str, hidden: int) -> list[dict[str, Any]]:
+    """The routed expert layer: its latent projections, where it has them, and the
+    grouped GEMM.
+
+    A latent MoE is three pieces of work, not one. Kimi-K3's KimiSparseMoeBlock
+    projects hidden -> latent, routes and runs the experts at the latent width, then
+    projects latent -> hidden (modeling_kimi_linear.py:776-832); DeepSeek and Nemotron
+    state the same structure as moe_latent_size. The two projections are dense GEMMs
+    every token pays, so they are nodes rather than an implication of latent_size.
+
+    The routing gate and the shared experts both run on the PRE-projection hidden
+    states -- vLLM gates before the down-projection and adds
+    `self.shared_experts(identity)` after the up-projection -- so neither is affected by
+    the latent width, which is why shared_intermediate_size stays as moe() states it."""
+    node = moe(cfg, model, hidden)
+    latent = node.get("latent_size")
+    if not latent:
+        return [node]
+    return [
+        gemm("routed_expert_down_proj", int(latent), hidden),
+        node,
+        gemm("routed_expert_up_proj", hidden, int(latent)),
+    ]
+
+
 # Emit conditions are a closed set naming WHEN a conditional node is part of the graph.
 # They are enum members rather than predicate strings: every condition the catalog's models
 # need is decided by the collective's role, so a resolver evaluates them with a switch and
@@ -392,6 +455,12 @@ EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE = "tensor_parallel_unless_sp_moe"
 
 def collective(op: str, role: str, emit: str) -> dict[str, Any]:
     return {"op": op, "role": role, "emit": emit}
+
+
+# The layer-kind id a handler uses for a draft module it prices itself. Reserved rather
+# than conventional: derive() prefers it over mirroring a target layer, so a handler that
+# defines it is stating that no target layer has the draft module's structure.
+DRAFT_KIND_ID = "mtp_moe"
 
 
 def compress(sequence: list[str]) -> dict[str, Any]:
@@ -455,12 +524,26 @@ def chain(nodes: list[dict[str, Any]]) -> list[list[int]]:
 
 def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
                     kind: str | None = None,
-                    window: int | None = None) -> list[dict[str, Any]]:
+                    window: int | None = None,
+                    compress_ratio: int | None = None,
+                    index_topk: int | None = None,
+                    latent_width: int | None = None) -> list[dict[str, Any]]:
     """The nodes common to every attention layer: norm, QKV, attention, output, reduce."""
     nq = int(require(cfg, "num_q_heads", model))
     nkv = int(require(cfg, "num_kv_heads", model))
-    attn = attention(cfg, model, kind=kind, window=window)
-    if attn["kind"] in ("mla", "sparse_mla"):
+    attn = attention(cfg, model, kind=kind, window=window,
+                     compress_ratio=compress_ratio, index_topk=index_topk,
+                     latent_width=latent_width)
+    if latent_width is not None:
+        # This family states one inclusive per-token width and no separate nope/v
+        # widths, so the projections are sized from that width: a per-head query at the
+        # full width, plus the one shared latent KV vector the cache stores. The rope
+        # width is NOT added -- latent_width already contains it, which is the whole
+        # point of its being inclusive, and adding it again would overstate the
+        # projection by an eighth exactly as it would the cache.
+        qkv_out = (nq + 1) * int(latent_width)
+        o_in = nq * int(latent_width)
+    elif attn["kind"] in ("mla", "sparse_mla"):
         # The latent path projects to a compressed KV plus a per-head query, and the
         # projection widths differ enough between published MLA variants that a single
         # formula would be a guess. The QKV node carries the query width, which is the
@@ -527,7 +610,7 @@ def handler_moe(cfg, raw, model):
 
     def sparse_nodes(win=None):
         n = attention_block(cfg, model, hidden, window=win)
-        n += [norm("post_attn_norm"), moe(cfg, model, hidden),
+        n += [norm("post_attn_norm"), *moe_block(cfg, model, hidden),
               collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
               collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
@@ -679,10 +762,16 @@ def handler_deepseek_v4(cfg, raw, model):
             f"would misprice whichever kind it did not pick"
         )
     # The vector carries a trailing entry for the MTP module, which is not one of the
-    # transformer layers num_hidden_layers counts. vLLM indexes it by layer, so the
-    # extra entry is only ever read for the draft module.
+    # transformer layers num_hidden_layers counts. vLLM indexes it by layer and takes
+    # compress_ratio 1 for any index at or beyond num_hidden_layers, NOT the trailing
+    # entry's value -- which this config states as 0, a ratio that cannot be read as a
+    # divisor at all (attention.py:229-235 at the pinned commit, `else:
+    # self.compress_ratio = 1`). So the draft module is an UNCOMPRESSED latent layer,
+    # and the entry is dropped rather than consulted.
+    draft_ratio = None
     if len(ratios) == layers + 1:
         ratios = ratios[:layers]
+        draft_ratio = 1
     elif len(ratios) != layers:
         raise DeriveError(
             f"{model}: compress_ratios has {len(ratios)} entries for {layers} layers; "
@@ -717,19 +806,44 @@ def handler_deepseek_v4(cfg, raw, model):
         "d_h": index_dim,
     }
 
+    swa_window = int(require(cfg, "sliding_window", model))
+
     def layer_for(ratio):
-        # The read is a top-k over a stream compressed by this ratio, so a larger ratio
-        # bounds it tighter. index_topk caps both.
-        window = max(1, min(topk, topk // ratio))
-        nodes = attention_block(cfg, model, hidden, kind="swa", window=window)
-        at = next(i for i, n in enumerate(nodes) if n.get("op") == "Attention")
-        nodes = nodes[:at] + [
-            gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
-            dict(indexer),
-        ] + nodes[at:]
+        # The read set is the UNION of the retained sliding window and the compressed
+        # positions, not a choice between them: every layer keeps its SWA window
+        # (attention.py:221, `self.window_size = config.sliding_window`, with no
+        # compress_ratio guard) and combine_topk_swa_indices merges the two position
+        # sets. So a layer states its window AND its compressed bound.
+        #
+        # The two bounds differ in kind. A ratio-4 layer SELECTS up to index_topk
+        # compressed positions through its indexer, so the compressed term is
+        # min(index_topk, context/4). A ratio-128 layer selects nothing: it reads a
+        # positional run of context/128 (sparse_mla.py, num_compressed =
+        # (position + 1) // compress_ratio), which no fixed token count expresses,
+        # hence compress_ratio in the graph.
+        selects_topk = ratio == 4
+        nodes = attention_block(
+            cfg, model, hidden,
+            kind="sparse_mla" if ratio > 1 else "mla",
+            latent_width=total_dim,
+            window=swa_window,
+            compress_ratio=ratio if ratio > 1 else None,
+            index_topk=topk if selects_topk else None,
+        )
+        if selects_topk:
+            # The indexer exists ONLY on ratio-4 layers: vLLM builds one under
+            # `if self.compress_ratio == 4`, noting "Only C4A uses sparse attention and
+            # hence has indexer" (attention.py:297-317). A ratio-128 layer has a
+            # compressor but no indexer, and pricing one there charges a
+            # context-proportional scan the layer never runs.
+            at = next(i for i, n in enumerate(nodes) if n.get("op") == "Attention")
+            nodes = nodes[:at] + [
+                gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
+                dict(indexer),
+            ] + nodes[at:]
         nodes += [
             norm("post_attn_norm"),
-            moe(cfg, model, hidden),
+            *moe_block(cfg, model, hidden),
             collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
             collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
         ]
@@ -739,6 +853,14 @@ def handler_deepseek_v4(cfg, raw, model):
     for ratio in sorted(set(ratios)):
         nodes = layer_for(ratio)
         kinds.append({"id": f"csa{ratio}_moe", "nodes": nodes, "edges": chain(nodes)})
+    # The draft module is its own layer kind rather than a reuse of a target layer's:
+    # at ratio 1 it is uncompressed, so it reads the full context within its window and
+    # carries no indexer. Without it the speculator's generic fallback mirrors
+    # kinds[-1] -- csa128_moe -- pricing the tightest-bounded read in the model for the
+    # one layer that has no bound at all.
+    if draft_ratio is not None:
+        nodes = layer_for(draft_ratio)
+        kinds.append({"id": "mtp_moe", "nodes": nodes, "edges": chain(nodes)})
     sequence = [f"csa{r}_moe" for r in ratios]
     return kinds, compress(sequence)
 
@@ -867,7 +989,7 @@ def handler_minimax_m3(cfg, raw, model):
     ] + sparse_attn[at:]
     sparse_nodes += [
         norm("post_attn_norm"),
-        moe(cfg, model, hidden),
+        *moe_block(cfg, model, hidden),
         collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
         collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
     ]
@@ -937,7 +1059,7 @@ def handler_qwen3_5_moe(cfg, raw, model):
 
     def with_moe(mixer):
         n = list(mixer)
-        n += [norm("post_attn_norm"), moe(cfg, model, hidden),
+        n += [norm("post_attn_norm"), *moe_block(cfg, model, hidden),
               collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
               collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
@@ -1013,7 +1135,7 @@ def handler_nemotron_h(cfg, raw, model):
     ]
     moe_nodes = [
         norm("input_norm"),
-        moe(cfg, model, hidden),
+        *moe_block(cfg, model, hidden),
         collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
         collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
     ]
@@ -1037,10 +1159,17 @@ def handler_nemotron_h(cfg, raw, model):
 
 
 def handler_kimi_k3(cfg, raw, model):
-    """Kimi-K3: linear attention on most layers, latent attention on a declared list.
+    """Kimi-K3: linear attention on most layers, latent attention on a declared list,
+    and a dense MLP on the leading layers.
 
     The full-attention layer indices are given explicitly rather than by a period, so
-    the sequence is built from that list."""
+    the sequence is built from that list.
+
+    first_k_dense_replace makes the leading layers dense: KimiDecoderLayer builds a
+    KimiSparseMoeBlock only when `layer_idx >= first_k_dense_replace`, and otherwise a
+    KimiMLP at the config's own intermediate_size rather than moe_intermediate_size
+    (modeling_kimi_linear.py:893-900). Pricing layer 0 as routed charges 896 experts
+    for a layer that runs one dense MLP."""
     hidden = int(require(cfg, "hidden_size", model))
     layers = int(require(cfg, "num_layers", model))
     linear = cfg.get("linear_attn_config") or {}
@@ -1050,8 +1179,14 @@ def handler_kimi_k3(cfg, raw, model):
 
     def with_moe(mixer_nodes):
         n = list(mixer_nodes)
-        n += [norm("post_attn_norm"), moe(cfg, model, hidden),
+        n += [norm("post_attn_norm"), *moe_block(cfg, model, hidden),
               collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+              collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
+        return n
+
+    def with_dense(mixer_nodes):
+        n = list(mixer_nodes)
+        n += [norm("post_attn_norm"), *dense_mlp(cfg, model, hidden),
               collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
 
@@ -1072,13 +1207,27 @@ def handler_kimi_k3(cfg, raw, model):
         {"id": "kda_moe", "nodes": kda, "edges": chain(kda)},
         {"id": "mla_moe", "nodes": mla, "edges": chain(mla)},
     ]
+    first_dense = int(cfg.get("first_k_dense_replace") or 0)
+    if first_dense:
+        kda_dense = with_dense(kda_mixer)
+        mla_dense = with_dense(attention_block(cfg, model, hidden))
+        kinds += [
+            {"id": "kda_dense", "nodes": kda_dense, "edges": chain(kda_dense)},
+            {"id": "mla_dense", "nodes": mla_dense, "edges": chain(mla_dense)},
+        ]
     full_set = set(int(i) for i in full)
     # The published list is 1-based against a 1-indexed layer numbering; a 0-based
     # reading would shift every attention layer by one. Detected rather than assumed:
     # a 0-based list would contain 0.
     offset = 1 if 0 not in full_set else 0
-    sequence = ["mla_moe" if (i + offset) in full_set else "kda_moe"
-                for i in range(layers)]
+    # The mixer and the MLP vary independently: which layers are attention comes from
+    # the declared list, and which are dense from first_k_dense_replace.
+    sequence = []
+    for i in range(layers):
+        mixer = "mla" if (i + offset) in full_set else "kda"
+        sequence.append(f"{mixer}_dense" if i < first_dense else f"{mixer}_moe")
+    # A kind no layer uses would be a node a reader has to account for and no step runs.
+    kinds = [k for k in kinds if k["id"] in set(sequence)]
     return kinds, compress(sequence)
 
 
@@ -1199,13 +1348,22 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
         spec = modules
     if spec and int(spec) > 0:
         # A draft module is its own stack: for an MoE target the draft pass is a second
-        # MoE, which a scalar draft length would hide. Its layer composition is declared
-        # where the config says so, and otherwise mirrors the target's last layer kind.
+        # MoE, which a scalar draft length would hide. Its layer composition comes from
+        # three sources, in order of how much the config actually says.
+        defined = {k["id"] for k in kinds}
         mtp_vector = cfg.get("mtp_layers_block_type")
-        if mtp_vector:
-            pattern = [n if n in {k["id"] for k in kinds} else kinds[-1]["id"]
-                       for n in mtp_vector]
+        if DRAFT_KIND_ID in defined:
+            # A handler that priced the draft module itself, because the family gives it
+            # a structure no target layer shares. DeepSeek-V4 is the case in hand: its
+            # draft layer is uncompressed where every target layer is compressed, so
+            # mirroring any of them would price the wrong read.
+            pattern = [DRAFT_KIND_ID]
+        elif mtp_vector:
+            pattern = [n if n in defined else kinds[-1]["id"] for n in mtp_vector]
         else:
+            # The fallback: mirror the target's last layer kind. Sound only where the
+            # draft module really does repeat a target layer's structure, which is why a
+            # handler whose family differs declares DRAFT_KIND_ID instead.
             pattern = [kinds[-1]["id"]]
         graph["speculator"] = {
             "method": speculative_method(arch, model),

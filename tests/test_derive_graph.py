@@ -389,6 +389,227 @@ def _change_kv_heads(g: dict) -> None:
     pytest.skip("no attention node")
 
 
+# --- Fidelity to the pinned implementations ---------------------------------------
+# The gates in this repo establish SELF-CONSISTENCY: a graph re-derives from its config,
+# validates against the schema, and prices distinctly from its siblings. None of that
+# checks fidelity to the implementation the deriver claims to follow, which is where
+# review found five defects. These tests assert against the pinned upstream behaviour,
+# so a regeneration cannot quietly restore the old shape.
+
+
+def test_v4_every_layer_retains_its_sliding_window():
+    """The read set is the UNION of the window and the compressed stream.
+
+    vLLM sets `self.window_size = config.sliding_window` with no compress_ratio guard
+    (deepseek_v4/attention.py at the pinned commit f9c9e8a), and
+    combine_topk_swa_indices merges the window positions with the compressed ones. The
+    deriver previously replaced the window with a fixed topk//ratio -- 256 for ratio 4
+    and 8 for ratio 128 -- the latter smaller than the 128-token window the config
+    declares, so a C128A layer claimed to read 8 tokens where the implementation reads
+    at least 128."""
+    g, t = _v4()
+    declared = t["sliding_window"]
+    assert declared > 0, "this test is about a config that declares a window"
+    main = [n for k in g["layer_kinds"] for n in k["nodes"]
+            if n["op"] == "Attention" and n.get("role") != "block_index_scores"]
+    assert main, "no attention nodes"
+    for n in main:
+        assert n["window"] == declared, (
+            f"a layer states window {n['window']} where the config declares "
+            f"{declared}; the window is retained at every compression ratio")
+
+
+def test_v4_compressed_bound_is_a_ratio_not_a_token_count():
+    """A ratio-128 layer's compressed term is context/128, which no constant expresses.
+
+    The C128A path reads a positional run -- num_compressed = (position + 1) //
+    compress_ratio in the Triton kernel -- rather than selecting a ranked top-k. A graph
+    storing a fixed token count there is wrong at every context but one."""
+    g, t = _v4()
+    ratios = set(t["compress_ratios"][: t["num_hidden_layers"]])
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    seq = layer_sequence(g["stack"])
+    for idx, ratio in enumerate(t["compress_ratios"][: t["num_hidden_layers"]]):
+        n = next(x for x in kinds[seq[idx]]["nodes"]
+                 if x["op"] == "Attention" and x.get("role") != "block_index_scores")
+        assert n.get("compress_ratio") == ratio, (
+            f"layer {idx} has compress_ratio {n.get('compress_ratio')}, config says "
+            f"{ratio}")
+    # Only the selecting ratio carries a top-k; the other selects nothing at all.
+    for ratio in ratios:
+        idx = t["compress_ratios"].index(ratio)
+        n = next(x for x in kinds[seq[idx]]["nodes"]
+                 if x["op"] == "Attention" and x.get("role") != "block_index_scores")
+        if ratio == 4:
+            assert n.get("index_topk") == t["index_topk"], (
+                "a ratio-4 layer selects up to index_topk compressed positions")
+        else:
+            assert not n.get("index_topk"), (
+                f"a ratio-{ratio} layer reads a positional run and selects no top-k, "
+                f"so index_topk {n.get('index_topk')} describes a selection it never "
+                f"makes")
+
+
+def test_v4_only_ratio_4_layers_have_an_indexer():
+    """vLLM builds an indexer under `if self.compress_ratio == 4`, noting "Only C4A uses
+    sparse attention and hence has indexer" (attention.py:297-317).
+
+    The deriver spliced the indexer into every ratio, so all 31 C128A layers carried an
+    index_qk_proj GEMM and a block_index_scores attention. The indexer is the only
+    context-proportional term in the layer, so pricing it on a layer that has none
+    charges a full context scan 31 times per forward pass."""
+    g, t = _v4()
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    seq = layer_sequence(g["stack"])
+    seen = {}
+    for idx, ratio in enumerate(t["compress_ratios"][: t["num_hidden_layers"]]):
+        nodes = kinds[seq[idx]]["nodes"]
+        has = any(n.get("role") == "block_index_scores" for n in nodes)
+        proj = any(n.get("role") == "index_qk_proj" for n in nodes)
+        assert has == proj, (
+            f"layer {idx}: an indexer and its projection must appear together")
+        seen.setdefault(ratio, set()).add(has)
+    assert seen[4] == {True}, "every ratio-4 layer needs its indexer"
+    for ratio, flags in seen.items():
+        if ratio == 4:
+            continue
+        assert flags == {False}, (
+            f"ratio-{ratio} layers carry an indexer; the implementation builds one only "
+            f"for ratio 4")
+
+
+def test_v4_draft_module_is_an_uncompressed_layer_of_its_own():
+    """An MTP layer takes compress_ratio 1, not a target layer's ratio.
+
+    vLLM reads compress_ratios by layer index and falls to `self.compress_ratio = 1` for
+    any index at or beyond num_hidden_layers (attention.py:229-235), so the trailing 0 in
+    this config's vector is never used as a divisor. The deriver dropped that entry and
+    let the generic speculator fallback mirror kinds[-1], which made the draft stack
+    csa128_moe: the tightest-bounded read in the model standing in for the one layer
+    with no compression at all, and carrying an indexer it should not have."""
+    g, t = _v4()
+    assert len(t["compress_ratios"]) == t["num_hidden_layers"] + 1, (
+        "this test is about the trailing draft entry; the vector no longer has one")
+    spec = g["speculator"]
+    drafted = layer_sequence(spec["stack"])
+    assert drafted, "no draft stack"
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    target_ids = set(layer_sequence(g["stack"]))
+    for lid in drafted:
+        assert lid not in target_ids, (
+            f"the draft stack reuses target layer kind {lid!r}, whose compression bound "
+            f"is not the draft module's")
+        n = next(x for x in kinds[lid]["nodes"]
+                 if x["op"] == "Attention" and x.get("role") != "block_index_scores")
+        assert not n.get("compress_ratio"), (
+            f"the draft layer states compress_ratio {n.get('compress_ratio')}; an MTP "
+            f"layer is uncompressed (ratio 1)")
+        assert not any(x.get("role") == "block_index_scores"
+                       for x in kinds[lid]["nodes"]), (
+            "the draft layer carries an indexer, which only a ratio-4 layer has")
+        assert n["window"] == t["sliding_window"], (
+            "the draft layer keeps the model's sliding window")
+
+
+def test_kimi_k3_leading_layers_are_dense():
+    """first_k_dense_replace makes the leading layers dense MLPs, not routed experts.
+
+    KimiDecoderLayer builds a KimiSparseMoeBlock only when
+    `layer_idx >= first_k_dense_replace` and otherwise a KimiMLP at the config's own
+    intermediate_size (modeling_kimi_linear.py:893-900). The handler defined only routed
+    kinds, so layer 0 was priced with a 896-expert GroupedGEMM in place of one dense
+    7168 -> 2*33792 -> 7168 MLP."""
+    d = ROOT / "models" / "kimi-k3"
+    if not d.is_dir():
+        pytest.skip("kimi-k3 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    first_dense = int(t["first_k_dense_replace"])
+    assert first_dense > 0, "this test is about a config that declares one"
+    seq = layer_sequence(g["stack"])
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+
+    for i in range(first_dense):
+        nodes = kinds[seq[i]]["nodes"]
+        assert not any(n["op"] == "GroupedGEMM" for n in nodes), (
+            f"layer {i} is within first_k_dense_replace {first_dense} and must run a "
+            f"dense MLP, but it carries routed experts")
+        widths = {n["n"] for n in nodes if n.get("role") == "mlp_gate_up"}
+        assert widths == {2 * t["intermediate_size"]}, (
+            f"layer {i}'s gate-and-up projection is {widths}; a dense KimiMLP is "
+            f"2 * intermediate_size ({2 * t['intermediate_size']}) wide, and uses "
+            f"intermediate_size rather than moe_intermediate_size")
+    # And the layer just past the prologue IS routed, or the prologue swallowed too much.
+    assert any(n["op"] == "GroupedGEMM"
+               for n in kinds[seq[first_dense]]["nodes"]), (
+        f"layer {first_dense} is the first routed layer and carries no experts")
+
+
+def test_kimi_k3_routed_experts_run_at_the_latent_width():
+    """routed_expert_hidden_size is the latent MoE width, and K is that, not hidden_size.
+
+    KimiSparseMoeBlock projects hidden -> routed_expert_hidden_size before routing, runs
+    each expert at that width, and projects back after
+    (modeling_kimi_linear.py:776-832). The alias table recognized only the
+    DeepSeek/Nemotron spelling, so every Kimi expert was priced at K=7168 instead of
+    3584 -- double the expert FLOPs and dispatch volume -- and the two projections were
+    missing entirely."""
+    d = ROOT / "models" / "kimi-k3"
+    if not d.is_dir():
+        pytest.skip("kimi-k3 is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    latent = int(t["routed_expert_hidden_size"])
+    hidden = int(t["hidden_size"])
+    assert latent != hidden, "this test is about a config whose latent width differs"
+
+    experts = [n for k in g["layer_kinds"] for n in k["nodes"]
+               if n["op"] == "GroupedGEMM"]
+    assert experts, "no routed expert nodes"
+    for n in experts:
+        assert n.get("latent_size") == latent, (
+            f"expert node states latent_size {n.get('latent_size')}, config says "
+            f"{latent}")
+
+    # The projections are real work every token pays, so they are nodes.
+    for k in g["layer_kinds"]:
+        if not any(n["op"] == "GroupedGEMM" for n in k["nodes"]):
+            continue
+        down = [n for n in k["nodes"] if n.get("role") == "routed_expert_down_proj"]
+        up = [n for n in k["nodes"] if n.get("role") == "routed_expert_up_proj"]
+        assert len(down) == 1 and len(up) == 1, (
+            f"{k['id']}: a latent MoE needs both projections, got "
+            f"{len(down)} down and {len(up)} up")
+        assert (down[0]["n"], down[0]["k"]) == (latent, hidden), (
+            f"{k['id']}: down-projection is {down[0]['n']}x{down[0]['k']}, expected "
+            f"{latent}x{hidden}")
+        assert (up[0]["n"], up[0]["k"]) == (hidden, latent), (
+            f"{k['id']}: up-projection is {up[0]['n']}x{up[0]['k']}, expected "
+            f"{hidden}x{latent}")
+
+
+def test_a_latent_moe_states_its_projections_wherever_it_appears():
+    """The property across the catalog, not just for Kimi.
+
+    Any node carrying latent_size describes a projection into and out of that width, so
+    the layer must price both. Nemotron-3-Ultra states the same structure as
+    moe_latent_size and had the same omission."""
+    checked = 0
+    for d in model_dirs():
+        for k in graph_of(d)["layer_kinds"]:
+            latent = {n.get("latent_size") for n in k["nodes"]
+                      if n["op"] == "GroupedGEMM" and n.get("latent_size")}
+            if not latent:
+                continue
+            assert len(latent) == 1, f"{d.name}/{k['id']}: mixed latent widths {latent}"
+            width = latent.pop()
+            roles = {n.get("role") for n in k["nodes"]}
+            assert "routed_expert_down_proj" in roles, (
+                f"{d.name}/{k['id']}: latent_size {width} with no projection into it")
+            assert "routed_expert_up_proj" in roles, (
+                f"{d.name}/{k['id']}: latent_size {width} with no projection out of it")
+            checked += 1
+    assert checked, "no latent MoE layers in the catalog to check"
+
+
 # --- The hybrid handlers' specific structure ---------------------------------------
 # The property tests above confirm the catalog HAS variety -- layer counts agree, dtypes
 # differ, attention shapes come from the config. None of them asserts that a given model
@@ -418,18 +639,18 @@ def test_kimi_k3_resolves_its_full_attention_layers_one_based():
     seq = layer_sequence(g["stack"])
     assert len(seq) == t["num_hidden_layers"]
 
-    mla = {i for i, k in enumerate(seq) if k == "mla_moe"}
+    mla = {i for i, k in enumerate(seq) if k.startswith("mla_")}
     expected = {n - 1 for n in declared}
     assert mla == expected, (
         f"MLA layers sit at 0-based {sorted(mla)[:6]}...; the config's 1-based list "
         f"{declared[:6]}... puts them at {sorted(expected)[:6]}...")
     # The concrete consequence, stated so a failure reads as the off-by-one it is:
     # index 4 declared means position 3 is attention and position 4 is not.
-    assert seq[declared[0] - 1] == "mla_moe"
-    assert seq[declared[0]] == "kda_moe", (
+    assert seq[declared[0] - 1].startswith("mla_")
+    assert seq[declared[0]].startswith("kda_"), (
         "the layer after the first declared attention layer is attention too, which is "
         "the signature of a 0-based read")
-    assert set(seq) == {"kda_moe", "mla_moe"}
+    assert set(seq) <= {"kda_moe", "mla_moe", "kda_dense", "mla_dense"}
 
 
 def test_kimi_k3_kda_state_geometry_comes_from_the_config():
@@ -1048,13 +1269,15 @@ def test_v4_has_one_layer_kind_per_compression_ratio():
     g, t = _v4()
     ratios = sorted(set(t["compress_ratios"][: t["num_hidden_layers"]]))
     assert len(ratios) == 2, f"expected two ratios, config states {ratios}"
-    windows = set()
+    bounds = set()
     for k in g["layer_kinds"]:
+        if k["id"] == "mtp_moe":
+            continue  # the draft layer, which is not one of the target ratios
         for n in k["nodes"]:
             if n["op"] == "Attention" and n.get("role") != "block_index_scores":
-                windows.add(n["window"])
-    assert len(windows) == len(ratios), (
-        f"two compression ratios must give two distinct read bounds, got {windows}"
+                bounds.add((n.get("compress_ratio"), n.get("index_topk")))
+    assert len(bounds) == len(ratios), (
+        f"two compression ratios must give two distinct read bounds, got {bounds}"
     )
 
 
@@ -1073,15 +1296,44 @@ def test_v4_higher_compression_reads_less():
         k = kinds[seq[idx]]
         for n in k["nodes"]:
             if n["op"] == "Attention" and n.get("role") != "block_index_scores":
-                by_ratio.setdefault(ratio, set()).add(n["window"])
+                by_ratio.setdefault(ratio, set()).add(
+                    (n["window"], n.get("compress_ratio"), n.get("index_topk")))
     assert all(len(v) == 1 for v in by_ratio.values()), (
         f"a ratio maps to more than one bound: {by_ratio}"
     )
     flat = {r: v.pop() for r, v in by_ratio.items()}
     lo, hi = min(flat), max(flat)
-    assert flat[hi] < flat[lo], (
-        f"ratio {hi} should read less than ratio {lo}, got {flat[hi]} vs {flat[lo]}"
-    )
+    # Every layer keeps the same sliding window; the ratio is what differs.
+    assert flat[lo][0] == flat[hi][0] == t["sliding_window"], (
+        f"both ratios retain the declared SWA window, got {flat}")
+    assert flat[hi][1] == hi and flat[lo][1] == lo, (
+        f"each layer must record its own compression ratio, got {flat}")
+    # The read set is window + compressed positions, evaluated rather than compared as
+    # a stored constant because the ratio-128 term is context-dependent and no constant
+    # expresses it.
+    def positions(bound, context):
+        window, ratio, topk = bound
+        compressed = context // ratio
+        if topk:
+            compressed = min(topk, compressed)
+        return window + compressed
+    # Through the context range the measured tables cover, the tighter ratio reads less.
+    for context in (1024, 8192, 65536):
+        assert positions(flat[hi], context) < positions(flat[lo], context), (
+            f"at context {context}, ratio {hi} should read less than ratio {lo}: "
+            f"{positions(flat[hi], context)} vs {positions(flat[lo], context)}")
+    # And the ordering INVERTS past a crossover, which is a real consequence of the two
+    # bounds being different in kind rather than in degree: ratio 4 selects at most
+    # index_topk compressed positions, so its read plateaus, while ratio 128 reads a
+    # positional run that keeps growing. Stated here because a reader who assumed
+    # "higher ratio is always cheaper" would mispredict long-context deployments, and
+    # this config permits max_position_embeddings far beyond the crossover.
+    crossover = flat[lo][2] * flat[hi][1]
+    assert positions(flat[hi], crossover) == positions(flat[lo], crossover), (
+        f"the two bounds should meet at context {crossover}")
+    assert positions(flat[hi], 2 * crossover) > positions(flat[lo], 2 * crossover), (
+        f"past context {crossover} the ratio-{hi} read must exceed the ratio-{lo} one, "
+        f"whose top-k has plateaued")
 
 
 def test_v4_head_dim_is_not_summed_with_rope():
@@ -1104,13 +1356,19 @@ def test_v4_indexer_is_unbounded_where_the_attention_is_bounded():
     """The measured split: the indexer grows 3.53x over a 12x context increase where the
     attention it feeds moves 1.18x. One node cannot carry both."""
     g, _ = _v4()
+    indexed = 0
     for k in g["layer_kinds"]:
         idx = [n for n in k["nodes"] if n.get("role") == "block_index_scores"]
         main = [n for n in k["nodes"]
                 if n["op"] == "Attention" and n.get("role") != "block_index_scores"]
-        assert len(idx) == 1 and len(main) == 1, f"{k['id']}: expected one of each"
+        assert len(main) == 1, f"{k['id']}: expected one attention node"
+        assert main[0]["window"] > 0, "every layer retains its sliding window"
+        if not idx:
+            continue  # a layer with no indexer, checked by the test below
+        assert len(idx) == 1, f"{k['id']}: expected at most one indexer"
         assert "window" not in idx[0], "a bounded indexer would make selection free"
-        assert main[0]["window"] > 0, "an unbounded read would track the full context"
+        indexed += 1
+    assert indexed, "no layer carries an indexer"
 
 
 def test_v4_prices_differently_from_deepseek_v3():

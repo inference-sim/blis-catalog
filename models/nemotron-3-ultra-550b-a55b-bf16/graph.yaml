@@ -41,6 +41,10 @@ layer_kinds:
   nodes:
   - op: Elementwise
     role: input_norm
+  - op: GEMM
+    role: routed_expert_down_proj
+    n: 2048
+    k: 8192
   - op: GroupedGEMM
     role: experts
     n: 5120
@@ -50,6 +54,10 @@ layer_kinds:
     shared_experts: 1
     shared_intermediate_size: 10240
     latent_size: 2048
+  - op: GEMM
+    role: routed_expert_up_proj
+    n: 8192
+    k: 2048
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -63,6 +71,10 @@ layer_kinds:
     - 2
   - - 2
     - 3
+  - - 3
+    - 4
+  - - 4
+    - 5
 - id: attention
   nodes:
   - op: Elementwise
