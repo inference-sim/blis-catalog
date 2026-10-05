@@ -31,3 +31,10 @@ jobs:
       - name: Run the gate's own test suite
         # Proves the checks actually fire (good data passes, bad data is rejected).
         run: python3 -m pytest tests/ -q
+      - name: Check every graph re-derives from its config
+        # A ModelGraph is derived from the vendor config, never hand-written. This
+        # re-derives all of them and fails if one differs from what is committed,
+        # which catches both a hand-edited graph and a config changed without
+        # re-deriving. Without it, the recorded source digest is provenance nobody
+        # enforces.
+        run: python3 scripts/derive_graph.py --check
