@@ -166,8 +166,10 @@ today, and the open enum is what lets per-field land later without a value chang
 
 The schema and every structural rule a catalog entry must satisfy are defined and
 documented in [blis-schemas](https://github.com/inference-sim/blis-schemas). This
-repo re-implements none of them: there is no catalog-local schema or validation
-logic, in code, tests, or prose.
+repo re-implements none of them: there is no catalog-local *schema* validation
+logic, in code, tests, or prose. (The one catalog-local check that remains,
+`derive_graph.py --check` and its test suite, validates graph *derivation* — that
+each committed graph re-derives from its vendor config — not the schema.)
 
 CI validates every committed entry by running that owner's binary against the
 checkout, pinned by version:
