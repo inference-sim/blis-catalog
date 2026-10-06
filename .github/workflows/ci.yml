@@ -50,3 +50,11 @@ jobs:
         # re-deriving. Without it, the recorded source digest is provenance nobody
         # enforces. Graph derivation is not schema validation, so it stays here.
         run: python3 scripts/derive_graph.py --check
+      - name: Run the derive-graph test suite
+        # --check only proves re-derivation equality on committed data. The suite
+        # in tests/test_derive_graph.py additionally exercises the derivation's
+        # fidelity to upstream (signatures, pricing distinctions, compression,
+        # attention/expert geometry, speculators) and its negative error paths.
+        # This is derivation coverage, not schema validation, so it belongs with
+        # the derive step — scoped to the one surviving test file.
+        run: python3 -m pytest tests/test_derive_graph.py -q
