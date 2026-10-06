@@ -67,25 +67,25 @@ def good_catalog(tmp_path: Path) -> Path:
         root / "networks/ib-400g.yaml",
         {"Provenance": "vendor_spec", "InterNodeBwGBps": 50},
     )
-    # workloads/chatbot
+    # workloads/chatbot — nested workload.Shape (blis-catalog#16)
     _write_yaml(
         root / "workloads/chatbot.yaml",
         {
             "prefix_tokens": 0,
-            "prompt_tokens": 256, "prompt_tokens_stdev": 100,
-            "prompt_tokens_min": 2, "prompt_tokens_max": 800,
-            "output_tokens": 256, "output_tokens_stdev": 100,
-            "output_tokens_min": 1, "output_tokens_max": 1024,
+            "prompt": {"tokens": 256, "tokens_stdev": 100,
+                       "tokens_min": 2, "tokens_max": 800},
+            "output": {"tokens": 256, "tokens_stdev": 100,
+                       "tokens_min": 1, "tokens_max": 1024},
         },
     )
     # workloads/multidoc — the preset that legitimately omits prefix_tokens
     _write_yaml(
         root / "workloads/multidoc.yaml",
         {
-            "prompt_tokens": 10240, "prompt_tokens_stdev": 1200,
-            "prompt_tokens_min": 500, "prompt_tokens_max": 20480,
-            "output_tokens": 1536, "output_tokens_stdev": 300,
-            "output_tokens_min": 50, "output_tokens_max": 4096,
+            "prompt": {"tokens": 10240, "tokens_stdev": 1200,
+                       "tokens_min": 500, "tokens_max": 20480},
+            "output": {"tokens": 1536, "tokens_stdev": 300,
+                       "tokens_min": 50, "tokens_max": 4096},
         },
     )
     # devices/storage
@@ -261,28 +261,104 @@ def test_models_missing_source_revision_fails(good_catalog):
 # --------------------------------------------------------------------------- #
 
 
-def test_workloads_missing_required_field_fails(good_catalog):
+def test_workloads_missing_required_tokens_fails(good_catalog):
     wl = good_catalog / "workloads/chatbot.yaml"
     data = yaml.safe_load(wl.read_text())
-    del data["output_tokens"]
+    del data["output"]["tokens"]  # the required mean of a distribution
     _write_yaml(wl, data)
-    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "output_tokens"])
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "output.tokens"])
+
+
+def test_workloads_missing_distribution_fails(good_catalog):
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    del data["output"]  # a whole distribution sub-map is absent
+    _write_yaml(wl, data)
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "output"])
+
+
+def test_workloads_distribution_not_a_mapping_fails(good_catalog):
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    data["prompt"] = 256  # a scalar where a Distribution sub-map is expected
+    _write_yaml(wl, data)
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prompt"])
 
 
 def test_workloads_min_exceeds_max_fails(good_catalog):
     wl = good_catalog / "workloads/chatbot.yaml"
     data = yaml.safe_load(wl.read_text())
-    data["prompt_tokens_min"] = 900  # > prompt_tokens_max 800
+    data["prompt"]["tokens_min"] = 900  # > prompt.tokens_max 800
     _write_yaml(wl, data)
-    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prompt_tokens_min"])
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prompt.tokens_min"])
 
 
 def test_workloads_negative_value_fails(good_catalog):
     wl = good_catalog / "workloads/chatbot.yaml"
     data = yaml.safe_load(wl.read_text())
-    data["output_tokens_min"] = -1
+    data["output"]["tokens_min"] = -1
     _write_yaml(wl, data)
-    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "output_tokens_min"])
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "output.tokens_min"])
+
+
+def test_workloads_mean_below_min_without_max_fails(good_catalog):
+    # One-sided bound: tokens_max is optional, but a mean below tokens_min must
+    # still be flagged (min <= mean holds independently of max).
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    del data["prompt"]["tokens_max"]
+    data["prompt"]["tokens"] = 1  # below tokens_min 2
+    _write_yaml(wl, data)
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prompt.tokens"])
+
+
+def test_workloads_mean_above_max_without_min_fails(good_catalog):
+    # The mirror one-sided bound: tokens_min is optional, but a mean above
+    # tokens_max must still be flagged (mean <= max holds independently of min).
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    del data["output"]["tokens_min"]
+    data["output"]["tokens"] = 2048  # above tokens_max 1024
+    _write_yaml(wl, data)
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "output.tokens"])
+
+
+@pytest.mark.parametrize("value", [-1, "oops"])
+def test_workloads_invalid_prefix_tokens_fails(good_catalog, value):
+    # prefix_tokens is optional, but when present it must be a non-negative number.
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    data["prefix_tokens"] = value
+    _write_yaml(wl, data)
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prefix_tokens"])
+
+
+@pytest.mark.parametrize("kind", ["prompt", "output"])
+def test_workloads_zero_mean_fails(good_catalog, kind):
+    # The mean (tokens) must be POSITIVE, not merely non-negative — mirrors Go
+    # Distribution.validate (`if d.Mean < 1`); a zero-token distribution describes
+    # no request.
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    data[kind]["tokens"] = 0
+    _write_yaml(wl, data)
+    joined = _assert_flags(
+        good_catalog, substrings=["workloads/chatbot.yaml", f"{kind}.tokens"]
+    )
+    assert "must be positive" in joined
+
+
+def test_workloads_prefix_exceeds_prompt_mean_fails(good_catalog):
+    # A shared prefix longer than the mean prompt describes no request — the
+    # Shape-level cross-check from Go Shape.Validate.
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    data["prefix_tokens"] = data["prompt"]["tokens"] + 1  # 257 > mean prompt 256
+    _write_yaml(wl, data)
+    joined = _assert_flags(
+        good_catalog, substrings=["workloads/chatbot.yaml", "prefix_tokens"]
+    )
+    assert "exceeds the mean prompt length" in joined
 
 
 # --------------------------------------------------------------------------- #
@@ -326,12 +402,24 @@ def test_empty_or_comment_only_yaml_is_flagged_not_skipped(good_catalog, rel, co
 @pytest.mark.parametrize("bad", [".nan", ".inf", "-.inf", '"nan"', '"inf"'])
 def test_workloads_non_finite_value_fails(good_catalog, bad):
     wl = good_catalog / "workloads/chatbot.yaml"
-    # write raw so YAML resolves `.nan`/`.inf` (safe_dump would quote a Python float);
-    # replace the line rather than append a duplicate key
-    lines = [ln for ln in wl.read_text().splitlines() if not ln.startswith("prompt_tokens_stdev")]
-    lines.append(f"prompt_tokens_stdev: {bad}")
-    wl.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prompt_tokens_stdev"])
+    # Write the nested shape raw so YAML resolves `.nan`/`.inf` as the float the Go
+    # loader would read (safe_dump would quote a Python float); the bad value sits in
+    # the nested prompt.tokens_stdev.
+    wl.write_text(
+        "prefix_tokens: 0\n"
+        "prompt:\n"
+        "  tokens: 256\n"
+        f"  tokens_stdev: {bad}\n"
+        "  tokens_min: 2\n"
+        "  tokens_max: 800\n"
+        "output:\n"
+        "  tokens: 256\n"
+        "  tokens_stdev: 100\n"
+        "  tokens_min: 1\n"
+        "  tokens_max: 1024\n",
+        encoding="utf-8",
+    )
+    _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prompt.tokens_stdev"])
 
 
 def test_networks_non_finite_bandwidth_fails(good_catalog):

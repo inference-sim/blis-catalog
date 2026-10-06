@@ -418,49 +418,117 @@ def validate_networks(networks_dir: Path, root: Path) -> list[str]:
 
 
 def validate_workloads(workloads_dir: Path, root: Path) -> list[str]:
-    """workloads/*.yaml: token-count distributions for a traffic preset."""
+    """workloads/*.yaml: a nested token-count distribution for a traffic preset.
+
+    Each preset is a ``workload.Shape`` (blis-catalog#16): an optional top-level
+    ``prefix_tokens`` and two nested distributions, ``prompt`` and ``output``,
+    each a mapping with a required ``tokens`` (the mean) and optional
+    ``tokens_stdev`` / ``tokens_min`` / ``tokens_max``. The mean is positive; the
+    other counts are non-negative; the bounds are consistent
+    (``min <= mean <= max``); and a shared ``prefix_tokens`` may not exceed the
+    mean prompt length. These rules mirror blis-schemas' ``Shape.Validate`` /
+    ``Distribution.validate`` so this gate and the Go loader agree. The file
+    carries no name — identity is the filename — so no name field is read.
+    """
     errors: list[str] = []
     if not workloads_dir.is_dir():
         return errors
-    # Common required fields across every preset. `prefix_tokens` is optional
-    # (multidoc omits it); when present it is validated as a non-negative count.
-    required = (
-        "prompt_tokens", "prompt_tokens_stdev", "prompt_tokens_min", "prompt_tokens_max",
-        "output_tokens", "output_tokens_stdev", "output_tokens_min", "output_tokens_max",
-    )
     for path in sorted(workloads_dir.glob("*.yaml")):
         data = _as_mapping(_load_yaml(path, root, errors), path, root, errors)
         if data is None:
             continue
 
-        for key in required:
-            if key not in data:
-                errors.append(f"{_rel(path, root)}: {key}: required field is missing")
+        # prefix_tokens is optional (multidoc omits it); non-negative when present.
+        if "prefix_tokens" in data:
+            num = _coerce_number(data["prefix_tokens"])
+            if num is None:
+                errors.append(f"{_rel(path, root)}: prefix_tokens: must be a number")
+            elif num < 0:
+                errors.append(
+                    f"{_rel(path, root)}: prefix_tokens: must be non-negative "
+                    f"(got {data['prefix_tokens']})"
+                )
 
-        for key in (*required, "prefix_tokens"):
-            if key in data:
-                num = _coerce_number(data[key])
-                if num is None:
-                    errors.append(f"{_rel(path, root)}: {key}: must be a number")
-                elif num < 0:
-                    errors.append(
-                        f"{_rel(path, root)}: {key}: must be non-negative (got {data[key]})"
-                    )
-
+        # prompt and output are nested Distribution sub-maps. Each is required and
+        # must be a mapping; within it `tokens` (the mean) is required and must be
+        # POSITIVE, while tokens_stdev/tokens_min/tokens_max are optional and
+        # non-negative, with min <= mean <= max.
         for kind in ("prompt", "output"):
-            lo = _coerce_number(data.get(f"{kind}_tokens_min"))
-            hi = _coerce_number(data.get(f"{kind}_tokens_max"))
-            mean = _coerce_number(data.get(f"{kind}_tokens"))
+            if kind not in data:
+                errors.append(f"{_rel(path, root)}: {kind}: required field is missing")
+                continue
+            dist = data[kind]
+            if not isinstance(dist, dict):
+                errors.append(f"{_rel(path, root)}: {kind}: must be a mapping")
+                continue
+
+            if "tokens" not in dist:
+                errors.append(
+                    f"{_rel(path, root)}: {kind}.tokens: required field is missing"
+                )
+
+            for key in ("tokens", "tokens_stdev", "tokens_min", "tokens_max"):
+                if key in dist:
+                    num = _coerce_number(dist[key])
+                    if num is None:
+                        errors.append(f"{_rel(path, root)}: {kind}.{key}: must be a number")
+                    elif key == "tokens":
+                        # The mean must be positive, mirroring Go
+                        # Distribution.validate (`if d.Mean < 1`): a zero-token
+                        # distribution describes no request.
+                        if num <= 0:
+                            errors.append(
+                                f"{_rel(path, root)}: {kind}.tokens: must be positive "
+                                f"(got {dist[key]})"
+                            )
+                    elif num < 0:
+                        errors.append(
+                            f"{_rel(path, root)}: {kind}.{key}: must be non-negative "
+                            f"(got {dist[key]})"
+                        )
+
+            # Bounds must be consistent: min <= max when both are given, and the
+            # mean lies within whichever bounds are present. Each check is
+            # one-sided, so a distribution that gives only one bound is still
+            # checked against the mean — matching blis-schemas' Distribution.validate,
+            # where mean-vs-max and mean-vs-min are independent guards.
+            lo = _coerce_number(dist.get("tokens_min"))
+            hi = _coerce_number(dist.get("tokens_max"))
+            mean = _coerce_number(dist.get("tokens"))
             if lo is not None and hi is not None and lo > hi:
                 errors.append(
-                    f"{_rel(path, root)}: {kind}_tokens_min: {lo:g} exceeds "
-                    f"{kind}_tokens_max {hi:g}"
+                    f"{_rel(path, root)}: {kind}.tokens_min: {lo:g} exceeds "
+                    f"{kind}.tokens_max {hi:g}"
                 )
-            if None not in (lo, mean, hi) and not (lo <= mean <= hi):
+            if mean is not None and hi is not None and mean > hi:
                 errors.append(
-                    f"{_rel(path, root)}: {kind}_tokens: mean {mean:g} is outside "
-                    f"[{kind}_tokens_min {lo:g}, {kind}_tokens_max {hi:g}]"
+                    f"{_rel(path, root)}: {kind}.tokens: mean {mean:g} exceeds "
+                    f"{kind}.tokens_max {hi:g}"
                 )
+            if mean is not None and mean > 0 and lo is not None and mean < lo:
+                errors.append(
+                    f"{_rel(path, root)}: {kind}.tokens: mean {mean:g} is below "
+                    f"{kind}.tokens_min {lo:g}"
+                )
+
+        # Shape-level cross-check (mirrors Go Shape.Validate): a shared prefix
+        # longer than the mean prompt describes no request. Gated on a positive
+        # prompt mean, exactly as Go gates on `s.Prompt.Mean > 0`.
+        prefix = _coerce_number(data.get("prefix_tokens"))
+        prompt = data.get("prompt")
+        prompt_mean = (
+            _coerce_number(prompt.get("tokens")) if isinstance(prompt, dict) else None
+        )
+        if (
+            prefix is not None
+            and prompt_mean is not None
+            and prompt_mean > 0
+            and prefix > prompt_mean
+        ):
+            errors.append(
+                f"{_rel(path, root)}: prefix_tokens: {prefix:g} exceeds the mean "
+                f"prompt length {prompt_mean:g}, so no prompt contains the prefix"
+            )
     return errors
 
 
