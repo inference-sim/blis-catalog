@@ -333,6 +333,34 @@ def test_workloads_invalid_prefix_tokens_fails(good_catalog, value):
     _assert_flags(good_catalog, substrings=["workloads/chatbot.yaml", "prefix_tokens"])
 
 
+@pytest.mark.parametrize("kind", ["prompt", "output"])
+def test_workloads_zero_mean_fails(good_catalog, kind):
+    # The mean (tokens) must be POSITIVE, not merely non-negative — mirrors Go
+    # Distribution.validate (`if d.Mean < 1`); a zero-token distribution describes
+    # no request.
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    data[kind]["tokens"] = 0
+    _write_yaml(wl, data)
+    joined = _assert_flags(
+        good_catalog, substrings=["workloads/chatbot.yaml", f"{kind}.tokens"]
+    )
+    assert "must be positive" in joined
+
+
+def test_workloads_prefix_exceeds_prompt_mean_fails(good_catalog):
+    # A shared prefix longer than the mean prompt describes no request — the
+    # Shape-level cross-check from Go Shape.Validate.
+    wl = good_catalog / "workloads/chatbot.yaml"
+    data = yaml.safe_load(wl.read_text())
+    data["prefix_tokens"] = data["prompt"]["tokens"] + 1  # 257 > mean prompt 256
+    _write_yaml(wl, data)
+    joined = _assert_flags(
+        good_catalog, substrings=["workloads/chatbot.yaml", "prefix_tokens"]
+    )
+    assert "exceeds the mean prompt length" in joined
+
+
 # --------------------------------------------------------------------------- #
 # devices/: tier shape and positivity                                         #
 # --------------------------------------------------------------------------- #

@@ -423,8 +423,11 @@ def validate_workloads(workloads_dir: Path, root: Path) -> list[str]:
     Each preset is a ``workload.Shape`` (blis-catalog#16): an optional top-level
     ``prefix_tokens`` and two nested distributions, ``prompt`` and ``output``,
     each a mapping with a required ``tokens`` (the mean) and optional
-    ``tokens_stdev`` / ``tokens_min`` / ``tokens_max``. Every count is
-    non-negative and the bounds are consistent (``min <= mean <= max``). The file
+    ``tokens_stdev`` / ``tokens_min`` / ``tokens_max``. The mean is positive; the
+    other counts are non-negative; the bounds are consistent
+    (``min <= mean <= max``); and a shared ``prefix_tokens`` may not exceed the
+    mean prompt length. These rules mirror blis-schemas' ``Shape.Validate`` /
+    ``Distribution.validate`` so this gate and the Go loader agree. The file
     carries no name — identity is the filename — so no name field is read.
     """
     errors: list[str] = []
@@ -447,9 +450,9 @@ def validate_workloads(workloads_dir: Path, root: Path) -> list[str]:
                 )
 
         # prompt and output are nested Distribution sub-maps. Each is required and
-        # must be a mapping; within it `tokens` (the mean) is required and
-        # tokens_stdev/tokens_min/tokens_max are optional — all non-negative, with
-        # min <= mean <= max.
+        # must be a mapping; within it `tokens` (the mean) is required and must be
+        # POSITIVE, while tokens_stdev/tokens_min/tokens_max are optional and
+        # non-negative, with min <= mean <= max.
         for kind in ("prompt", "output"):
             if kind not in data:
                 errors.append(f"{_rel(path, root)}: {kind}: required field is missing")
@@ -469,6 +472,15 @@ def validate_workloads(workloads_dir: Path, root: Path) -> list[str]:
                     num = _coerce_number(dist[key])
                     if num is None:
                         errors.append(f"{_rel(path, root)}: {kind}.{key}: must be a number")
+                    elif key == "tokens":
+                        # The mean must be positive, mirroring Go
+                        # Distribution.validate (`if d.Mean < 1`): a zero-token
+                        # distribution describes no request.
+                        if num <= 0:
+                            errors.append(
+                                f"{_rel(path, root)}: {kind}.tokens: must be positive "
+                                f"(got {dist[key]})"
+                            )
                     elif num < 0:
                         errors.append(
                             f"{_rel(path, root)}: {kind}.{key}: must be non-negative "
@@ -493,11 +505,30 @@ def validate_workloads(workloads_dir: Path, root: Path) -> list[str]:
                     f"{_rel(path, root)}: {kind}.tokens: mean {mean:g} exceeds "
                     f"{kind}.tokens_max {hi:g}"
                 )
-            if mean is not None and lo is not None and mean < lo:
+            if mean is not None and mean > 0 and lo is not None and mean < lo:
                 errors.append(
                     f"{_rel(path, root)}: {kind}.tokens: mean {mean:g} is below "
                     f"{kind}.tokens_min {lo:g}"
                 )
+
+        # Shape-level cross-check (mirrors Go Shape.Validate): a shared prefix
+        # longer than the mean prompt describes no request. Gated on a positive
+        # prompt mean, exactly as Go gates on `s.Prompt.Mean > 0`.
+        prefix = _coerce_number(data.get("prefix_tokens"))
+        prompt = data.get("prompt")
+        prompt_mean = (
+            _coerce_number(prompt.get("tokens")) if isinstance(prompt, dict) else None
+        )
+        if (
+            prefix is not None
+            and prompt_mean is not None
+            and prompt_mean > 0
+            and prefix > prompt_mean
+        ):
+            errors.append(
+                f"{_rel(path, root)}: prefix_tokens: {prefix:g} exceeds the mean "
+                f"prompt length {prompt_mean:g}, so no prompt contains the prefix"
+            )
     return errors
 
 
