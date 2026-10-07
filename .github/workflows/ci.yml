@@ -31,7 +31,7 @@ jobs:
         # fails naming the file when an entry is malformed. Nothing here re-implements
         # a rule — pinned by version so the gate is reproducible and bumping it is a
         # one-line change.
-        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.1.0 .
+        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.2.0 .
 
   derive-graph:
     name: check derived graphs
