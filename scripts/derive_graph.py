@@ -2448,7 +2448,7 @@ def handler_glm5_next(cfg, raw, model):
     ]
     # The sparse-attention layers are latent attention fronted by the indexer.
     mla_mixer = lightning_indexer(cfg, model, hidden,
-                                  attention_block(cfg, model, hidden))
+                                  attention_block(cfg, model, hidden, raw=raw), raw)
 
     builders = {
         ("kda", "moe"): lambda: with_moe(kda_mixer),

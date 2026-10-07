@@ -882,9 +882,10 @@ def test_kpool_indexer_prices_its_own_projections_and_pooled_scan(d: Path):
             f"{scorer.get('compress_ratio')}; index_kpool is {kpool}, and an unpooled "
             f"scan overstates the dominant long-context term by that factor")
         # index_topk must NOT be here: the scorer scans every pooled candidate to
-        # DISCOVER the top-k, and the selection bounds the main read instead. This test
-        # is dormant until a k-pool model is committed, so it would otherwise have
-        # contradicted the production code the moment one arrived.
+        # DISCOVER the top-k, and the selection bounds the main read instead. Pinned
+        # directly by test_kpool_scorer_is_bounded_by_pooling_and_not_by_the_topk_it_computes;
+        # this catalog-driven case covers the same separation once a k-pool model is
+        # committed, and asserted the opposite until it was corrected.
         assert "index_topk" not in scorer, (
             f"{d.name}/{kind['id']}: the scorer carries index_topk, bounding it by the "
             f"selection it is supposed to produce")
@@ -968,6 +969,14 @@ def test_indexer_runs_only_on_the_layers_the_config_indexes():
             # instead -- only the ratio-4 layers build one -- which is a different rule
             # from skip_topk and is pinned by its own test. Keyed off the vector rather
             # than the model name so a future family declaring one is also excluded.
+            continue
+        if t.get("layer_types"):
+            # A hybrid states which layers have latent attention at all: GLM-5.3-Flash
+            # is KDA on 34 of 45 layers, and a linear-attention layer reads no KV cache
+            # to index. skip_topk selects among the layers that COULD index, so on a
+            # hybrid the two rules compose and this test's expansion does not describe
+            # the result. Those models' placement is pinned against layer_types by
+            # their own handler's tests.
             continue
         g = graph_of(d)
         layers = int(t.get("num_hidden_layers") or 0)

@@ -234,33 +234,37 @@ layer_kinds:
     k: 4096
   - &id013
     op: Elementwise
-    role: q_a_layernorm
+    role: qkv_a_layernorm
+    bytes_per_token: 8192
   - &id014
-    op: Elementwise
-    role: kv_a_layernorm
-  - &id015
     op: GEMM
     role: q_b_proj
     n: 16384
     k: 1536
-  - &id016
+  - &id015
     op: GEMM
     role: kv_b_proj
     n: 32768
     k: 512
     weight_dtype: bf16
-  - &id017
+  - &id016
     op: GEMM
     role: index_wq_b
     n: 4096
     k: 1536
     weight_dtype: bf16
-  - &id018
+  - &id017
     op: GEMM
     role: index_wk_weights_proj
     n: 160
     k: 4096
     weight_dtype: bf16
+  - &id018
+    op: GEMM
+    role: index_head_gate_proj
+    n: 32
+    k: 4096
+    weight_dtype: fp32
   - &id019
     op: GEMM
     role: index_kpool_compress_gate
@@ -269,17 +273,21 @@ layer_kinds:
     weight_dtype: bf16
   - &id020
     op: Elementwise
-    role: index_k_norm
+    role: index_kpool_compress
+    bytes_per_token: 2432
   - &id021
+    op: Elementwise
+    role: index_k_norm
+    bytes_per_token: 1024
+  - &id022
     op: Attention
     role: block_index_scores
     kind: sparse_mla
     n_q: 32
     n_kv: 1
     d_h: 128
-    index_topk: 2048
     compress_ratio: 4
-  - &id022
+  - &id023
     op: Attention
     kind: sparse_mla
     n_q: 64
@@ -288,12 +296,12 @@ layer_kinds:
     kv_lora_rank: 512
     qk_rope_head_dim: 0
     index_topk: 2048
-  - &id023
+  - &id024
     op: GEMM
     role: o_proj
     n: 4096
     k: 16384
-  - &id024
+  - &id025
     op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -357,6 +365,8 @@ layer_kinds:
     - 18
   - - 18
     - 19
+  - - 19
+    - 20
 - id: mtp_moe
   nodes:
   - op: Elementwise
@@ -383,6 +393,7 @@ layer_kinds:
   - *id022
   - *id023
   - *id024
+  - *id025
   - op: Elementwise
     role: post_attn_norm
   - op: GroupedGEMM
@@ -443,6 +454,8 @@ layer_kinds:
     - 20
   - - 20
     - 21
+  - - 21
+    - 22
 stack:
   prologue:
   - kda_dense
