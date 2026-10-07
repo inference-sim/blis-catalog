@@ -145,6 +145,89 @@ def test_attention_shape_matches_config(d: Path):
             assert n["n_kv"] == t["num_key_value_heads"]
 
 
+def mla_models() -> list[Path]:
+    """The models whose config declares a compressed latent KV."""
+    return [d for d in model_dirs()
+            if text_config(config_of(d)).get("kv_lora_rank")]
+
+
+@pytest.mark.parametrize("d", mla_models(), ids=lambda d: d.name)
+def test_mla_prices_its_low_rank_stages_not_one_fused_projection(d: Path):
+    """A latent layer runs a chain of low-rank GEMMs, and each must be priced.
+
+    An MLA layer does not project hidden straight to the query width. It compresses to
+    kv_lora_rank (and, where declared, q_lora_rank), normalises, then up-projects: the
+    cached latent through kv_b_proj into per-head nope + value widths, and the query
+    through q_b_proj. Collapsing that into one query-width `qkv_proj` priced the wrong
+    number of GEMMs at the wrong widths -- and for GLM-5.3-Flash it OVERSTATED the
+    parameter count by 1.33x while coincidentally matching on bytes, because kv_b_proj
+    is BF16 where its siblings are FP8. Byte traffic alone cannot catch this, so every
+    stage is asserted by shape.
+
+    Each width comes from the config, so this survives a config update."""
+    g, t = graph_of(d), text_config(config_of(d))
+    hidden = int(t["hidden_size"])
+    nq = int(t["num_attention_heads"])
+    nope = int(t["qk_nope_head_dim"])
+    rope = int(t["qk_rope_head_dim"])
+    v = int(t.get("v_head_dim") or nope)
+    kv_lora = int(t["kv_lora_rank"])
+    q_lora = int(t.get("q_lora_rank") or 0)
+
+    latent = [k for k in g["layer_kinds"]
+              if any(n.get("role") == "kv_b_proj" for n in k["nodes"])]
+    assert latent, (
+        f"{d.name}: no layer kind prices a kv_b_proj, so the cached latent is never "
+        f"up-projected; the layer is still one fused qkv_proj")
+
+    for kind in latent:
+        gemms = {n.get("role"): (n["n"], n["k"]) for n in kind["nodes"]
+                 if n["op"] == "GEMM"}
+        roles = [n.get("role") for n in kind["nodes"]]
+
+        assert "qkv_proj" not in gemms, (
+            f"{d.name}/{kind['id']}: still carries the fused qkv_proj alongside the "
+            f"low-rank stages, so the projection work is counted twice")
+
+        # The up-projection of the cache: kv_lora_rank -> heads * (nope + v).
+        assert gemms["kv_b_proj"] == (nq * (nope + v), kv_lora), (
+            f"{d.name}/{kind['id']}: kv_b_proj is {gemms['kv_b_proj']}; the config "
+            f"gives {nq} * ({nope} + {v}) from {kv_lora}")
+        assert "kv_a_layernorm" in roles, (
+            f"{d.name}/{kind['id']}: no norm on the compressed latent, which sits "
+            f"between the two KV stages")
+
+        if q_lora:
+            # vLLM fuses the two A-stages into one GEMM over
+            # [q_lora_rank, kv_lora_rank + qk_rope_head_dim].
+            assert gemms["qkv_a_proj"] == (q_lora + kv_lora + rope, hidden), (
+                f"{d.name}/{kind['id']}: qkv_a_proj is {gemms['qkv_a_proj']}; the "
+                f"config gives {q_lora} + {kv_lora} + {rope} from {hidden}")
+            assert gemms["q_b_proj"] == (nq * (nope + rope), q_lora), (
+                f"{d.name}/{kind['id']}: q_b_proj is {gemms['q_b_proj']}; the config "
+                f"gives {nq} * ({nope} + {rope}) from {q_lora}")
+            assert "q_a_layernorm" in roles, (
+                f"{d.name}/{kind['id']}: no norm on the compressed query")
+            assert "q_proj" not in gemms, (
+                f"{d.name}/{kind['id']}: declares q_lora_rank {q_lora} yet prices a "
+                f"direct q_proj; the query path is low-rank")
+        else:
+            # No q_lora_rank: the query is projected directly at full width, which is
+            # the branch vLLM takes and the shape deepseek-v2-lite really runs.
+            assert gemms["q_proj"] == (nq * (nope + rope), hidden), (
+                f"{d.name}/{kind['id']}: q_proj is {gemms['q_proj']}; with no "
+                f"q_lora_rank it runs {nq} * ({nope} + {rope}) from {hidden}")
+            assert gemms["kv_a_proj"] == (kv_lora + rope, hidden)
+            assert "qkv_a_proj" not in gemms, (
+                f"{d.name}/{kind['id']}: declares no q_lora_rank, so there is no "
+                f"query A-stage to fuse the KV one with")
+
+        # The output projection reads the per-head value width, not the query width.
+        assert gemms["o_proj"] == (hidden, nq * v), (
+            f"{d.name}/{kind['id']}: o_proj is {gemms['o_proj']}; the config gives "
+            f"{hidden} from {nq} * {v}")
+
+
 @pytest.mark.parametrize("d", model_dirs(), ids=lambda d: d.name)
 def test_expert_shape_matches_config(d: Path):
     """Expert count and top-k must come from the config, under whichever alias."""

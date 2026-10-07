@@ -693,16 +693,54 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
         qkv_out = (nq + 1) * int(latent_width)
         o_in = nq * int(latent_width)
     elif attn["kind"] in ("mla", "sparse_mla"):
-        # The latent path projects to a compressed KV plus a per-head query, and the
-        # projection widths differ enough between published MLA variants that a single
-        # formula would be a guess. The QKV node carries the query width, which is the
-        # part every variant shares.
-        qkv_out = nq * (int(pick(cfg, "qk_nope_head_dim") or 0) +
-                        int(pick(cfg, "qk_rope_head_dim") or 0))
-        o_in = nq * int(pick(cfg, "v_head_dim") or pick(cfg, "qk_nope_head_dim") or 0)
-        if qkv_out == 0 or o_in == 0:
+        # The latent path is a sequence of low-rank stages, not one fused projection,
+        # and the config states every width it needs. Each stage below is a GEMM an
+        # engine launches and a norm between the two it separates, so the whole chain is
+        # returned rather than collapsed into a query-width stand-in.
+        nope = int(pick(cfg, "qk_nope_head_dim") or 0)
+        rope = int(pick(cfg, "qk_rope_head_dim") or 0)
+        v = int(pick(cfg, "v_head_dim") or nope)
+        kv_lora = int(pick(cfg, "kv_lora_rank") or 0)
+        # q_lora_rank is read by its literal name: it is not a cross-dialect concept in
+        # ALIASES, and its ABSENCE is meaningful here -- it selects the direct-q_proj
+        # branch rather than defaulting a width.
+        q_lora = int(cfg.get("q_lora_rank") or 0)
+        qk_head = nope + rope
+        if qk_head == 0 or v == 0:
             raise DeriveError(f"{model}: latent attention with no head widths to size "
                               f"its projections")
+        if kv_lora == 0:
+            raise DeriveError(f"{model}: latent attention with no kv_lora_rank to size "
+                              f"its compressed KV stage")
+        stages = []
+        if q_lora:
+            # A declared q_lora_rank makes the query low-rank too, and vLLM fuses the
+            # two A-stages into one GEMM: DeepSeekV2FusedQkvAProjLinear over
+            # [q_lora_rank, kv_lora_rank + qk_rope_head_dim] (glm5next attention.py
+            # 464-469, the DeepSeek MLA path it shares). Priced as that one launch,
+            # which is what a deployment runs; the checkpoint stores the halves
+            # separately, and the weight bytes are identical either way.
+            stages.append(gemm("qkv_a_proj", q_lora + kv_lora + rope, hidden))
+            stages.append(norm("q_a_layernorm"))
+            stages.append(norm("kv_a_layernorm"))
+            stages.append(gemm("q_b_proj", nq * qk_head, q_lora))
+        else:
+            # No q_lora_rank: vLLM takes the else branch and builds a direct q_proj at
+            # full width, with only the KV side compressed (deepseek-v2-lite).
+            stages.append(gemm("kv_a_proj", kv_lora + rope, hidden))
+            stages.append(norm("kv_a_layernorm"))
+            stages.append(gemm("q_proj", nq * qk_head, hidden))
+        # The up-projection of the cached latent into per-head nope + value widths. Read
+        # on every decode step for every cached token, so its width is the one a fused
+        # node hid most consequentially.
+        stages.append(gemm("kv_b_proj", nq * (nope + v), kv_lora))
+        return [
+            norm("input_norm"),
+            *stages,
+            attn,
+            gemm("o_proj", hidden, nq * v),
+            collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
+        ]
     else:
         dh = attn["d_h"]
         qkv_out = (nq + 2 * nkv) * dh

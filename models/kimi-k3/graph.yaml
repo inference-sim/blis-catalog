@@ -129,9 +129,21 @@ layer_kinds:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
-    n: 18432
+    role: qkv_a_proj
+    n: 2112
     k: 7168
+  - op: Elementwise
+    role: q_a_layernorm
+  - op: Elementwise
+    role: kv_a_layernorm
+  - op: GEMM
+    role: q_b_proj
+    n: 18432
+    k: 1536
+  - op: GEMM
+    role: kv_b_proj
+    n: 24576
+    k: 512
   - op: Attention
     kind: mla
     n_q: 96
@@ -191,6 +203,14 @@ layer_kinds:
     - 9
   - - 9
     - 10
+  - - 10
+    - 11
+  - - 11
+    - 12
+  - - 12
+    - 13
+  - - 13
+    - 14
 - id: kda_dense
   nodes:
   - *id001
