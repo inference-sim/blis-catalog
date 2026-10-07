@@ -2143,6 +2143,19 @@ def handler_glm5_next(cfg, raw, model):
     for the DeepSeek-V3 family, rather than through a node here: an MTP module runs as
     its own forward pass, not as part of a base layer.
 
+    That draft module is sparse-MLA plus MoE, confirmed from the checkpoint's own tensor
+    list: layer 45 carries `self_attn.indexer.*`, `kv_a_layernorm` and `kv_b_proj`, the
+    sparse-latent projections, and none of the KDA ones (`A_log`, `k_conv1d`, `dt_bias`)
+    that layer 44 has. `mla_moe` is therefore the right kind -- but the generic fallback
+    does not read the module to get there, and for this family it is unsound. It mirrors
+    the last DECLARED kind, which is insertion order, and the kinds here are declared
+    `kda_moe`, `kda_dense`, `mla_moe`. That it lands on `mla_moe` is a coincidence of
+    that order, not a derivation: this model's last base LAYER is `kda_moe`, so mirroring
+    the target's final layer -- which is what the fallback reads like it does -- would
+    price the draft pass as KDA and be wrong. Reordering the declarations below would
+    silently change the draft kind, which the test named for this model in
+    tests/test_derive_graph.py pins against.
+
     The published repo is multimodal and ships a `vision_config`. Only the text path is
     priced, as for the other multimodal entries: the vision tower runs once per image,
     not per decode step, and the deployments this catalog serves are text."""
@@ -2383,9 +2396,18 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
         elif mtp_vector:
             pattern = [n if n in defined else kinds[-1]["id"] for n in mtp_vector]
         else:
-            # The fallback: mirror the target's last layer kind. Sound only where the
-            # draft module really does repeat a target layer's structure, which is why a
-            # handler whose family differs declares DRAFT_KIND_ID instead.
+            # The fallback: mirror the last kind the handler DECLARED. That is insertion
+            # order, not position in the layer sequence -- the two coincide for most
+            # families, but not all, and where they differ this reads the declaration.
+            # GLM-5.3-Flash is the case in hand: its last declared kind is mla_moe and
+            # its last base layer is kda_moe, and the draft module really is sparse-MLA,
+            # so the right answer here is reached by the order the handler happens to
+            # declare its kinds in rather than by anything about the module.
+            #
+            # Sound only where the draft module really does repeat a declared layer's
+            # structure, which is why a handler whose family differs declares
+            # DRAFT_KIND_ID instead. A handler that cannot say that of its last
+            # declaration should declare DRAFT_KIND_ID rather than rely on this.
             pattern = [kinds[-1]["id"]]
         graph["speculator"] = {
             "method": speculative_method(arch, model),

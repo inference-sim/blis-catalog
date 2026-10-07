@@ -2630,6 +2630,88 @@ def test_a_declared_mtp_vector_is_what_the_draft_stack_mirrors():
         f"declares {vector}")
 
 
+def test_glm5_3_flash_draft_module_is_sparse_mla_not_the_targets_last_layer():
+    """The draft pass must be priced as sparse-MLA, which is NOT this target's last layer.
+
+    GLM-5.3-Flash is the catalog's first family where "mirror the last declared kind" and
+    "mirror the last layer in the sequence" disagree. Its layer_types vector ends on
+    `linear_attention`, so the final base layer is KDA; the MTP module is sparse-latent.
+    The checkpoint settles it -- layer 45 carries `self_attn.indexer.*`, `kv_a_layernorm`
+    and `kv_b_proj` and none of KDA's `A_log`/`k_conv1d`/`dt_bias`, while layer 44 is the
+    reverse.
+
+    The committed graph is right, but it is right because the handler declares `mla_moe`
+    last and the fallback reads declaration order. Reordering those declarations is a
+    refactor with no visible semantics that would reprice every drafted token as KDA, and
+    nothing else in this suite would notice: the draft stack is one layer either way, the
+    layer count is unchanged, and --check would re-derive the new wrong graph as current.
+
+    Asserted on what the draft layer COSTS -- a latent cache read and projections, no
+    convolutional state -- rather than on its identifier, so renaming a kind leaves this
+    passing and repricing the draft pass fails it."""
+    d = ROOT / "models" / "glm-5.3-flash"
+    if not d.is_dir():
+        pytest.skip("glm-5.3-flash is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+
+    target = layer_sequence(g["stack"])
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+
+    def ops(layer_id: str) -> set:
+        return {n["op"] for n in kinds[layer_id]["nodes"]}
+
+    def mixer(layer_id: str):
+        """The layer's sequence mixer, ignoring the indexer's own scoring pass."""
+        return next((n for n in kinds[layer_id]["nodes"]
+                     if n["op"] == "Attention" and n.get("role") != "block_index_scores"),
+                    None)
+
+    def is_kda(layer_id: str) -> bool:
+        """The cost-bearing difference: KDA evolves a recurrent state and reads no KV
+        cache, so it prices a RecurrentUpdate and has no Attention node. Latent
+        attention is the reverse."""
+        return "RecurrentUpdate" in ops(layer_id)
+
+    # The premise: this test only means something while the two rules disagree here.
+    assert t["layer_types"][-1] == "linear_attention", (
+        f"this test is about a config whose last layer is KDA; it is now "
+        f"{t['layer_types'][-1]!r}, so the divergence it pins is gone")
+    assert is_kda(target[-1]), (
+        f"the target's last layer {target[-1]!r} is no longer priced as KDA, so "
+        f"mirroring it would no longer be the mistake this guards")
+
+    drafted = layer_sequence(g["speculator"]["stack"])
+    assert drafted, "no draft stack"
+    assert len(drafted) == int(t["num_nextn_predict_layers"]), (
+        f"draft stack is {len(drafted)} layer(s) and the config declares "
+        f"{t['num_nextn_predict_layers']} MTP module(s)")
+
+    for lid in drafted:
+        # Priced as latent attention: the cache is the latent rank alone, because this
+        # config declares mla_use_nope and so carries no rope dimensions beside it.
+        assert not is_kda(lid), (
+            f"the draft layer {lid!r} is priced as KDA -- the target's last layer kind. "
+            f"The MTP module is sparse-MLA (checkpoint layer 45 has no KDA projections), "
+            f"so every drafted token is being charged a convolutional state it never "
+            f"reads instead of a latent cache it does")
+        n = mixer(lid)
+        assert n is not None, (
+            f"the draft layer {lid!r} prices no Attention node at all, so it reads no "
+            f"KV cache; the MTP module is latent attention and does")
+        assert n.get("d_h") == int(t["kv_lora_rank"]), (
+            f"the draft layer reads a {n.get('d_h')}-wide cache; the latent rank is "
+            f"{t['kv_lora_rank']}")
+        # The module is sparse-latent, so it selects with a lightning indexer and the
+        # graph must charge for that selection.
+        assert any(x.get("role") == "block_index_scores"
+                   for x in kinds[lid]["nodes"]), (
+            "the draft layer carries no indexer; the MTP module is "
+            "deepseek_sparse_attention and its top-k selection is work")
+        # Routed experts, not a dense MLP: the module ships mlp.gate and shared_experts.
+        assert any(x["op"] == "GroupedGEMM" for x in kinds[lid]["nodes"]), (
+            "the draft layer has no routed-expert GEMM; the MTP module is MoE")
+
+
 @pytest.mark.parametrize("mutate,description", [
     (lambda g: g["speculator"].update(num_spec_tokens=g["speculator"]["num_spec_tokens"] + 6),
      "lengthening the draft stack"),
