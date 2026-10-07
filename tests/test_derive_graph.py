@@ -182,6 +182,9 @@ def kpool_config(**over) -> dict:
         "qk_nope_head_dim": 256, "qk_rope_head_dim": 64, "v_head_dim": 256,
         "index_n_heads": 32, "index_head_dim": 128, "index_topk": 2048,
         "index_kpool": 4, "dtype": "bfloat16", "num_hidden_layers": 45,
+        # The architecture matters: the FP32 head gate and the fused A/norm layout are
+        # per-family, resolved through this string.
+        "architectures": ["Glm5NextForConditionalGeneration"],
     }
     cfg.update(over)
     return cfg
@@ -307,6 +310,110 @@ def test_a_kpool_config_without_a_latent_rank_is_refused():
     cfg.pop("q_lora_rank")
     with pytest.raises(deriver().DeriveError, match="q_lora_rank"):
         indexer_nodes(cfg)
+
+
+def test_only_glm5next_recomputes_the_fp32_head_gate():
+    """The FP32 head-gate matmul is one architecture's, not every indexer's.
+
+    glm5next caches wk_weights_proj's trailing n_head rows transposed to FP32 and runs
+    its own matmul against FP32 activations (common/attention.py:341-350). deepseek_v32
+    does NOT: it slices index_weights straight out of the same GEMM's result and hands it
+    to fused_q (deepseek_v32/attention.py:309-315, 433-446), with no FP32 copy and no
+    second launch.
+
+    So the node must appear for glm5next and NOT for GlmMoeDsaForCausalLM, which is the
+    negative case -- emitting it there would invent an FP32 launch and a resident FP32
+    weight copy on every indexed glm-5* layer."""
+    positive = negative = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if not (t.get("index_topk") and t.get("index_n_heads")):
+            continue
+        g, raw = graph_of(d), config_of(d)
+        # Named by architecture string rather than read from the deriver's predicate: a
+        # test that imports what it checks moves with it and catches nothing.
+        arches = (list(raw.get("architectures") or ())
+                  + list(t.get("architectures") or ()))
+        expected = "Glm5NextForConditionalGeneration" in arches
+        for k in g["layer_kinds"]:
+            if not any(n.get("role") == "block_index_scores" for n in k["nodes"]):
+                continue
+            gate = [n for n in k["nodes"]
+                    if n.get("role") == "index_head_gate_proj"]
+            if expected:
+                assert len(gate) == 1, (
+                    f"{d.name}/{k['id']}: this architecture recomputes the head gate "
+                    f"as its own FP32 matmul and the graph prices none")
+                assert gate[0].get("weight_dtype") == "fp32", (
+                    f"{d.name}/{k['id']}: the head gate is cached as FP32; the global "
+                    f"width understates its resident bytes")
+                positive += 1
+            else:
+                assert not gate, (
+                    f"{d.name}/{k['id']}: prices an FP32 head-gate matmul, but this "
+                    f"architecture slices the gate out of wk_weights_proj instead")
+                negative += 1
+    assert negative, (
+        "no architecture in the catalog takes the slice-and-reuse path, so the negative "
+        "case this test exists for is unchecked")
+
+
+def test_the_indexer_projection_vllm_leaves_unquantized_carries_the_base_width():
+    """wk_weights_proj is constructed with quant_config=None, so it serves at base.
+
+    Both implementations do this (deepseek_v32/attention.py:78-86,
+    glm5next/common/attention.py:274-281), so the matrix is unquantized whatever the
+    checkpoint's global width. The fp8 GLM DSA graphs would otherwise inherit fp8 for a
+    tensor the runtime keeps at bf16.
+
+    Checked only where the global width differs from the base, since that is the only
+    case where an override is observable."""
+    checked = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if not (t.get("index_topk") and t.get("index_n_heads")):
+            continue
+        g = graph_of(d)
+        if g["global"]["weight_dtype"] == "bf16":
+            continue
+        for k in g["layer_kinds"]:
+            wk = next((n for n in k["nodes"]
+                       if n.get("role") == "index_wk_weights_proj"), None)
+            if wk is None:
+                continue
+            assert wk.get("weight_dtype") == "bf16", (
+                f"{d.name}/{k['id']}: index_wk_weights_proj inherits the global "
+                f"{g['global']['weight_dtype']}, but vLLM builds it with "
+                f"quant_config=None")
+            checked += 1
+    assert checked, (
+        "no indexed model has a non-bf16 global width, so this override is unobservable "
+        "and the test has nothing to check")
+
+
+def test_the_indexer_norm_prices_activation_width_not_the_accumulation_dtype():
+    """index_k_norm reads and writes BF16; the FP32 cast is an in-kernel temporary.
+
+    glm5next's _fused_indexer_k_norm is `F.layer_norm(x.float(), ...).type_as(x)`
+    (common/attention.py:55-59), and x is the BF16 output of the unquantized
+    wk_weights_proj. Sizing the traffic from fp32 would double it."""
+    checked = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if not (t.get("index_topk") and t.get("index_n_heads")):
+            continue
+        dim = int(t["index_head_dim"])
+        for k in graph_of(d)["layer_kinds"]:
+            n = next((x for x in k["nodes"]
+                      if x.get("role") == "index_k_norm"), None)
+            if n is None:
+                continue
+            assert n.get("bytes_per_token") == 2 * dim * 2, (
+                f"{d.name}/{k['id']}: index_k_norm states "
+                f"{n.get('bytes_per_token')} B/token; a BF16 read and write over "
+                f"{dim} is {2 * dim * 2}")
+            checked += 1
+    assert checked, "no indexer norm in the catalog to check"
 
 
 def kpool_models() -> list[Path]:
@@ -461,21 +568,27 @@ def test_indexer_runs_only_on_the_layers_the_config_indexes():
             f"{d.name}: scorers at {len(got)} layers {got[:8]}...; the config's "
             f"skip_topk rule gives {len(want)} at {want[:8]}...")
 
-        # A layer that skips the indexer makes no selection at all -- vLLM passes
-        # index_k=None and takes the dense latent path (attention.py:309-315) -- so it
-        # must not record a top-k either.
-        for i, kid in enumerate(seq):
-            if scores[kid]:
-                continue
-            for n in kinds[kid]["nodes"]:
-                if n["op"] != "Attention":
-                    continue
-                assert not n.get("index_topk"), (
-                    f"{d.name}/{kid}: a layer with no indexer records index_topk "
-                    f"{n['index_topk']}, asserting a selection it never computes")
-                assert n.get("kind") != "sparse_mla", (
-                    f"{d.name}/{kid}: a layer with no indexer claims the sparse-latent "
-                    f"kind, which implies a bound it does not have")
+        # A layer that skips the indexer omits the SCORING work, not the bounded read.
+        # vLLM constructs the shared MLA module with use_sparse=True on every layer and
+        # passes the common topk_indices_buffer (deepseek_v32/attention.py:202-218);
+        # mla_attention.py:564-566 says why: "Sparse MLA reads top-k indices from a
+        # shared buffer. Pass it explicitly so backbone 'skip' layers (indexer=None)
+        # still find it." Making such a layer plain mla would price its main KV read as
+        # unbounded, which is a far larger error than the scorer it correctly drops.
+        for kid in {k for k, has in scores.items() if not has} & set(seq):
+            main = next(n for n in kinds[kid]["nodes"]
+                        if n["op"] == "Attention"
+                        and n.get("role") != "block_index_scores")
+            assert main.get("kind") == "sparse_mla", (
+                f"{d.name}/{kid}: a skipped layer dropped the sparse-latent kind; it "
+                f"still reads a top-k from the shared buffer")
+            assert main.get("index_topk") == int(t["index_topk"]), (
+                f"{d.name}/{kid}: a skipped layer records index_topk "
+                f"{main.get('index_topk')}; it reads the same shared selection as every "
+                f"other layer, only without computing it")
+            assert not any(n.get("role") == "index_head_gate_proj"
+                           for n in kinds[kid]["nodes"]), (
+                f"{d.name}/{kid}: a skipped layer prices indexer projections")
         checked += 1
     assert checked, "no indexed model in the catalog to check"
 
@@ -580,6 +693,27 @@ def test_mla_prices_its_low_rank_stages_not_one_fused_projection(d: Path):
                  if n["op"] == "GEMM"}
         roles = [n.get("role") for n in kind["nodes"]]
 
+        # Whether the A-projections and latent norms are ONE launch or two is
+        # per-architecture. Named here by ARCHITECTURE STRING rather than read from the
+        # deriver's own table: a test that imports the table it is checking moves with
+        # it, so flipping an entry would flip the assertion too and catch nothing.
+        #
+        #   generic DeepseekV2Attention -- separate q_a_proj, two norm calls
+        #     (deepseek_v2.py:493, 598, 605, 608). Serves DeepseekV2ForCausalLM and
+        #     DeepseekV3ForCausalLM, which registry.py:89-90 both send to deepseek_v2;
+        #     kimi-k2.5's text_config declares DeepseekV3ForCausalLM.
+        #   fused -- one A-projection and one norm over both latents. deepseek_v32
+        #     (registry.py:118 for GlmMoeDsaForCausalLM), kimi_k3, glm5next.
+        FUSED_ARCHES = {
+            "GlmMoeDsaForCausalLM", "DeepseekV4ForCausalLM",
+            "KimiK3ForConditionalGeneration", "KimiLinearForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        }
+        arches = (list(config_of(d).get("architectures") or ())
+                  + list(t.get("architectures") or ()))
+        fused = any(a in FUSED_ARCHES for a in arches)
+        layout = {"fused_a": fused, "fused_norm": fused}
+
         assert "qkv_proj" not in gemms, (
             f"{d.name}/{kind['id']}: still carries the fused qkv_proj alongside the "
             f"low-rank stages, so the projection work is counted twice")
@@ -597,11 +731,24 @@ def test_mla_prices_its_low_rank_stages_not_one_fused_projection(d: Path):
             # (kimi_k3/nvidia/mla.py:218-228, 574-576). kimi-k3 declares it, which adds
             # num_heads * v_head_dim rows; no other committed config does.
             gate_rows = nq * v if t.get("mla_use_output_gate") else 0
-            assert gemms["qkv_a_proj"] == (
-                q_lora + kv_lora + rope + gate_rows, hidden), (
-                f"{d.name}/{kind['id']}: qkv_a_proj is {gemms['qkv_a_proj']}; the "
-                f"config gives {q_lora} + {kv_lora} + {rope} + {gate_rows} (gate) "
-                f"from {hidden}")
+            if layout["fused_a"]:
+                assert gemms["qkv_a_proj"] == (
+                    q_lora + kv_lora + rope + gate_rows, hidden), (
+                    f"{d.name}/{kind['id']}: qkv_a_proj is {gemms['qkv_a_proj']}; the "
+                    f"config gives {q_lora} + {kv_lora} + {rope} + {gate_rows} (gate) "
+                    f"from {hidden}")
+            else:
+                # Two launches, as deepseek_v2.py:493 and :605 build them.
+                assert gemms["q_a_proj"] == (q_lora, hidden), (
+                    f"{d.name}/{kind['id']}: q_a_proj is {gemms.get('q_a_proj')}; this "
+                    f"architecture projects {q_lora} from {hidden} on its own")
+                assert gemms["kv_a_proj"] == (kv_lora + rope, hidden)
+                assert "qkv_a_proj" not in gemms, (
+                    f"{d.name}/{kind['id']}: prices a fused A-projection, but this "
+                    f"architecture builds the two separately")
+                assert not gate_rows, (
+                    f"{d.name}/{kind['id']}: an output gate is a shard of a fused "
+                    f"A-projection, which this architecture does not build")
             if gate_rows:
                 gate = next((n for n in kind["nodes"]
                              if n.get("role") == "mla_output_gate"), None)
@@ -611,28 +758,38 @@ def test_mla_prices_its_low_rank_stages_not_one_fused_projection(d: Path):
             assert gemms["q_b_proj"] == (nq * (nope + rope), q_lora), (
                 f"{d.name}/{kind['id']}: q_b_proj is {gemms['q_b_proj']}; the config "
                 f"gives {nq} * ({nope} + {rope}) from {q_lora}")
-            # ONE fused norm over both latents, not two. Kimi-K3 calls
-            # fused_q_kv_rmsnorm (kimi_k3/nvidia/mla.py:520) and glm5next asks the
-            # shared MLA module for the same via fuse_qkv_rmsnorm=True
-            # (glm5next/common/attention.py:604), so two nodes would charge a launch
-            # neither family makes.
-            fused = next((n for n in kind["nodes"]
-                          if n.get("role") == "qkv_a_layernorm"), None)
-            assert fused is not None, (
-                f"{d.name}/{kind['id']}: no fused latent norm; vLLM normalises both "
-                f"latents in one launch for this family")
-            assert "q_a_layernorm" not in roles and "kv_a_layernorm" not in roles, (
-                f"{d.name}/{kind['id']}: prices separate q and kv latent norms "
-                f"alongside the fused one")
+            # The generic DeepseekV2Attention builds a separate q_a_proj and calls the
+            # two norms separately (deepseek_v2.py:493, 598, 605, 608); kimi_k3 and the
+            # DSA/glm5next families fuse both.
+            if layout["fused_norm"]:
+                latent_norms = [next((n for n in kind["nodes"]
+                                      if n.get("role") == "qkv_a_layernorm"), None)]
+                assert latent_norms[0] is not None, (
+                    f"{d.name}/{kind['id']}: this family fuses the two latent norms "
+                    f"into one launch and the graph prices no qkv_a_layernorm")
+                assert "q_a_layernorm" not in roles and "kv_a_layernorm" not in roles, (
+                    f"{d.name}/{kind['id']}: prices separate latent norms alongside "
+                    f"the fused one")
+            else:
+                latent_norms = [next((n for n in kind["nodes"]
+                                      if n.get("role") == r), None)
+                                for r in ("q_a_layernorm", "kv_a_layernorm")]
+                assert all(n is not None for n in latent_norms), (
+                    f"{d.name}/{kind['id']}: this family calls the two latent norms "
+                    f"separately and the graph does not price both")
+                assert "qkv_a_layernorm" not in roles, (
+                    f"{d.name}/{kind['id']}: prices a fused latent norm, but this "
+                    f"architecture makes two calls")
             # Sub-hidden traffic must be stated: these widths are the latent ranks, not
             # hidden, so an omitted bytes_per_token prices them as hidden-wide norms.
-            assert fused.get("bytes_per_token"), (
-                f"{d.name}/{kind['id']}: the fused latent norm states no "
-                f"bytes_per_token, so it prices as a hidden-width pass")
-            assert fused["bytes_per_token"] < 2 * hidden * 4, (
-                f"{d.name}/{kind['id']}: the fused latent norm states "
-                f"{fused['bytes_per_token']} B/token, which is not below a "
-                f"hidden-width norm's traffic; the latents are narrower than hidden")
+            for n in latent_norms:
+                assert n.get("bytes_per_token"), (
+                    f"{d.name}/{kind['id']}: {n.get('role')} states no "
+                    f"bytes_per_token, so it prices as a hidden-width pass")
+                assert n["bytes_per_token"] < 2 * hidden * 4, (
+                    f"{d.name}/{kind['id']}: {n.get('role')} states "
+                    f"{n['bytes_per_token']} B/token, not below a hidden-width norm's "
+                    f"traffic; the latents are narrower than hidden")
             assert "q_proj" not in gemms, (
                 f"{d.name}/{kind['id']}: declares q_lora_rank {q_lora} yet prices a "
                 f"direct q_proj; the query path is low-rank")
@@ -1205,6 +1362,13 @@ def test_a_latent_moe_states_its_projections_wherever_it_appears():
     assert checked, "no latent MoE layers in the catalog to check"
 
 
+def indexed_layer_rule(t: dict) -> bool:
+    """Whether this config declares a rule that skips the indexer on some layers."""
+    if t.get("index_topk_pattern"):
+        return True
+    return int(t.get("index_topk_freq") or 1) > 1
+
+
 def test_a_sparse_latent_read_prices_the_selection_it_claims():
     """A graph recording index_topk must also charge for the indexer that selects.
 
@@ -1225,10 +1389,18 @@ def test_a_sparse_latent_read_prices_the_selection_it_claims():
             if not selects:
                 continue
             scorers = [n for n in k["nodes"] if n.get("role") == "block_index_scores"]
-            assert scorers, (
-                f"{d.name}/{k['id']}: index_topk "
-                f"{selects[0]['index_topk']} asserts a top-k selection, but the layer "
-                f"has no block_index_scores node to charge for making it")
+            if not scorers:
+                # A DSA family may skip the indexer on some layers while every layer
+                # still READS the shared top-k (deepseek_v32/attention.py:202-218,
+                # mla_attention.py:564-566). Such a layer legitimately records
+                # index_topk with no scorer, and which layers those are is pinned by
+                # test_indexer_runs_only_on_the_layers_the_config_indexes.
+                assert indexed_layer_rule(text_config(config_of(d))), (
+                    f"{d.name}/{k['id']}: index_topk "
+                    f"{selects[0]['index_topk']} asserts a top-k selection, but the "
+                    f"layer has no block_index_scores node and the config declares no "
+                    f"skip pattern that would explain it")
+                continue
             # Two spellings, because the catalog holds two indexer shapes: the shared
             # lightning_indexer's wq_b (read from the latent rank, as both deepseek_v32
             # and glm5next build it) and DeepSeek-V4's own per-tensor wq_proj. All that

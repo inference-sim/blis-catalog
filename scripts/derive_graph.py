@@ -444,8 +444,7 @@ def gemm(role: str, n: int, k: int) -> dict[str, Any]:
 def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
               window: int | None = None, compress_ratio: int | None = None,
               index_topk: int | None = None,
-              latent_width: int | None = None,
-              selects: bool = True) -> dict[str, Any]:
+              latent_width: int | None = None) -> dict[str, Any]:
     """Build the attention node, choosing the kind from the config's own evidence.
 
     `latent_width` is the per-token cache width for a family that states it directly
@@ -459,12 +458,15 @@ def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
 
     if kind is None:
         if lora:
-            # A DSA config may skip the indexer on some layers, and a skipped layer
-            # makes no selection at all: vLLM passes index_k=None and takes the dense
-            # latent path (models/deepseek_v32/attention.py:309-315). Such a layer is
-            # plain MLA, so it must neither claim the sparse kind nor record a top-k it
-            # never computes.
-            kind = "sparse_mla" if (selects and pick(cfg, "index_topk")) else "mla"
+            # Every layer of a DSA model reads a top-k, including the ones that build no
+            # indexer. vLLM constructs the shared MLA module with use_sparse=True on
+            # every layer and passes the common topk_indices_buffer
+            # (deepseek_v32/attention.py:202-218), which mla_attention.py:564-566 states
+            # outright: "Sparse MLA reads top-k indices from a shared buffer. Pass it
+            # explicitly so backbone 'skip' layers (indexer=None) still find it." So a
+            # skipped layer omits the SCORING work, not the bounded read -- making it
+            # plain mla would overprice its main KV read as unbounded.
+            kind = "sparse_mla" if pick(cfg, "index_topk") else "mla"
         elif window:
             kind = "swa"
         else:
@@ -743,20 +745,93 @@ def chain(nodes: list[dict[str, Any]]) -> list[list[int]]:
     return [[i, i + 1] for i in range(len(nodes) - 1)]
 
 
+# How a family lays out its MLA latent stages, because vLLM does not do it one way and
+# the differences are launches rather than labels. Keyed by the architecture string, and
+# resolved through vLLM's own registry rather than by family resemblance:
+#
+#   "DeepseekV2ForCausalLM"      -> deepseek_v2.DeepseekV2Attention
+#   "DeepseekV3ForCausalLM"      -> deepseek_v2.DeepseekV3ForCausalLM (same attention)
+#   "GlmMoeDsaForCausalLM"       -> vllm.models.deepseek_v32  (registry.py:118)
+#   "KimiK3ForConditionalGeneration" -> vllm.models.kimi_k3
+#   "Glm5NextForConditionalGeneration" -> vllm.models.glm5next
+#
+# fused_a: one A-projection GEMM over [q_lora_rank, kv_lora_rank + rope], as
+#   DeepSeekV2FusedQkvAProjLinear / KimiK3MergedQKVGateLinear do. The generic
+#   DeepseekV2Attention instead builds a SEPARATE q_a_proj and kv_a_proj_with_mqa
+#   (deepseek_v2.py:493, 597, 605), which is two launches.
+# fused_norm: one norm over both latents, as kimi_k3's fused_q_kv_rmsnorm (mla.py:520)
+#   and glm5next's fuse_qkv_rmsnorm=True (glm5next/common/attention.py:604) do. The
+#   generic path calls q_a_layernorm then kv_a_layernorm separately (:598, :608).
+#
+# An architecture absent here takes the generic layout, which is the conservative
+# reading: separate launches are what deepseek_v2.py shows, and a family that fuses has
+# to say so.
+MLA_LAYOUTS = {
+    "DeepseekV2ForCausalLM": {"fused_a": False, "fused_norm": False},
+    "DeepseekV3ForCausalLM": {"fused_a": False, "fused_norm": False},
+    "GlmMoeDsaForCausalLM": {"fused_a": True, "fused_norm": True},
+    "DeepseekV4ForCausalLM": {"fused_a": True, "fused_norm": True},
+    "KimiK3ForConditionalGeneration": {"fused_a": True, "fused_norm": True},
+    # kimi-k3's text_config names KimiLinearForCausalLM while the outer config names
+    # KimiK3ForConditionalGeneration; both resolve to vllm.models.kimi_k3, so both map
+    # here rather than relying on which view the lookup happens to read.
+    "KimiLinearForCausalLM": {"fused_a": True, "fused_norm": True},
+    "Glm5NextForConditionalGeneration": {"fused_a": True, "fused_norm": True},
+    # kimi-k2.5 is NOT in the fused group. Its text_config declares
+    # DeepseekV3ForCausalLM and vLLM's registry sends that to deepseek_v2 (registry.py:90),
+    # whose DeepseekV2Attention builds a separate q_a_proj and calls the two latent norms
+    # separately. KimiK25ForConditionalGeneration wraps that text decoder, so it takes the
+    # generic layout by absence.
+}
+
+
+# Architectures whose indexer recomputes the head gate as its own FP32 matmul, rather
+# than slicing it out of the wk_weights_proj result. glm5next alone does this
+# (common/attention.py:341-350); deepseek_v32 slices and reuses
+# (deepseek_v32/attention.py:309-315).
+HEAD_GATE_RECOMPUTED = frozenset({
+    "Glm5NextForConditionalGeneration",
+})
+
+
+def recomputes_head_gate(raw: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Whether this architecture runs a separate FP32 head-gate matmul."""
+    for arches in (raw.get("architectures"), cfg.get("architectures")):
+        for arch in arches or ():
+            if arch in HEAD_GATE_RECOMPUTED:
+                return True
+    return False
+
+
+def mla_layout(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, bool]:
+    """The latent-stage layout for this checkpoint's architecture."""
+    # The OUTER architecture wins where the two differ: it is what vLLM's registry is
+    # keyed on, and it is the module that builds the attention. kimi-k3 declares
+    # KimiK3ForConditionalGeneration outside and KimiLinearForCausalLM in its
+    # text_config; kimi-k2.5 declares KimiK25ForConditionalGeneration outside and
+    # DeepseekV3ForCausalLM inside, and there the INNER one is the text decoder vLLM
+    # actually instantiates -- so both views are consulted and an entry for either
+    # spelling resolves the same way.
+    for arches in (raw.get("architectures"), cfg.get("architectures")):
+        for arch in arches or ():
+            if arch in MLA_LAYOUTS:
+                return MLA_LAYOUTS[arch]
+    return {"fused_a": False, "fused_norm": False}
+
+
 def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
                     raw: dict[str, Any] | None = None,
                     kind: str | None = None,
                     window: int | None = None,
                     compress_ratio: int | None = None,
                     index_topk: int | None = None,
-                    latent_width: int | None = None,
-                    selects: bool = True) -> list[dict[str, Any]]:
+                    latent_width: int | None = None) -> list[dict[str, Any]]:
     """The nodes common to every attention layer: norm, QKV, attention, output, reduce."""
     nq = int(require(cfg, "num_q_heads", model))
     nkv = int(require(cfg, "num_kv_heads", model))
     attn = attention(cfg, model, kind=kind, window=window,
                      compress_ratio=compress_ratio, index_topk=index_topk,
-                     latent_width=latent_width, selects=selects)
+                     latent_width=latent_width)
     if latent_width is not None:
         # This family states one inclusive per-token width and no separate nope/v
         # widths, so the projections are sized from that width: a per-head query at the
@@ -815,6 +890,7 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
                 return dict(node, weight_dtype=attn_width)
             return node
 
+        layout = mla_layout(raw, cfg)
         stages = []
         if q_lora:
             # A declared q_lora_rank makes the query low-rank too, and vLLM fuses the
@@ -824,6 +900,7 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
             # which is what a deployment runs; the checkpoint stores the halves
             # separately, and the weight bytes are identical either way.
             # An output gate rides in the SAME launch where the config declares one.
+            # (Only a fused-A family can carry it: it is a shard of that projection.)
             # Kimi-K3 sets mla_use_output_gate, and vLLM then builds
             # KimiK3MergedQKVGateLinear in place of the plain fused A-projection, with
             # the gate as a third shard (kimi_k3/nvidia/mla.py:218-228). The forward
@@ -833,14 +910,35 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
             # parameters and the work: for kimi-k3 that is 96 * 128 = 12,288 rows, which
             # makes the real launch (14,400, 7,168) rather than (2,112, 7,168).
             gate_rows = nq * v if cfg.get("mla_use_output_gate") else 0
-            stages.append(gemm("qkv_a_proj",
-                               q_lora + kv_lora + rope + gate_rows, hidden))
-            # One launch, not two. Kimi-K3 calls fused_q_kv_rmsnorm over both latents
-            # (kimi_k3/nvidia/mla.py:520) and glm5next asks the shared MLA module for
-            # the same with fuse_qkv_rmsnorm=True (glm5next common/attention.py:604), so
-            # two separate nodes would charge a kernel launch neither family makes. The
-            # traffic is both latents.
-            stages.append(latent_norm("qkv_a_layernorm", q_lora + kv_lora))
+            if layout["fused_a"]:
+                # One A-projection over both latents, as DeepSeekV2FusedQkvAProjLinear
+                # and KimiK3MergedQKVGateLinear build it.
+                stages.append(gemm("qkv_a_proj",
+                                   q_lora + kv_lora + rope + gate_rows, hidden))
+            else:
+                # The generic DeepseekV2Attention builds these separately
+                # (deepseek_v2.py:493 q_a_proj, :605 kv_a_proj_with_mqa), which is two
+                # launches rather than one. An output gate is a shard of a fused
+                # projection, so a family without one cannot be carrying it.
+                if gate_rows:
+                    raise DeriveError(
+                        f"{model}: mla_use_output_gate is set, but this architecture "
+                        f"builds its A-projections separately, so there is no fused "
+                        f"launch for the gate to be a shard of")
+                stages.append(gemm("q_a_proj", q_lora, hidden))
+                stages.append(gemm("kv_a_proj", kv_lora + rope, hidden))
+            if layout["fused_norm"]:
+                # One launch, not two. Kimi-K3 calls fused_q_kv_rmsnorm over both
+                # latents (kimi_k3/nvidia/mla.py:520) and glm5next asks the shared MLA
+                # module for the same with fuse_qkv_rmsnorm=True
+                # (glm5next common/attention.py:604). The traffic is both latents.
+                stages.append(latent_norm("qkv_a_layernorm", q_lora + kv_lora))
+            else:
+                # Two calls, in the order the generic forward makes them: q_a_layernorm
+                # right after q_a_proj (deepseek_v2.py:598) and kv_a_layernorm after the
+                # KV A-projection (:608).
+                stages.append(latent_norm("q_a_layernorm", q_lora))
+                stages.append(latent_norm("kv_a_layernorm", kv_lora))
             stages.append(gemm("q_b_proj", nq * qk_head, q_lora))
         else:
             # No q_lora_rank: vLLM takes the else branch and builds a direct q_proj at
@@ -963,19 +1061,29 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
         raise DeriveError(
             f"{model}: a lightning indexer projects its query from the latent rank, "
             f"and the config declares no q_lora_rank to size wq_b from")
+    # wk_weights_proj is constructed with quant_config=None in both implementations
+    # (deepseek_v32/attention.py:78-86, glm5next/common/attention.py:274-281), so it is
+    # served unquantized whatever the checkpoint's global width. The fp8 GLM DSA graphs
+    # would otherwise inherit fp8 for a matrix the runtime keeps at the base width.
     projections = [
         gemm("index_wq_b", index_heads * index_dim, q_lora),
-        gemm("index_wk_weights_proj", index_dim + index_heads, hidden),
+        dict(gemm("index_wk_weights_proj", index_dim + index_heads, hidden),
+             weight_dtype=base_dtype(cfg, raw, model)),
     ]
-    # The head gate is a SECOND launch, not part of the fused projection. The forward
-    # keeps the first head_dim rows of wk_weights_proj for K, then caches the remaining
-    # n_head rows transposed to FP32 and runs its own matmul against fp32 activations:
-    #   weights = torch.mm(hidden_states.float(), self._wp_fp32)
-    # (glm5next common/attention.py:341-350; deepseek_v32 attention.py does the same).
-    # That is a resident FP32 weight copy and a distinct GEMM, so modelling only the
-    # merged layer undercounts both compute and weight bytes.
-    projections.append(dict(gemm("index_head_gate_proj", index_heads, hidden),
-                            weight_dtype="fp32"))
+    # The FP32 head gate is glm5next's ALONE. Its forward keeps the first head_dim rows
+    # of wk_weights_proj for K, then caches the remaining n_head rows transposed to FP32
+    # and runs its own matmul against fp32 activations -- `weights =
+    # torch.mm(hidden_states.float(), self._wp_fp32)` (glm5next/common/attention.py
+    # 341-350) -- which is a second launch and a resident FP32 copy.
+    #
+    # deepseek_v32 does NOT: it slices index_weights straight out of the same GEMM's
+    # result and hands it to fused_q (deepseek_v32/attention.py:309-315, 433-446), with
+    # no FP32 copy and no second matmul. Emitting this node for that family would invent
+    # an FP32 launch on every indexed glm-5* layer, so it is gated on the architecture
+    # rather than on the presence of an indexer.
+    if recomputes_head_gate(raw, cfg):
+        projections.append(dict(gemm("index_head_gate_proj", index_heads, hidden),
+                                weight_dtype="fp32"))
     if kpool > 1:
         # The pooled path adds a learned compression gate and an APE table, and the
         # compression itself is real per-token work: a softmax-weighted pool over each
@@ -998,8 +1106,14 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
             # pooled state written back at the cache's quantized width.
             "bytes_per_token": key + ape + index_dim,
         })
+    # The norm reads and writes at the ACTIVATION width. glm5next's
+    # _fused_indexer_k_norm is `F.layer_norm(x.float(), ...).type_as(x)`
+    # (common/attention.py:55-59): the fp32 cast is a temporary inside the fused kernel,
+    # and x is the BF16 output of the unquantized wk_weights_proj. Sizing this from the
+    # accumulation dtype would double its HBM traffic.
     projections.append(dict(norm("index_k_norm"),
-                            bytes_per_token=2 * index_dim * DTYPE_WIDTHS["fp32"]))
+                            bytes_per_token=2 * index_dim
+                            * DTYPE_WIDTHS[base_dtype(cfg, raw, model)]))
 
     scorer = {
         "op": "Attention",
@@ -1108,7 +1222,7 @@ def handler_moe(cfg, raw, model):
 
     def attn_nodes(win=None, index=None):
         use = indexed_any if index is None else index
-        n = attention_block(cfg, model, hidden, raw=raw, window=win, selects=use)
+        n = attention_block(cfg, model, hidden, raw=raw, window=win)
         return lightning_indexer(cfg, model, hidden, n, raw) if use else n
 
     def sparse_nodes(win=None, index=None):

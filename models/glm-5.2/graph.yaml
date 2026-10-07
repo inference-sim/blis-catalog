@@ -38,14 +38,10 @@ layer_kinds:
     role: index_wk_weights_proj
     n: 160
     k: 6144
-  - op: GEMM
-    role: index_head_gate_proj
-    n: 32
-    k: 6144
-    weight_dtype: fp32
+    weight_dtype: bf16
   - op: Elementwise
     role: index_k_norm
-    bytes_per_token: 1024
+    bytes_per_token: 512
   - op: Attention
     role: block_index_scores
     kind: gqa
@@ -111,8 +107,6 @@ layer_kinds:
     - 14
   - - 14
     - 15
-  - - 15
-    - 16
 - id: attn_moe_indexed
   nodes:
   - op: Elementwise
@@ -140,14 +134,10 @@ layer_kinds:
     role: index_wk_weights_proj
     n: 160
     k: 6144
-  - op: GEMM
-    role: index_head_gate_proj
-    n: 32
-    k: 6144
-    weight_dtype: fp32
+    weight_dtype: bf16
   - op: Elementwise
     role: index_k_norm
-    bytes_per_token: 1024
+    bytes_per_token: 512
   - op: Attention
     role: block_index_scores
     kind: gqa
@@ -215,8 +205,6 @@ layer_kinds:
     - 14
   - - 14
     - 15
-  - - 15
-    - 16
 - id: attn_moe_noindex
   nodes:
   - op: Elementwise
@@ -237,12 +225,13 @@ layer_kinds:
     n: 28672
     k: 512
   - op: Attention
-    kind: mla
+    kind: sparse_mla
     n_q: 64
     n_kv: 1
     d_h: 576
     kv_lora_rank: 512
     qk_rope_head_dim: 64
+    index_topk: 2048
   - op: GEMM
     role: o_proj
     n: 6144
