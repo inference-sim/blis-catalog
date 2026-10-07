@@ -21,6 +21,7 @@ layer_kinds:
     k: 2048
   - op: Elementwise
     role: kv_a_layernorm
+    bytes_per_token: 2048
   - op: GEMM
     role: q_proj
     n: 3072
@@ -89,6 +90,7 @@ layer_kinds:
     k: 2048
   - op: Elementwise
     role: kv_a_layernorm
+    bytes_per_token: 2048
   - op: GEMM
     role: q_proj
     n: 3072

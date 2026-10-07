@@ -19,18 +19,20 @@ layer_kinds:
     role: qkv_a_proj
     n: 2112
     k: 7168
+    weight_dtype: bf16
   - op: Elementwise
-    role: q_a_layernorm
-  - op: Elementwise
-    role: kv_a_layernorm
+    role: qkv_a_layernorm
+    bytes_per_token: 8192
   - op: GEMM
     role: q_b_proj
     n: 12288
     k: 1536
+    weight_dtype: bf16
   - op: GEMM
     role: kv_b_proj
     n: 16384
     k: 512
+    weight_dtype: bf16
   - op: Attention
     kind: mla
     n_q: 64
@@ -42,6 +44,7 @@ layer_kinds:
     role: o_proj
     n: 7168
     k: 8192
+    weight_dtype: bf16
   - op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -81,8 +84,6 @@ layer_kinds:
     - 10
   - - 10
     - 11
-  - - 11
-    - 12
 - id: attn_moe
   nodes:
   - op: Elementwise
@@ -91,18 +92,20 @@ layer_kinds:
     role: qkv_a_proj
     n: 2112
     k: 7168
+    weight_dtype: bf16
   - op: Elementwise
-    role: q_a_layernorm
-  - op: Elementwise
-    role: kv_a_layernorm
+    role: qkv_a_layernorm
+    bytes_per_token: 8192
   - op: GEMM
     role: q_b_proj
     n: 12288
     k: 1536
+    weight_dtype: bf16
   - op: GEMM
     role: kv_b_proj
     n: 16384
     k: 512
+    weight_dtype: bf16
   - op: Attention
     kind: mla
     n_q: 64
@@ -114,6 +117,7 @@ layer_kinds:
     role: o_proj
     n: 7168
     k: 8192
+    weight_dtype: bf16
   - op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -155,8 +159,6 @@ layer_kinds:
     - 10
   - - 10
     - 11
-  - - 11
-    - 12
 stack:
   prologue:
   - attn_dense

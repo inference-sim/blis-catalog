@@ -178,6 +178,61 @@ QUANT_ALGOS = {
 }
 
 
+# The graph roles that price an attention module's weights, i.e. the ones a
+# checkpoint's `self_attn` exclusion covers. Listed explicitly rather than matched on a
+# substring so that adding a role is a deliberate act: a role missing from here keeps the
+# global width, which is the conservative direction for a width override.
+ATTENTION_WEIGHT_ROLES = (
+    "qkv_proj", "qkv_a_proj", "kv_a_proj", "q_proj", "q_b_proj", "kv_b_proj", "o_proj",
+    "index_wq_b", "index_wk_weights_proj", "index_head_gate_proj",
+    "index_kpool_compress_gate",
+    # DeepSeek-V4 and MiniMax-M3 name their indexer projections differently, because
+    # their handlers build them rather than lightning_indexer. index_qk_proj is
+    # MiniMax-M3's block-sparse scorer projection, which is a different mechanism from
+    # the DSA lightning indexer and keeps its own shape.
+    "index_wq_proj", "index_weights_proj", "index_compressor_fused_wkv_wgate",
+    "index_qk_proj",
+    # A linear-attention mixer is the layer's self_attn too, not a separate module:
+    # vLLM builds Kimi-K3's KDA as `self.self_attn` with prefix "{...}.self_attn"
+    # (kimi_k3/nvidia/model.py:888-891), so an ignore list naming self_attn covers these
+    # projections exactly as it covers the latent ones.
+    "kda_q_proj", "kda_k_proj", "kda_v_proj", "kda_b_proj",
+    "kda_f_a_proj", "kda_f_b_proj", "kda_g_a_proj", "kda_g_b_proj", "kda_g_proj",
+    "kda_o_proj",
+)
+
+
+def compressed_tensors_skips_attention(cfg: dict[str, Any],
+                                       raw: dict[str, Any]) -> bool:
+    """Whether a compressed-tensors checkpoint leaves the attention modules alone.
+
+    compressed-tensors states an `ignore` list of module names and `re:`-prefixed
+    regexes, and both Kimi configs name `re:.*self_attn.*` -- so every MLA projection and
+    the indexer stay at the declared base width while the routed experts carry the
+    quantized one. kimi-k2.5's global width is int4 and kimi-k3's mxfp4, so pricing those
+    projections globally charged 4 bits for tensors the runtime never quantizes.
+
+    Deliberately narrow: this answers only "does the ignore list cover self_attn", which
+    is the pattern both committed configs use. A checkpoint ignoring individual attention
+    tensors would need its own reading rather than this one."""
+    quant = raw.get("quantization_config") or cfg.get("quantization_config") or {}
+    if not isinstance(quant, dict):
+        return False
+    if "compressed-tensors" not in str(quant.get("quant_method", "")).lower():
+        return False
+    for entry in quant.get("ignore") or ():
+        text = str(entry)
+        if not text.startswith("re:"):
+            continue
+        body = text[3:]
+        # Only the blanket self_attn form is recognised. A narrower regex may cover some
+        # attention tensors and not others, and guessing which would be worse than
+        # leaving the global width in place.
+        if body in (".*self_attn.*", r".*self_attn.*"):
+            return True
+    return False
+
+
 def quantized_classes(cfg: dict[str, Any], model: str) -> dict[str, str]:
     """Map each role class to its stored width, from an explicit per-tensor map.
 
@@ -323,6 +378,17 @@ def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
 # descriptor this catalog cites for the model both state BF16 for those tensors.
 # Recorded per model rather than defaulted, because a default here would silently price
 # every future dtype-less config at two bytes.
+# Bytes per element, for the widths an activation tensor is stored in. Only the dtypes
+# that can carry activations are listed: this sizes elementwise traffic, not weights, so
+# the sub-byte quantized formats have no entry rather than a fractional one.
+DTYPE_WIDTHS = {
+    "fp32": 4,
+    "bf16": 2,
+    "fp16": 2,
+    "fp8": 1,
+}
+
+
 UNQUANTIZED_BASE = {
     "gpt-oss-120b": "bf16",
     "gpt-oss-20b": "bf16",
@@ -378,7 +444,8 @@ def gemm(role: str, n: int, k: int) -> dict[str, Any]:
 def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
               window: int | None = None, compress_ratio: int | None = None,
               index_topk: int | None = None,
-              latent_width: int | None = None) -> dict[str, Any]:
+              latent_width: int | None = None,
+              selects: bool = True) -> dict[str, Any]:
     """Build the attention node, choosing the kind from the config's own evidence.
 
     `latent_width` is the per-token cache width for a family that states it directly
@@ -392,7 +459,12 @@ def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
 
     if kind is None:
         if lora:
-            kind = "sparse_mla" if pick(cfg, "index_topk") else "mla"
+            # A DSA config may skip the indexer on some layers, and a skipped layer
+            # makes no selection at all: vLLM passes index_k=None and takes the dense
+            # latent path (models/deepseek_v32/attention.py:309-315). Such a layer is
+            # plain MLA, so it must neither claim the sparse kind nor record a top-k it
+            # never computes.
+            kind = "sparse_mla" if (selects and pick(cfg, "index_topk")) else "mla"
         elif window:
             kind = "swa"
         else:
@@ -672,17 +744,19 @@ def chain(nodes: list[dict[str, Any]]) -> list[list[int]]:
 
 
 def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
+                    raw: dict[str, Any] | None = None,
                     kind: str | None = None,
                     window: int | None = None,
                     compress_ratio: int | None = None,
                     index_topk: int | None = None,
-                    latent_width: int | None = None) -> list[dict[str, Any]]:
+                    latent_width: int | None = None,
+                    selects: bool = True) -> list[dict[str, Any]]:
     """The nodes common to every attention layer: norm, QKV, attention, output, reduce."""
     nq = int(require(cfg, "num_q_heads", model))
     nkv = int(require(cfg, "num_kv_heads", model))
     attn = attention(cfg, model, kind=kind, window=window,
                      compress_ratio=compress_ratio, index_topk=index_topk,
-                     latent_width=latent_width)
+                     latent_width=latent_width, selects=selects)
     if latent_width is not None:
         # This family states one inclusive per-token width and no separate nope/v
         # widths, so the projections are sized from that width: a per-head query at the
@@ -712,6 +786,35 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
         if kv_lora == 0:
             raise DeriveError(f"{model}: latent attention with no kv_lora_rank to size "
                               f"its compressed KV stage")
+        # A norm's traffic is derivable from hidden_size only when it runs at hidden
+        # width. These do not: the q norm is q_lora_rank wide and the kv norm
+        # kv_lora_rank, so each states its own traffic or it prices as a hidden-width
+        # pass. RMSNorm accumulates in fp32 over a read and a write.
+        # raw is needed for the activation width: two committed configs state their
+        # dtype nowhere a text_config view can see, so guessing a default here would
+        # silently halve or double the traffic on the stages below.
+        if raw is None:
+            raise DeriveError(
+                f"{model}: the latent stages size their norm traffic from the declared "
+                f"activation width, so this call must pass raw")
+        act = DTYPE_WIDTHS[base_dtype(cfg, raw, model)]
+
+        def latent_norm(role: str, width: int) -> dict[str, Any]:
+            return dict(norm(role), bytes_per_token=2 * width * act)
+
+        # Where the checkpoint's quantization skips the attention modules, these stages
+        # store at the base width and the global one would misprice them. Both Kimi
+        # configs do this: kimi-k2.5 is globally int4 and kimi-k3 mxfp4, and each names
+        # `re:.*self_attn.*` in its compressed-tensors ignore list, so every projection
+        # below stays unquantized at runtime.
+        attn_width = (base_dtype(cfg, raw, model)
+                      if compressed_tensors_skips_attention(cfg, raw) else None)
+
+        def staged(node: dict[str, Any]) -> dict[str, Any]:
+            if attn_width and node.get("role") in ATTENTION_WEIGHT_ROLES:
+                return dict(node, weight_dtype=attn_width)
+            return node
+
         stages = []
         if q_lora:
             # A declared q_lora_rank makes the query low-rank too, and vLLM fuses the
@@ -720,25 +823,49 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
             # 464-469, the DeepSeek MLA path it shares). Priced as that one launch,
             # which is what a deployment runs; the checkpoint stores the halves
             # separately, and the weight bytes are identical either way.
-            stages.append(gemm("qkv_a_proj", q_lora + kv_lora + rope, hidden))
-            stages.append(norm("q_a_layernorm"))
-            stages.append(norm("kv_a_layernorm"))
+            # An output gate rides in the SAME launch where the config declares one.
+            # Kimi-K3 sets mla_use_output_gate, and vLLM then builds
+            # KimiK3MergedQKVGateLinear in place of the plain fused A-projection, with
+            # the gate as a third shard (kimi_k3/nvidia/mla.py:218-228). The forward
+            # splits [qkv_a_rows, num_local_heads * v_head_dim] off the one result and
+            # sigmoid-multiplies the attention output by it (mla.py:574-576, 621-622).
+            # Those rows are part of this GEMM, so omitting them dropped both the
+            # parameters and the work: for kimi-k3 that is 96 * 128 = 12,288 rows, which
+            # makes the real launch (14,400, 7,168) rather than (2,112, 7,168).
+            gate_rows = nq * v if cfg.get("mla_use_output_gate") else 0
+            stages.append(gemm("qkv_a_proj",
+                               q_lora + kv_lora + rope + gate_rows, hidden))
+            # One launch, not two. Kimi-K3 calls fused_q_kv_rmsnorm over both latents
+            # (kimi_k3/nvidia/mla.py:520) and glm5next asks the shared MLA module for
+            # the same with fuse_qkv_rmsnorm=True (glm5next common/attention.py:604), so
+            # two separate nodes would charge a kernel launch neither family makes. The
+            # traffic is both latents.
+            stages.append(latent_norm("qkv_a_layernorm", q_lora + kv_lora))
             stages.append(gemm("q_b_proj", nq * qk_head, q_lora))
         else:
             # No q_lora_rank: vLLM takes the else branch and builds a direct q_proj at
             # full width, with only the KV side compressed (deepseek-v2-lite).
             stages.append(gemm("kv_a_proj", kv_lora + rope, hidden))
-            stages.append(norm("kv_a_layernorm"))
+            # Only the KV side is compressed here, so there is one latent norm and
+            # nothing to fuse it with.
+            stages.append(latent_norm("kv_a_layernorm", kv_lora))
             stages.append(gemm("q_proj", nq * qk_head, hidden))
         # The up-projection of the cached latent into per-head nope + value widths. Read
         # on every decode step for every cached token, so its width is the one a fused
         # node hid most consequentially.
         stages.append(gemm("kv_b_proj", nq * (nope + v), kv_lora))
+        post_attn = []
+        if q_lora and cfg.get("mla_use_output_gate"):
+            # The sigmoid-multiply itself, which runs on the attention output before
+            # o_proj: read the output and the gate, write the product.
+            post_attn.append(dict(norm("mla_output_gate"),
+                                  bytes_per_token=3 * nq * v * act))
         return [
             norm("input_norm"),
-            *stages,
+            *[staged(n) for n in stages],
             attn,
-            gemm("o_proj", hidden, nq * v),
+            *post_attn,
+            staged(gemm("o_proj", hidden, nq * v)),
             collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
         ]
     else:
@@ -754,8 +881,54 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
     ]
 
 
+def indexed_layers(cfg: dict[str, Any], model: str, layers: int) -> list[bool] | None:
+    """Which layers actually build an indexer, or None where the family has no indexer.
+
+    A DSA config does not necessarily index every layer. vLLM computes a per-layer
+    `skip_topk` and constructs the indexer only when it is false
+    (models/deepseek_v32/attention.py:166-200, where GlmMoeDsaForCausalLM is served):
+
+        if index_topk_pattern is None:
+            skip_topk = max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+        elif 0 <= layer_id < len(index_topk_pattern):
+            skip_topk = index_topk_pattern[layer_id] == "S"
+        else:
+            skip_topk = False
+
+    The defaults matter: freq 1 and offset 2 make every layer indexed, which is why the
+    families that declare neither field are unaffected. glm-5.2, glm-5.2-fp8 and glm-5.3
+    declare freq 4 with offset 3 over 78 layers, which indexes 21 of them -- so charging
+    all 78 for the scorer and its projections overprices that work by 78/21.
+
+    Returns a per-layer list so a handler can key its layer kinds off it rather than
+    collapsing indexing to one model-wide flag."""
+    if not (pick(cfg, "index_topk") and cfg.get("index_n_heads") is not None):
+        return None
+    pattern = cfg.get("index_topk_pattern")
+    if pattern is not None:
+        if len(pattern) < layers:
+            raise DeriveError(
+                f"{model}: index_topk_pattern has {len(pattern)} entries for {layers} "
+                f"layers; a layer past the end would silently take the indexed branch")
+        unknown = set(pattern[:layers]) - {"S", "I"}
+        if unknown:
+            raise DeriveError(
+                f"{model}: index_topk_pattern names {sorted(unknown)}; this deriver "
+                f"reads 'S' as skipped and anything else as indexed, so an unexpected "
+                f"code would be priced as indexed on a guess")
+        return [pattern[i] != "S" for i in range(layers)]
+    freq = int(cfg.get("index_topk_freq") or 1)
+    offset = cfg.get("index_skip_topk_offset")
+    offset = 2 if offset is None else int(offset)
+    if freq < 1:
+        raise DeriveError(
+            f"{model}: index_topk_freq is {freq}; the modulus must be at least 1")
+    return [max(i - offset + 1, 0) % freq == 0 for i in range(layers)]
+
+
 def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
-                      nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                      nodes: list[dict[str, Any]],
+                      raw: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Splice a DSA lightning indexer in front of the attention node.
 
     The indexer is what makes a sparse latent read sparse: it scores every cached
@@ -774,71 +947,83 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
     q_lora = int(cfg.get("q_lora_rank") or 0)
     at = next(i for i, n in enumerate(nodes) if n.get("op") == "Attention")
 
+    # One shape for every family that reaches this helper, because vLLM builds one:
+    # GlmMoeDsaForCausalLM is served by the deepseek_v32 module (its __init__ aliases
+    # GlmMoeDsaForCausalLM = DeepseekV32ForCausalLM), and that indexer
+    # (models/deepseek_v32/attention.py:71-85) constructs exactly what glm5next's does
+    # (models/glm5next/common/attention.py:265-282):
+    #
+    #   wq_b              q_lora_rank -> n_head * head_dim      (ReplicatedLinear)
+    #   wk_weights_proj   hidden -> [head_dim, n_head]           (fused, ONE GEMM)
+    #
+    # The query stage reads the LATENT rank, not hidden. An earlier revision of this
+    # helper emitted a single hidden-wide GEMM of n_head*head_dim + head_dim, which
+    # overstated the projection work -- 2.3x on GLM-5.3-Flash -- and had the wrong k.
+    if not q_lora:
+        raise DeriveError(
+            f"{model}: a lightning indexer projects its query from the latent rank, "
+            f"and the config declares no q_lora_rank to size wq_b from")
+    projections = [
+        gemm("index_wq_b", index_heads * index_dim, q_lora),
+        gemm("index_wk_weights_proj", index_dim + index_heads, hidden),
+    ]
+    # The head gate is a SECOND launch, not part of the fused projection. The forward
+    # keeps the first head_dim rows of wk_weights_proj for K, then caches the remaining
+    # n_head rows transposed to FP32 and runs its own matmul against fp32 activations:
+    #   weights = torch.mm(hidden_states.float(), self._wp_fp32)
+    # (glm5next common/attention.py:341-350; deepseek_v32 attention.py does the same).
+    # That is a resident FP32 weight copy and a distinct GEMM, so modelling only the
+    # merged layer undercounts both compute and weight bytes.
+    projections.append(dict(gemm("index_head_gate_proj", index_heads, hidden),
+                            weight_dtype="fp32"))
     if kpool > 1:
-        # The k-pool indexer, which vLLM implements for glm5next and whose projections
-        # the pinned GLM-5.3-Flash checkpoint states tensor by tensor. Three launches,
-        # not one, and the query stage reads the LATENT rather than hidden:
-        #
-        #   wq_b              q_lora_rank -> n_head * head_dim   (ReplicatedLinear)
-        #   wk_weights_proj   hidden -> [head_dim, n_head]       (fused, one GEMM)
-        #   kpool gate        hidden -> head_dim                 (F.linear over a Parameter)
-        #
-        # (common/attention.py:255-282; the fused pair is vLLM's own comment, "Fused wk
-        # + weights_proj: single GEMM producing [head_dim + n_head]".) Sourcing all of
-        # it from hidden at a single fused width, as the non-pooled branch below does,
-        # overstated this model's indexer projections by 2.3x.
-        if not q_lora:
+        # The pooled path adds a learned compression gate and an APE table, and the
+        # compression itself is real per-token work: a softmax-weighted pool over each
+        # group of index_kpool keys, then rotate, quantize and write one pooled state to
+        # the cache (glm5next common/attention.py:394-417). The gate GEMM is the only
+        # part with a weight shape; the pool/rotate/quantize pass is elementwise over the
+        # per-token key and its FP32 [index_kpool, index_head_dim] APE, so it is an
+        # Elementwise node with that traffic stated rather than left derivable.
+        projections.append(gemm("index_kpool_compress_gate", index_dim, hidden))
+        ape = kpool * index_dim * DTYPE_WIDTHS["fp32"]
+        if raw is None:
             raise DeriveError(
-                f"{model}: a kpool indexer projects its query from the latent rank, "
-                f"and the config declares no q_lora_rank to size wq_b from")
-        projections = [
-            gemm("index_wq_b", index_heads * index_dim, q_lora),
-            gemm("index_wk_weights_proj", index_dim + index_heads, hidden),
-            gemm("index_kpool_compress_gate", index_dim, hidden),
-            norm("index_k_norm"),
-        ]
-        # Scoring runs over POOLED candidates: one K state per index_kpool tokens, which
-        # vLLM expresses as the cache spec's tokens_per_state and sizes the scan with as
-        # max_model_len // index_kpool (common/attention.py:128-131, 314). The pooled
-        # scan is therefore ~1/kpool of the token context, on the one term that grows
-        # with context -- so recording it unpooled overstates the dominant long-context
-        # cost by that factor. compress_ratio is the schema's field for exactly this: a
-        # latent read bounded by a factor rather than by a window.
-        #
-        # The incomplete trailing pool is always kept, which vLLM requires rather than
-        # treats as optional -- it rejects a config with index_kpool_always_select_tail
-        # false (common/model.py:145-150) -- and it lives in its own tail cache. That is
-        # a kpool-1 addend on the selection, below the granularity a per-token node
-        # prices, so it is not a separate node; index_topk carries the selection.
-        scorer = {
-            "op": "Attention",
-            "role": "block_index_scores",
-            "kind": "sparse_mla",
-            "n_q": index_heads,
-            "n_kv": 1,
-            "d_h": index_dim,
-            "index_topk": int(require_key(cfg, "index_topk", model)),
-            "compress_ratio": kpool,
-        }
-        return nodes[:at] + projections + [scorer] + nodes[at:]
+                f"{model}: the kpool compression pass sizes its traffic from the "
+                f"declared activation width, so this call must pass raw")
+        key = index_dim * DTYPE_WIDTHS[base_dtype(cfg, raw, model)]
+        projections.append({
+            "op": "Elementwise",
+            "role": "index_kpool_compress",
+            # Per token: its own key read, the APE table it is weighted against, and the
+            # pooled state written back at the cache's quantized width.
+            "bytes_per_token": key + ape + index_dim,
+        })
+    projections.append(dict(norm("index_k_norm"),
+                            bytes_per_token=2 * index_dim * DTYPE_WIDTHS["fp32"]))
 
-    # The non-pooled indexer. Kept as one fused projection: the families that reach it
-    # (GlmMoeDsaForCausalLM, DeepseekV4ForCausalLM) declare no kpool fields, and this
-    # deriver has no per-tensor evidence for their indexer the way it does for the
-    # glm5next one above -- vLLM carries no GlmMoeDsa implementation at the commit this
-    # was read from. Splitting them on the glm5next shape would be extrapolation, so the
-    # shape they already had is left alone rather than changed on a guess.
-    return nodes[:at] + [
-        gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
-        {
-            "op": "Attention",
-            "role": "block_index_scores",
-            "kind": "gqa",
-            "n_q": index_heads,
-            "n_kv": 1,
-            "d_h": index_dim,
-        },
-    ] + nodes[at:]
+    scorer = {
+        "op": "Attention",
+        "role": "block_index_scores",
+        "kind": "gqa",
+        "n_q": index_heads,
+        "n_kv": 1,
+        "d_h": index_dim,
+    }
+    if kpool > 1:
+        # The scan is over POOLED candidates: one K state per index_kpool tokens, which
+        # vLLM expresses as the cache spec's tokens_per_state and sizes as
+        # max_model_len // index_kpool (common/attention.py:128-131, 314).
+        #
+        # index_topk is deliberately NOT set here. The scorer must score EVERY pooled
+        # candidate in order to discover the top-k; the selection bounds the main MLA
+        # read, which already carries index_topk. Setting it here would make the scorer
+        # read only the answers it exists to find, and would cap the one
+        # context-proportional term in the layer at a constant. DeepSeek-V4's
+        # representation draws the same line: block_index_scores is unbounded and only
+        # the downstream sparse MLA node carries the top-k.
+        scorer["kind"] = "sparse_mla"
+        scorer["compress_ratio"] = kpool
+    return nodes[:at] + projections + [scorer] + nodes[at:]
 
 
 # --- Architecture handlers ------------------------------------------------------
@@ -860,7 +1045,7 @@ def handler_dense(cfg, raw, model):
     # windowed would understate every layer's KV read.
     if window and cfg.get("use_sliding_window") is False:
         window = None
-    nodes = attention_block(cfg, model, hidden, window=window)
+    nodes = attention_block(cfg, model, hidden, raw=raw, window=window)
     nodes += [norm("post_attn_norm")]
     nodes += dense_mlp(cfg, model, hidden)
     nodes += [collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
@@ -910,24 +1095,40 @@ def handler_moe(cfg, raw, model):
     # spec, and attention() reads the topk into kind=sparse_mla. The selection work is
     # a node of its own, and omitting it leaves the graph asserting a top-k it never
     # charges for -- which is what happened here across 78 layers per model.
-    indexed = bool(pick(cfg, "index_topk")) and cfg.get("index_n_heads") is not None
+    # ...but not necessarily on every layer. indexed_layers() expands the config's own
+    # skip_topk rule, which for glm-5.2/5.2-fp8/5.3 indexes 21 of 78 layers. Keyed per
+    # layer rather than per model: a single flag charged all 78 for a scorer that 57 of
+    # them never build.
+    index_map = indexed_layers(cfg, model, layers)
+    indexed_any = index_map is not None and any(index_map)
+    indexed_all = index_map is not None and all(index_map)
+    # A layer kind must be uniform in whether it indexes, so a partially-indexed model
+    # needs the distinction carried in the kind id.
+    split_index = indexed_any and not indexed_all
 
-    def attn_nodes(win=None):
-        n = attention_block(cfg, model, hidden, window=win)
-        return lightning_indexer(cfg, model, hidden, n) if indexed else n
+    def attn_nodes(win=None, index=None):
+        use = indexed_any if index is None else index
+        n = attention_block(cfg, model, hidden, raw=raw, window=win, selects=use)
+        return lightning_indexer(cfg, model, hidden, n, raw) if use else n
 
-    def sparse_nodes(win=None):
-        n = attn_nodes(win)
+    def sparse_nodes(win=None, index=None):
+        n = attn_nodes(win, index)
         n += [norm("post_attn_norm"), *moe_block(cfg, model, hidden),
               collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
               collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
 
-    def dense_nodes(win=None):
-        n = attn_nodes(win)
+    def dense_nodes(win=None, index=None):
+        n = attn_nodes(win, index)
         n += [norm("post_attn_norm")] + dense_mlp(cfg, model, hidden)
         n += [collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
         return n
+
+    def suffix(index: bool) -> str:
+        """The kind-id suffix that keeps an indexed layer distinct from a skipped one."""
+        if not split_index:
+            return ""
+        return "_indexed" if index else "_noindex"
 
     # A per-layer ATTENTION-kind vector, which is a different thing from the per-layer
     # MLP-type vector handled below: this one says which layers see a bounded window
@@ -948,6 +1149,12 @@ def handler_moe(cfg, raw, model):
                 f"{model}: layer_types names {sorted(unknown)}, which this handler cannot "
                 f"price; add the kind rather than defaulting it to full attention"
             )
+        if split_index:
+            raise DeriveError(
+                f"{model}: a per-layer attention-kind vector AND a partial indexer "
+                f"pattern would make the layer kind a three-way product; no committed "
+                f"config does both, so this handler refuses rather than pricing one "
+                f"dimension and dropping the other")
         swa = sparse_nodes(win=window)
         full = sparse_nodes(win=None)
         kinds = [
@@ -962,6 +1169,11 @@ def handler_moe(cfg, raw, model):
     # index list; every other member of this family is uniform in attention kind.
     local_ids = cfg.get("local_layer_ids")
     if local_ids and window:
+        if split_index:
+            raise DeriveError(
+                f"{model}: a declared local-layer list AND a partial indexer pattern "
+                f"would make the layer kind a three-way product; no committed config "
+                f"does both, so this handler refuses rather than dropping one")
         swa = sparse_nodes(win=window)
         full = sparse_nodes(win=None)
         kinds = [
@@ -980,18 +1192,41 @@ def handler_moe(cfg, raw, model):
                 f"{model}: mlp_layer_types has {len(mlp_types)} entries for "
                 f"{layers} layers"
             )
-        sparse, dense = sparse_nodes(window), dense_nodes(window)
-        kinds = [
-            {"id": "attn_dense", "nodes": dense, "edges": chain(dense)},
-            {"id": "attn_moe", "nodes": sparse, "edges": chain(sparse)},
-        ]
-        sequence = ["attn_moe" if t == "sparse" else "attn_dense" for t in mlp_types]
+        # The kind of a layer is the pair (mlp type, does it index), because a skipped
+        # layer builds no indexer at all. Only the combinations the sequence actually
+        # uses are emitted.
+        sequence = []
+        for i, t in enumerate(mlp_types):
+            idx = True if index_map is None else index_map[i]
+            sequence.append(("attn_moe" if t == "sparse" else "attn_dense") + suffix(idx))
+        kinds = []
+        for mlp_t, builder in (("dense", dense_nodes), ("moe", sparse_nodes)):
+            for idx in (True, False):
+                kid = ("attn_moe" if mlp_t == "moe" else "attn_dense") + suffix(idx)
+                if kid in {k["id"] for k in kinds} or kid not in set(sequence):
+                    continue
+                nodes = builder(window, idx)
+                kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
         # compress() finds the trailing uniform run itself, which is the common shape
         # here: a short dense prologue then sparse throughout.
         return kinds, compress(sequence)
 
     # A first_k_dense_replace count does the same job as a type vector.
     first_dense = int(cfg.get("first_k_dense_replace") or 0)
+    if split_index:
+        # A partially-indexed stack has no single repeated layer, so the sequence is
+        # expanded per layer and compress() finds whatever period it really has.
+        sequence = []
+        for i in range(layers):
+            base = "attn_dense" if i < first_dense else "attn_moe"
+            sequence.append(base + suffix(index_map[i]))
+        kinds = []
+        for kid in dict.fromkeys(sequence):
+            idx = kid.endswith("_indexed")
+            builder = dense_nodes if kid.startswith("attn_dense") else sparse_nodes
+            nodes = builder(window, idx)
+            kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+        return kinds, compress(sequence)
     sparse = sparse_nodes(window)
     kinds = [{"id": "attn_moe", "nodes": sparse, "edges": chain(sparse)}]
     if first_dense:
@@ -1316,7 +1551,7 @@ def handler_minimax_m3(cfg, raw, model):
     # local and initial blocks. Counted in tokens because that is what a KV read costs.
     bound = (topk_blocks + local + init) * block
 
-    dense_attn = attention_block(cfg, model, hidden)
+    dense_attn = attention_block(cfg, model, hidden, raw=raw)
     dense_ffn = int(require_key(cfg, "dense_intermediate_size", model))
     dense_nodes = dense_attn + [
         norm("post_attn_norm"),
@@ -1325,7 +1560,7 @@ def handler_minimax_m3(cfg, raw, model):
         collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
     ]
 
-    sparse_attn = attention_block(cfg, model, hidden, kind="swa", window=bound)
+    sparse_attn = attention_block(cfg, model, hidden, raw=raw, kind="swa", window=bound)
     # The indexer scores the whole context to choose blocks, so its read is bounded by
     # context rather than by the top-k. It is placed BEFORE the bounded attention node,
     # which is the order it runs in: its scores pick the blocks that node then reads.
@@ -1436,7 +1671,7 @@ def handler_qwen3_5_moe(cfg, raw, model):
         collective("AllReduce", "mixer_out", EMIT_TENSOR_PARALLEL),
     ]
     gdn = with_moe(gdn_mixer)
-    full = with_moe(attention_block(cfg, model, hidden))
+    full = with_moe(attention_block(cfg, model, hidden, raw=raw))
     kinds = [
         {"id": "gdn_moe", "nodes": gdn, "edges": chain(gdn)},
         {"id": "attn_moe", "nodes": full, "edges": chain(full)},
@@ -1504,7 +1739,7 @@ def handler_nemotron_h(cfg, raw, model):
         collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
         collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
     ]
-    attn = attention_block(cfg, model, hidden)
+    attn = attention_block(cfg, model, hidden, raw=raw)
     mlp = [norm("input_norm")] + dense_mlp(cfg, model, hidden) + [
         collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
 
@@ -1603,8 +1838,18 @@ def handler_kimi_k3(cfg, raw, model):
     kda_mixer = [n if n.get("conv_kernel") is not None or n.get("op") != "RecurrentUpdate"
                  else {k: v for k, v in n.items() if k != "conv_kernel"}
                  for n in kda_mixer]
+    # The KDA mixer IS this layer's self_attn (vllm kimi_k3/nvidia/model.py:888-891), so
+    # a compressed-tensors ignore list naming self_attn leaves these projections at the
+    # base width just as it does the latent ones. kimi-k3's global width is mxfp4, so
+    # without this every KDA projection prices at four bits for tensors the runtime
+    # never quantizes.
+    if compressed_tensors_skips_attention(cfg, raw):
+        base = base_dtype(cfg, raw, model)
+        kda_mixer = [dict(n, weight_dtype=base)
+                     if n.get("role") in ATTENTION_WEIGHT_ROLES else n
+                     for n in kda_mixer]
     kda = with_moe(kda_mixer)
-    mla = with_moe(attention_block(cfg, model, hidden))
+    mla = with_moe(attention_block(cfg, model, hidden, raw=raw))
     kinds = [
         {"id": "kda_moe", "nodes": kda, "edges": chain(kda)},
         {"id": "mla_moe", "nodes": mla, "edges": chain(mla)},
@@ -1612,7 +1857,7 @@ def handler_kimi_k3(cfg, raw, model):
     first_dense = int(cfg.get("first_k_dense_replace") or 0)
     if first_dense:
         kda_dense = with_dense(kda_mixer)
-        mla_dense = with_dense(attention_block(cfg, model, hidden))
+        mla_dense = with_dense(attention_block(cfg, model, hidden, raw=raw))
         kinds += [
             {"id": "kda_dense", "nodes": kda_dense, "edges": chain(kda_dense)},
             {"id": "mla_dense", "nodes": mla_dense, "edges": chain(mla_dense)},
