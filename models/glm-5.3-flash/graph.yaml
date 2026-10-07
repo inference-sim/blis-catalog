@@ -278,7 +278,7 @@ layer_kinds:
   - &id021
     op: Elementwise
     role: index_k_norm
-    bytes_per_token: 1024
+    bytes_per_token: 512
   - &id022
     op: Attention
     role: block_index_scores
