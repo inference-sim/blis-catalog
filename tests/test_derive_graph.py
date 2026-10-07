@@ -2640,11 +2640,13 @@ def test_glm5_3_flash_draft_module_is_sparse_mla_not_the_targets_last_layer():
     and `kv_b_proj` and none of KDA's `A_log`/`k_conv1d`/`dt_bias`, while layer 44 is the
     reverse.
 
-    The committed graph is right, but it is right because the handler declares `mla_moe`
-    last and the fallback reads declaration order. Reordering those declarations is a
-    refactor with no visible semantics that would reprice every drafted token as KDA, and
-    nothing else in this suite would notice: the draft stack is one layer either way, the
-    layer count is unchanged, and --check would re-derive the new wrong graph as current.
+    The handler now prices the module itself as DRAFT_KIND_ID, so the derived kind no
+    longer depends on declaration order. This test outlives that change: it pins the
+    PROPERTY -- the draft pass reads a latent cache, not a recurrent state -- which is
+    what a future handler rewrite, or a reversion to derive()'s mirror-a-target-layer
+    fallback, would break. Nothing else in the suite would notice such a reversion: the
+    draft stack is one layer either way, the layer count is unchanged, and --check would
+    re-derive the new wrong graph as current.
 
     Asserted on what the draft layer COSTS -- a latent cache read and projections, no
     convolutional state -- rather than on its identifier, so renaming a kind leaves this
@@ -2710,6 +2712,158 @@ def test_glm5_3_flash_draft_module_is_sparse_mla_not_the_targets_last_layer():
         # Routed experts, not a dense MLP: the module ships mlp.gate and shared_experts.
         assert any(x["op"] == "GroupedGEMM" for x in kinds[lid]["nodes"]), (
             "the draft layer has no routed-expert GEMM; the MTP module is MoE")
+
+
+def _flash():
+    d = ROOT / "models" / "glm-5.3-flash"
+    if not d.is_dir():
+        pytest.skip("glm-5.3-flash is not in the catalog")
+    return graph_of(d), text_config(config_of(d))
+
+
+def test_glm5_3_flash_prices_unquantized_tensors_at_the_base_width():
+    """An fp8 checkpoint's excluded tensors keep the base width, per node.
+
+    The config names 1,509 modules in modules_to_not_convert and the pinned safetensors
+    headers agree: every KDA projection and every indexer tensor is BF16 while the
+    experts and the MLA q_a/q_b/kv_a/o_proj are F8_E4M3. Pricing the BF16 ones at one
+    byte understates the weight traffic of all 34 KDA layers.
+
+    The global width must stay fp8: the routed experts are fp8 and are 213x the rest of
+    a layer by parameter volume, so flipping the global to bf16 to fix the exceptions
+    would overstate far more than it corrects. Asserted as a width per node."""
+    g, t = _flash()
+    quant = config_of(ROOT / "models" / "glm-5.3-flash").get("quantization_config", {})
+    excluded = quant.get("modules_to_not_convert")
+    assert excluded, "this test is about a config that names its unquantized tensors"
+    assert "fp8" in str(quant.get("quant_method", "")).lower()
+    assert g["global"]["weight_dtype"] == "fp8", (
+        "the routed experts dominate parameter volume and are fp8; the global width "
+        "must stay fp8 with the exceptions carried per node")
+
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    kda = [n for k in kinds.values() for n in k["nodes"]
+           if str(n.get("role", "")).startswith("kda_")]
+    assert kda, "no KDA projections found"
+    for n in kda:
+        assert n.get("weight_dtype") == "bf16", (
+            f"KDA projection {n['role']!r} is priced at the global fp8 width; the "
+            f"checkpoint stores it BF16 and vLLM builds KDA with quant_config=None")
+
+    for k in kinds.values():
+        for n in k["nodes"]:
+            if n.get("role") == "index_qk_proj":
+                assert n.get("weight_dtype") == "bf16", (
+                    "the indexer projection is priced fp8; every indexer tensor is BF16")
+
+    # The other side of the same list: what it does NOT exclude keeps the global width.
+    for k in kinds.values():
+        for n in k["nodes"]:
+            if n.get("role") in ("experts", "qkv_proj", "o_proj"):
+                assert "weight_dtype" not in n, (
+                    f"{n['role']!r} carries an override; the checkpoint stores it fp8 "
+                    f"and it should take the global width")
+
+    lm_head = next(n for n in g["head"] if n.get("role") == "lm_head")
+    assert lm_head.get("weight_dtype") == "bf16", (
+        "lm_head is priced fp8; the config excludes it and the header is BF16")
+
+
+def test_glm5_3_flash_prices_mhc_and_replaces_the_norms_it_fuses():
+    """mhc: true adds a mixing projection per side, standing in for the norm it fuses.
+
+    vLLM runs one mixing op on each of the attention and FFN sides and passes the
+    layernorm weight into it (common/model.py:556-603), so the mixing REPLACES each
+    norm rather than preceding it -- emitting both would charge a normalisation pass the
+    layer does not run. Each projection is [(2+n)*n, n*hidden] at n = hc_mult.
+
+    Asserted against the config's own hc_mult, so the test survives a config update."""
+    g, t = _flash()
+    assert t.get("mhc") is True, "this test is about a config that declares mhc"
+    n = int(t["hc_mult"])
+    hidden = int(t["hidden_size"])
+    mix, width = (2 + n) * n, n * hidden
+
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    base_ids = set(layer_sequence(g["stack"]))
+    assert base_ids, "no base layers"
+
+    for lid in sorted(base_ids):
+        nodes = kinds[lid]["nodes"]
+        roles = [x.get("role") for x in nodes]
+        for side in ("hc_attn_fn", "hc_ffn_fn"):
+            assert side in roles, f"{lid}: base layer carries no {side}"
+            node = next(x for x in nodes if x.get("role") == side)
+            assert node["op"] == "GEMM"
+            assert (node["n"], node["k"]) == (mix, width), (
+                f"{lid}.{side} is {node['n']}x{node['k']}; hc_mult {n} gives "
+                f"{mix}x{width}")
+            assert node.get("weight_dtype") == "bf16", (
+                f"{lid}.{side} is priced at the global fp8 width; the header is BF16")
+        # The fused norms must not also appear as separate passes.
+        assert "input_norm" not in roles, (
+            f"{lid}: both the mHC attention mixing and a separate input_norm are "
+            f"priced; vLLM fuses the norm into the mixing")
+        assert "post_attn_norm" not in roles, (
+            f"{lid}: both the mHC FFN mixing and a separate post_attn_norm are priced")
+
+
+def test_glm5_3_flash_mtp_module_carries_no_mhc():
+    """vLLM gates mHC on `not is_mtp_layer`, and the checkpoint agrees.
+
+    Layer 45 carries no hc_* tensors at all while every base layer carries six. A draft
+    layer priced with the mixing would charge two GEMMs and two passes per speculative
+    step that the module never runs."""
+    g, _ = _flash()
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    drafted = layer_sequence(g["speculator"]["stack"])
+    assert drafted, "no draft stack"
+    for lid in drafted:
+        hc = [n.get("role") for n in kinds[lid]["nodes"]
+              if str(n.get("role", "")).startswith("hc_")]
+        assert not hc, (
+            f"the draft layer {lid!r} prices mHC nodes {hc}; the MTP module carries no "
+            f"hc_* tensors and vLLM builds it with mHC off")
+
+
+def test_glm5_3_flash_mtp_module_prices_its_own_prefix():
+    """The draft pass pays enorm, hnorm, eh_proj and the shared-head norm.
+
+    vLLM's Glm5NextMultiTokenPredictorLayer builds all four around the decoder block
+    (common/mtp.py:51-88), and the pinned checkpoint's layer 45 carries them: an
+    `eh_proj` of [4096, 8192] BF16 -- 33,554,432 parameters -- plus `enorm`, `hnorm` and
+    `shared_head.norm`. Recording only the method and token count underprices every
+    draft pass by that projection.
+
+    eh_proj takes the concatenated [previous hidden, token embedding], so its k is twice
+    hidden; asserted that way rather than against 8192."""
+    g, t = _flash()
+    hidden = int(t["hidden_size"])
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    drafted = layer_sequence(g["speculator"]["stack"])
+    assert len(drafted) == int(t["num_nextn_predict_layers"])
+
+    for lid in drafted:
+        nodes = kinds[lid]["nodes"]
+        roles = [n.get("role") for n in nodes]
+        eh = next((n for n in nodes if n.get("role") == "mtp_eh_proj"), None)
+        assert eh is not None, (
+            f"the draft layer {lid!r} prices no eh_proj; the module concatenates the "
+            f"previous hidden state with the token embedding and projects back")
+        assert eh["op"] == "GEMM"
+        assert (eh["n"], eh["k"]) == (hidden, 2 * hidden), (
+            f"eh_proj is {eh['n']}x{eh['k']}; the concatenated input makes it "
+            f"{hidden}x{2 * hidden}")
+        assert eh.get("weight_dtype") == "bf16", (
+            "eh_proj is priced fp8; the checkpoint stores it BF16")
+        for role in ("mtp_enorm", "mtp_hnorm", "mtp_shared_head_norm"):
+            assert role in roles, f"the draft layer prices no {role}"
+
+    # The draft kind must be its own, not a reused target layer: it carries the prefix
+    # and no target layer does.
+    assert set(drafted).isdisjoint(set(layer_sequence(g["stack"]))), (
+        "the draft stack reuses a target layer kind, so it cannot be carrying the "
+        "MTP-specific prefix")
 
 
 @pytest.mark.parametrize("mutate,description", [

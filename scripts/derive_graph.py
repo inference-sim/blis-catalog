@@ -233,6 +233,53 @@ def compressed_tensors_skips_attention(cfg: dict[str, Any],
     return False
 
 
+def fp8_unquantized_roles(cfg: dict[str, Any], raw: dict[str, Any], model: str,
+                          roles: dict[str, str]) -> dict[str, str]:
+    """Map node role -> base width, for roles an fp8 checkpoint leaves unquantized.
+
+    `modules_to_not_convert` names the tensor sets a quantization method SKIPS. The
+    mxfp4/nvfp4 path already honours it by keeping the global width at the unquantized
+    base and carrying the narrow width on the expert node (weight_dtype(), gemm_moe()),
+    because there the quantized scope is the minority. An fp8 checkpoint is the mirror
+    case: the routed experts dominate -- 288 experts x 3 matrices x 2048x4096 is 213x
+    the rest of a layer -- so fp8 is the right global width and the EXCEPTIONS are what
+    need carrying.
+
+    GLM-5.3-Flash is the case in hand. It declares 1,509 exclusions, and the pinned
+    safetensors headers agree with them exactly: every KDA projection, every indexer
+    tensor and `lm_head` are BF16 while `q_a`/`q_b`/`kv_a`/`o_proj` and the experts are
+    F8_E4M3. Pricing the BF16 tensors at one byte understates the weight traffic of all
+    34 KDA layers and the head.
+
+    `roles` maps a checkpoint module suffix to the graph role that prices it, and a role
+    is returned when the list names that suffix anywhere. A graph role prices a layer
+    kind rather than one tensor, so a suffix must be chosen to be unambiguous across the
+    layers a kind covers -- see GLM5_NEXT_UNQUANTIZED on why `self_attn.o_proj` is safe
+    here and `kv_b_proj` is omitted. This function does not verify that; the caller's
+    table is what carries it.
+
+    Returns an empty mapping for any checkpoint that declares no fp8 exclusions, which
+    leaves every other model's nodes untouched."""
+    quant = raw.get("quantization_config") or cfg.get("quantization_config") or {}
+    if not isinstance(quant, dict) or not quant:
+        return {}
+    if "fp8" not in str(quant.get("quant_method", "")).lower():
+        return {}
+    excluded = quant.get("modules_to_not_convert")
+    if not excluded:
+        return {}
+    names = set(excluded)
+    matched = {role for suffix, role in roles.items()
+               if any(n == suffix or n.endswith("." + suffix) for n in names)}
+    if not matched:
+        return {}
+    # Resolved only once a role actually matches. minimax-m2.5 declares an fp8 exclusion
+    # list and NO dtype at all, so asking for the base width unconditionally would raise
+    # for a model this function has nothing to say about.
+    base = base_dtype(cfg, raw, model)
+    return {role: base for role in matched}
+
+
 def quantized_classes(cfg: dict[str, Any], model: str) -> dict[str, str]:
     """Map each role class to its stored width, from an explicit per-tensor map.
 
@@ -689,6 +736,47 @@ def collective(op: str, role: str, emit: str) -> dict[str, Any]:
 # than conventional: derive() prefers it over mirroring a target layer, so a handler that
 # defines it is stating that no target layer has the draft module's structure.
 DRAFT_KIND_ID = "mtp_moe"
+
+
+# Architectures whose head width this deriver reads from the fp8 exclusion list. Keyed
+# by architecture so adding a family is a deliberate act: five other fp8 configs exclude
+# lm_head too (glm-5, glm-5.2-fp8, glm-5.3, minimax-m2.5, minimax-m2.7) and are correct
+# to add here, but doing so re-derives their graphs, so they are not swept in as a side
+# effect of this entry. Until they are, each understates its head by vocab x hidden bytes.
+HEAD_UNQUANTIZED = {
+    "Glm5NextForConditionalGeneration": {"lm_head": "lm_head"},
+}
+
+
+# GLM-5.3-Flash: checkpoint module suffix -> the graph role that prices it, for the
+# tensors modules_to_not_convert names. Every entry was checked against the pinned
+# safetensors headers (revision eb9eb208): the named tensors are BF16, and the ones
+# deliberately absent -- q_a_proj, q_b_proj, kv_a_proj_with_mqa, the MLA o_proj, the
+# routed and shared experts -- are F8_E4M3 and correctly take the global fp8 width.
+#
+# `self_attn.o_proj` maps to kda_o_proj rather than the MLA o_proj because the config
+# excludes it on exactly the 34 linear_attention layers and on no sparse-attention layer;
+# the two have distinct roles, so the suffix cannot cross over.
+#
+# kv_b_proj is BF16 in the checkpoint and IS named by the config, but it has no node of
+# its own: attention_block() folds the whole latent projection into one qkv_proj, so
+# there is no role to width. Marking qkv_proj bf16 would reprice the fp8 q_a/q_b/kv_a
+# work it also stands for, which is worse than leaving it. Left at the global width
+# deliberately; the split that gives it a node is tracked separately.
+GLM5_NEXT_UNQUANTIZED = {
+    "self_attn.q_proj": "kda_q_proj",
+    "self_attn.k_proj": "kda_k_proj",
+    "self_attn.v_proj": "kda_v_proj",
+    "self_attn.b_proj": "kda_b_proj",
+    "self_attn.f_a_proj": "kda_f_a_proj",
+    "self_attn.f_b_proj": "kda_f_b_proj",
+    "self_attn.g_a_proj": "kda_g_a_proj",
+    "self_attn.g_b_proj": "kda_g_b_proj",
+    "self_attn.o_proj": "kda_o_proj",
+    "self_attn.indexer.wk": "index_qk_proj",
+    "eh_proj": "mtp_eh_proj",
+    "lm_head": "lm_head",
+}
 
 
 def compress(sequence: list[str]) -> dict[str, Any]:
@@ -2143,18 +2231,20 @@ def handler_glm5_next(cfg, raw, model):
     for the DeepSeek-V3 family, rather than through a node here: an MTP module runs as
     its own forward pass, not as part of a base layer.
 
-    That draft module is sparse-MLA plus MoE, confirmed from the checkpoint's own tensor
-    list: layer 45 carries `self_attn.indexer.*`, `kv_a_layernorm` and `kv_b_proj`, the
-    sparse-latent projections, and none of the KDA ones (`A_log`, `k_conv1d`, `dt_bias`)
-    that layer 44 has. `mla_moe` is therefore the right kind -- but the generic fallback
-    does not read the module to get there, and for this family it is unsound. It mirrors
-    the last DECLARED kind, which is insertion order, and the kinds here are declared
-    `kda_moe`, `kda_dense`, `mla_moe`. That it lands on `mla_moe` is a coincidence of
-    that order, not a derivation: this model's last base LAYER is `kda_moe`, so mirroring
-    the target's final layer -- which is what the fallback reads like it does -- would
-    price the draft pass as KDA and be wrong. Reordering the declarations below would
-    silently change the draft kind, which the test named for this model in
-    tests/test_derive_graph.py pins against.
+    That draft module is sparse-MLA plus MoE -- layer 45 carries `self_attn.indexer.*`,
+    `kv_a_layernorm` and `kv_b_proj` and none of layer 44's KDA projections (`A_log`,
+    `k_conv1d`, `dt_bias`) -- but it is NOT a copy of any target layer, so this handler
+    prices it as DRAFT_KIND_ID rather than letting derive()'s fallback mirror one. It
+    runs its own embedding-mixing prefix (`enorm`, `hnorm`, an `eh_proj` over the
+    concatenated pair) and the `shared_head` norm, and it carries no mHC.
+
+    Leaving it to the fallback was the earlier behaviour and was wrong twice over. The
+    fallback mirrors the last DECLARED kind -- insertion order, not sequence position --
+    which lands on `mla_moe` here only by the order the kinds below happen to be built
+    in; this model's last base LAYER is `kda_moe`, so the positional reading of that
+    fallback would have priced the draft pass as KDA. And even landing on `mla_moe`, a
+    mirrored target layer pays none of the prefix above, which is 33,554,432 parameters
+    of `eh_proj` on every speculative step.
 
     The published repo is multimodal and ships a `vision_config`. Only the text path is
     priced, as for the other multimodal entries: the vision tower runs once per image,
@@ -2180,6 +2270,79 @@ def handler_glm5_next(cfg, raw, model):
     linear = cfg.get("linear_attn_config") or {}
     if not linear:
         raise DeriveError(f"{model}: no linear_attn_config")
+
+    # Manifold hyper-connections. The config states `mhc: true` with hc_mult 4, and vLLM
+    # builds, per base layer, a learned mixing around BOTH the attention and the FFN
+    # (common/model.py:439-493): two [mix_hc, hc_mult*hidden] matrices where
+    # mix_hc = (2 + n) * n, plus a pre/post/comb elementwise pass over the n residual
+    # streams with hc_sinkhorn_iters normalisation rounds. The pinned headers confirm
+    # the shapes exactly: hc_attn_fn and hc_ffn_fn are both [24, 16384] at n = 4.
+    #
+    # Gated on the `mhc` flag, NOT on hc_mult alone. deepseek-v4-pro declares hc_mult 4
+    # and hc_sinkhorn_iters 20 but no `mhc` key, and vLLM reads `self.mhc` to decide --
+    # so keying off hc_mult would invent mixing nodes for a model whose config never
+    # switches it on.
+    use_mhc = bool(cfg.get("mhc"))
+    hc_mult = int(cfg.get("hc_mult") or 0)
+    sinkhorn = int(cfg.get("hc_sinkhorn_iters") or 0)
+    if use_mhc and hc_mult < 2:
+        raise DeriveError(
+            f"{model}: mhc is set but hc_mult is {hc_mult or 'absent'}; the mixing is "
+            f"over hc_mult residual streams and needs at least two")
+    if use_mhc and sinkhorn < 1:
+        raise DeriveError(
+            f"{model}: mhc is set but hc_sinkhorn_iters is {sinkhorn or 'absent'}; the "
+            f"normalisation rounds are per-token work and a count is required")
+    mhc_mix = (2 + hc_mult) * hc_mult if use_mhc else 0
+    mhc_width = hc_mult * hidden if use_mhc else 0
+    # Resolved only when the mixing exists, so a future config in this family that
+    # declares no dtype cannot fail here for a width it never uses.
+    mhc_base = base_dtype(cfg, raw, model) if use_mhc else None
+
+    def mhc(nodes):
+        """Replace each of a base layer's two norms with the mHC mixing that subsumes it.
+
+        vLLM runs one mixing op per side, and each one FUSES the norm it replaces: the
+        attention side calls hc_pre (or hc_fused_post_pre) with
+        `norm_weight=self.input_layernorm.weight`, and the FFN side calls
+        hc_fused_post_pre with `norm_weight=self.post_attention_layernorm.weight`
+        (common/model.py:556-603). So the mixing stands IN PLACE OF each norm rather
+        than in addition to it -- emitting both would charge the layer two normalisation
+        passes it does not run.
+
+        Each side is a [mix_hc, hc_mult*hidden] projection plus the mixing pass over the
+        hc_mult residual streams. The projections are BF16 in the checkpoint, which the
+        global fp8 width would otherwise understate.
+
+        bytes_per_token is omitted, as it is on every other Elementwise node in this
+        catalog: the volume follows from hidden_size and hc_mult, which a cost model has,
+        rather than from a figure this deriver would invent.
+
+        Returns the nodes untouched for any config that does not declare mhc, which is
+        every other model in the catalog."""
+        if not use_mhc:
+            return nodes
+        out = []
+        replaced = set()
+        for n in nodes:
+            role = n.get("role")
+            if role == "input_norm":
+                out.append(dict(gemm("hc_attn_fn", mhc_mix, mhc_width),
+                                weight_dtype=mhc_base))
+                out.append(norm("hc_attn_pre"))
+                replaced.add(role)
+            elif role == "post_attn_norm":
+                out.append(dict(gemm("hc_ffn_fn", mhc_mix, mhc_width),
+                                weight_dtype=mhc_base))
+                out.append(norm("hc_ffn_post_pre"))
+                replaced.add(role)
+            else:
+                out.append(n)
+        if replaced != {"input_norm", "post_attn_norm"}:
+            raise DeriveError(
+                f"{model}: mHC fuses the norm on each side, and this layer does not "
+                f"have both to replace (found {sorted(replaced)})")
+        return out
 
     def with_moe(mixer_nodes):
         n = list(mixer_nodes)
@@ -2255,13 +2418,62 @@ def handler_glm5_next(cfg, raw, model):
         mlp = "moe" if mlp_t == "sparse" else "dense"
         sequence.append(f"{mixer}_{mlp}")
 
+    # The widths this fp8 checkpoint leaves unquantized, per graph role. Read from
+    # modules_to_not_convert rather than assumed: the config names every KDA projection
+    # and every indexer tensor, and the pinned safetensors headers agree.
+    unquant = fp8_unquantized_roles(cfg, raw, model, GLM5_NEXT_UNQUANTIZED)
+
+    def priced(nodes):
+        """Stamp the base width on the GEMMs this checkpoint does not quantize.
+
+        Only a GEMM or GroupedGEMM may carry a per-node weight_dtype -- a norm holds no
+        parameters -- so a role naming anything else would be a mistake here."""
+        for n in nodes:
+            width = unquant.get(n.get("role"))
+            if width is None:
+                continue
+            if n["op"] not in ("GEMM", "GroupedGEMM"):
+                raise DeriveError(
+                    f"{model}: role {n['role']!r} is excluded from quantization but is "
+                    f"a {n['op']}, which holds no parameters to width")
+            n["weight_dtype"] = width
+        return nodes
+
     kinds = []
     for key, build in builders.items():
         kid = f"{key[0]}_{key[1]}"
         if kid not in set(sequence):
             continue
-        nodes = build()
+        nodes = mhc(priced(build()))
         kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+
+    # The MTP module. vLLM builds it as a sparse-MLA + MoE decoder layer (the layer_idx
+    # past num_hidden_layers selects the DSA branch, common/mtp.py:78-88) fronted by its
+    # own embedding-mixing prefix, and the pinned checkpoint's layer 45 matches: an
+    # `eh_proj` of [4096, 8192], `enorm`, `hnorm`, and the `shared_head.norm` before
+    # logits. It carries NO hc_* tensors, which vLLM states as `if self.mhc and not
+    # is_mtp_layer` (common/model.py:439) -- so the draft layer gets no mHC nodes.
+    #
+    # Declared as DRAFT_KIND_ID rather than left to derive()'s fallback: that fallback
+    # mirrors a TARGET layer, and no target layer carries this prefix. Before this the
+    # draft stack reused mla_moe and so paid neither the eh_proj nor the three norms on
+    # every speculative step.
+    if int(pick(cfg, "num_spec_tokens") or 0) > 0:
+        if ("mla", "moe") not in builders:
+            raise DeriveError(
+                f"{model}: an MTP module is declared but no sparse-MLA MoE layer was "
+                f"built for it to mirror")
+        draft = priced([
+            norm("mtp_enorm"),
+            norm("mtp_hnorm"),
+            # Concatenated [previous hidden, token embedding] -> hidden. BF16 in the
+            # checkpoint, which modules_to_not_convert also names.
+            gemm("mtp_eh_proj", hidden, 2 * hidden),
+            *builders[("mla", "moe")](),
+            norm("mtp_shared_head_norm"),
+        ])
+        kinds.append({"id": DRAFT_KIND_ID, "nodes": draft, "edges": chain(draft)})
+
     return kinds, compress(sequence)
 
 
@@ -2361,9 +2573,21 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
         graph["modality"] = "text_decoder_of_multimodal"
 
     hidden = graph["global"]["hidden_size"]
+    lm_head = gemm("lm_head", graph["global"]["vocab_size"], hidden)
+    # An fp8 checkpoint that excludes lm_head from quantization stores it at the base
+    # width, and six committed configs do (glm-5, glm-5.2-fp8, glm-5.3, glm-5.3-flash,
+    # minimax-m2.5, minimax-m2.7). Applied here only for the handler that asks for it,
+    # via its unquantized-role map, rather than globally: widening it for all six is a
+    # correct change but re-derives five other graphs, which belongs in the pass that
+    # takes the whole exclusion list rather than in this model's entry. Each of those
+    # five understates the head by vocab x hidden bytes until then.
+    head_widths = fp8_unquantized_roles(cfg, raw, model,
+                                        HEAD_UNQUANTIZED.get(arch, {}))
+    if head_widths.get("lm_head"):
+        lm_head["weight_dtype"] = head_widths["lm_head"]
     graph["head"] = [
         norm("final_norm"),
-        gemm("lm_head", graph["global"]["vocab_size"], hidden),
+        lm_head,
     ]
 
     spec = pick(cfg, "num_spec_tokens")
