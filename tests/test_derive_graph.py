@@ -1069,26 +1069,31 @@ def test_the_draft_module_indexes_even_where_the_base_rule_skips():
             assert any(n.get("role") == "index_wq_b" for n in nodes), (
                 f"{d.name}: the draft layer {lid!r} has a scorer with no projection "
                 f"to feed it")
-            # METAMORPHIC: the draft's ATTENTION side must cost exactly what an indexed
-            # base layer's does. vLLM builds both from the same decoder-layer code with
-            # the indexer on, so the scoring and projection work cannot differ. Compared
-            # on the attention prefix alone, because the MLP side is an independent
-            # dimension -- a draft mirroring a dense layer vs a sparse one is a separate
-            # question, pinned elsewhere.
+            # METAMORPHIC: the draft's INDEXER work must cost exactly what an indexed
+            # base layer's does. vLLM builds the draft from the same decoder-layer code
+            # with the indexer forced on, so the scoring pass and the projections that
+            # feed it cannot differ.
+            #
+            # Restricted to the indexer nodes rather than the whole attention side,
+            # because a draft layer legitimately differs elsewhere and those
+            # differences are real, not errors: glm5next's MTP module adds an eh_proj
+            # over the concatenated [hidden, embedding] pair and three norms of its own,
+            # and carries NO mHC, since vLLM gates that on `not is_mtp_layer`
+            # (glm5next/common/model.py:439). A relation over the full attention prefix
+            # would flag those as faults.
             if base_scoring:
                 ref = sorted(base_scoring)[0]
-                def attn_side(ns):
-                    out = []
-                    for n in ns:
-                        out.append(node_cost(n))
-                        if n.get("role") == "attn_out":
-                            break
-                    return collections.Counter(out)
-                draft_cost, ref_cost = attn_side(nodes), attn_side(kinds[ref]["nodes"])
+                def indexer_cost(ns):
+                    return collections.Counter(
+                        node_cost(n) for n in ns
+                        if str(n.get("role") or "").startswith("index_")
+                        or n.get("role") == "block_index_scores")
+                draft_cost = indexer_cost(nodes)
+                ref_cost = indexer_cost(kinds[ref]["nodes"])
                 assert draft_cost == ref_cost, (
                     f"{d.name}: the draft layer {lid!r} and the indexed base layer "
-                    f"{ref!r} price their attention differently; vLLM builds both from "
-                    f"the same decoder layer with the indexer on. Only in draft: "
+                    f"{ref!r} price their INDEXER differently; vLLM builds both from "
+                    f"the same decoder layer with it forced on. Only in draft: "
                     f"{sorted(draft_cost - ref_cost)[:2]}; only in base: "
                     f"{sorted(ref_cost - draft_cost)[:2]}")
             checked += 1

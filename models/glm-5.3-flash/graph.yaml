@@ -274,12 +274,18 @@ layer_kinds:
   - &id020
     op: Elementwise
     role: index_kpool_compress
-    bytes_per_token: 2432
+    bytes_per_token: 2337
   - &id021
+    op: GEMM
+    role: index_kpool_compress_ape
+    n: 4
+    k: 128
+    weight_dtype: fp32
+  - &id022
     op: Elementwise
     role: index_k_norm
     bytes_per_token: 512
-  - &id022
+  - &id023
     op: Attention
     role: block_index_scores
     kind: sparse_mla
@@ -287,7 +293,7 @@ layer_kinds:
     n_kv: 1
     d_h: 128
     compress_ratio: 4
-  - &id023
+  - &id024
     op: Attention
     kind: sparse_mla
     n_q: 64
@@ -296,12 +302,12 @@ layer_kinds:
     kv_lora_rank: 512
     qk_rope_head_dim: 0
     index_topk: 2048
-  - &id024
+  - &id025
     op: GEMM
     role: o_proj
     n: 4096
     k: 16384
-  - &id025
+  - &id026
     op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -367,6 +373,8 @@ layer_kinds:
     - 19
   - - 19
     - 20
+  - - 20
+    - 21
 - id: mtp_moe
   nodes:
   - op: Elementwise
@@ -394,6 +402,7 @@ layer_kinds:
   - *id023
   - *id024
   - *id025
+  - *id026
   - op: Elementwise
     role: post_attn_norm
   - op: GroupedGEMM
@@ -456,6 +465,8 @@ layer_kinds:
     - 21
   - - 21
     - 22
+  - - 22
+    - 23
 stack:
   prologue:
   - kda_dense
