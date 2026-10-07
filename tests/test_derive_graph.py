@@ -273,11 +273,66 @@ def test_kpool_prices_the_compression_pass_and_its_ape_state():
     comp = next((n for n in nodes if n.get("role") == "index_kpool_compress"), None)
     assert comp is not None, "no compression pass; pooling is work, not just a gate"
     assert comp["op"] == "Elementwise"
-    ape = cfg["index_kpool"] * cfg["index_head_dim"] * 4
-    key = cfg["index_head_dim"] * 2
-    assert comp["bytes_per_token"] == key + ape + cfg["index_head_dim"], (
-        f"the compression states {comp['bytes_per_token']} B/token; the pass reads its "
-        f"key ({key}) and the FP32 APE table ({ape}) and writes a pooled state")
+    assert comp["bytes_per_token"] > 0
+    # The exact figure is pinned by
+    # test_kpool_compression_traffic_is_per_pool_amortized, which derives it from the
+    # kernel's own reads. Here the point is that the pass exists AND that its resident
+    # FP32 APE parameter is counted.
+    ape = next((n for n in nodes
+                if n.get("role") == "index_kpool_compress_ape"), None)
+    assert ape is not None, (
+        "the FP32 [index_kpool, index_head_dim] APE is not counted anywhere; it is a "
+        "resident parameter, not per-token traffic")
+    assert (ape["n"], ape["k"]) == (cfg["index_kpool"], cfg["index_head_dim"])
+    assert ape.get("weight_dtype") == "fp32"
+
+
+def test_kpool_indexer_widths_are_visible_against_a_quantized_global():
+    """With a BF16 global the overrides are unobservable, so assert against fp8.
+
+    glm5next builds its whole MLA module with quant_config=None -- the call says so,
+    `quant_config=None,  # MLA projections are BF16 in checkpoint`
+    (glm5next/common/model.py:394) -- so wq_b, wk_weights_proj and the compression gate
+    all serve at the base width however the checkpoint is quantized. The APE is FP32 and
+    the head gate's cached copy likewise."""
+    cfg = kpool_config(quantization_config={"quant_method": "fp8",
+                                            "fmt": "e4m3"})
+    nodes = indexer_nodes(cfg)
+    by_role = {n.get("role"): n for n in nodes}
+    for role in ("index_wq_b", "index_wk_weights_proj",
+                 "index_kpool_compress_gate"):
+        assert by_role[role].get("weight_dtype") == "bf16", (
+            f"{role} inherits the quantized global width; vLLM builds this module "
+            f"unquantized")
+    assert by_role["index_head_gate_proj"]["weight_dtype"] == "fp32"
+    assert by_role["index_kpool_compress_ape"]["weight_dtype"] == "fp32"
+
+
+def test_kpool_compression_traffic_is_per_pool_amortized():
+    """The compression kernel runs one program per POOL, not per token.
+
+    kpool_compress.py:165-245 reads slot_score in BOTH passes (the per-dim max for
+    softmax stability, then the weighted sum), the FP32 APE row likewise, slot_k once,
+    and writes one fp8 vector plus its fp32 scale. bytes_per_token is charged once per
+    model token, so the figure is that per-pool total divided by index_kpool.
+
+    Asserted against the kernel's own reads rather than against the deriver's
+    expression, and separately asserted NOT to be the naive per-token form that charges
+    the whole APE table every token."""
+    cfg = kpool_config()
+    kpool, dim = cfg["index_kpool"], cfg["index_head_dim"]
+    comp = next(n for n in indexer_nodes(cfg)
+                if n.get("role") == "index_kpool_compress")
+    per_pool = (2 * kpool * dim * 4     # slot_score, both passes, fp32
+                + 2 * kpool * dim * 4   # APE rows, both passes, fp32
+                + kpool * dim * 2       # slot_k, bf16
+                + dim + 4)              # fp8 vector + fp32 scale
+    assert comp["bytes_per_token"] == per_pool // kpool, (
+        f"compression states {comp['bytes_per_token']} B/token; the kernel moves "
+        f"{per_pool} per pool over {kpool} tokens")
+    naive = dim * 2 + kpool * dim * 4 + dim
+    assert comp["bytes_per_token"] != naive, (
+        "compression is priced as if the whole APE table were read every token")
 
 
 def test_a_config_without_kpool_gets_no_pooling_nodes_or_bound():
@@ -310,6 +365,149 @@ def test_a_kpool_config_without_a_latent_rank_is_refused():
     cfg.pop("q_lora_rank")
     with pytest.raises(deriver().DeriveError, match="q_lora_rank"):
         indexer_nodes(cfg)
+
+
+# --- Properties and metamorphic relations over the indexer -------------------------
+# These assert INVARIANTS rather than committed numbers: a property holds for every
+# config in a family, and a metamorphic relation says how the output must move when an
+# input moves. Both survive a config update that changes literals, and both catch
+# classes of error a fixed-value assertion cannot.
+
+
+@pytest.mark.parametrize("kpool", [2, 3, 4, 8, 16])
+def test_pooled_scan_bound_scales_inversely_with_the_pool_size(kpool: int):
+    """METAMORPHIC: multiplying index_kpool must multiply the scan bound identically.
+
+    One K state is cached per index_kpool tokens (attention.py:128-131), and the scan is
+    sized max_model_len // index_kpool (:314). So the bound the graph records has to
+    track the field exactly -- not approximately, and not saturating at some value. A
+    deriver that hard-coded 4, or clamped, or inverted the relation would pass a
+    single-value test and fail here."""
+    cfg = kpool_config(index_kpool=kpool)
+    scorer = next(n for n in indexer_nodes(cfg)
+                  if n.get("role") == "block_index_scores")
+    assert scorer["compress_ratio"] == kpool, (
+        f"index_kpool {kpool} gives compress_ratio {scorer.get('compress_ratio')}; the "
+        f"pooled scan is 1/kpool of the token context")
+    assert "index_topk" not in scorer, (
+        "the scorer is bounded by pooling alone, whatever the pool size")
+
+
+@pytest.mark.parametrize("kpool", [2, 4, 8])
+def test_compression_traffic_falls_as_pools_get_larger(kpool: int):
+    """METAMORPHIC: per-token compression traffic must DECREASE as kpool grows.
+
+    The kernel runs once per pool and its per-pool cost grows linearly in kpool (it
+    loops over POOL_SIZE slots), while the number of tokens sharing that cost grows
+    linearly too -- so the amortized per-token figure converges rather than exploding.
+    The one term that does NOT scale is the single pooled write, which is amortized over
+    more tokens as kpool grows.
+
+    This is the relation that catches the error the review found: charging the whole
+    [kpool, dim] APE table per TOKEN makes traffic RISE with kpool instead."""
+    small = next(n for n in indexer_nodes(kpool_config(index_kpool=kpool))
+                 if n.get("role") == "index_kpool_compress")["bytes_per_token"]
+    large = next(n for n in indexer_nodes(kpool_config(index_kpool=kpool * 2))
+                 if n.get("role") == "index_kpool_compress")["bytes_per_token"]
+    assert large <= small, (
+        f"per-token compression traffic rose from {small} to {large} when the pool size "
+        f"doubled; the kernel runs once per pool, so a larger pool amortizes its cost "
+        f"over more tokens. A rise means the per-pool cost is being charged per token")
+
+
+@pytest.mark.parametrize("dim,heads", [(64, 16), (128, 32), (128, 64), (192, 48)])
+def test_indexer_projection_widths_track_the_declared_geometry(dim: int, heads: int):
+    """PROPERTY: every indexer projection is a stated function of the config.
+
+    wq_b is heads*dim from the LATENT rank; the fused wk_weights_proj is dim+heads from
+    hidden; the gate is dim from hidden. Checked across geometries so a deriver that
+    happened to match GLM-5.3-Flash's numbers by coincidence -- or that swapped dim and
+    heads, which both being powers of two makes easy -- fails."""
+    cfg = kpool_config(index_head_dim=dim, index_n_heads=heads)
+    g = {n.get("role"): (n["n"], n["k"]) for n in indexer_nodes(cfg)
+         if n["op"] == "GEMM"}
+    assert g["index_wq_b"] == (heads * dim, cfg["q_lora_rank"])
+    assert g["index_wk_weights_proj"] == (dim + heads, cfg["hidden_size"])
+    assert g["index_kpool_compress_gate"] == (dim, cfg["hidden_size"])
+    assert g["index_head_gate_proj"] == (heads, cfg["hidden_size"])
+    assert g["index_kpool_compress_ape"] == (cfg["index_kpool"], dim)
+
+
+@pytest.mark.parametrize("freq,offset,layers", [
+    (1, 2, 16), (2, 2, 16), (4, 3, 78), (4, 2, 32), (8, 1, 64), (3, 0, 12),
+])
+def test_indexed_layer_count_matches_the_skip_formula_for_any_frequency(
+        freq: int, offset: int, layers: int):
+    """PROPERTY: the indexed set is exactly vLLM's formula, over many (freq, offset).
+
+    skip_topk = max(layer_id - offset + 1, 0) % freq != 0
+    (deepseek_v32/attention.py:166-173). Asserted against an independent re-expression
+    of that formula across a grid, so an off-by-one in the offset, a wrong modulus
+    direction, or a clamp that only shows at particular values cannot hide. Also checks
+    the invariant that freq=1 indexes EVERY layer, which is the default path the
+    families declaring neither field take."""
+    d = deriver()
+    cfg = {"num_hidden_layers": layers, "index_topk": 2048, "index_n_heads": 32,
+           "index_topk_freq": freq, "index_skip_topk_offset": offset}
+    got = d.indexed_layers(cfg, "synthetic", layers)
+    want = [max(i - offset + 1, 0) % freq == 0 for i in range(layers)]
+    assert got == want, (
+        f"freq={freq} offset={offset}: indexed {sum(got)} of {layers}, formula gives "
+        f"{sum(want)}")
+    if freq == 1:
+        assert all(got), "freq 1 must index every layer; it is the default"
+
+
+def test_an_indexed_layer_never_costs_less_than_an_unindexed_one():
+    """METAMORPHIC: skipping the indexer may only REMOVE work, never add or change any.
+
+    A skipped layer omits the scoring pass and its projections and keeps everything else
+    -- including the bounded main read, since the top-k comes from a shared buffer
+    (mla_attention.py:564-566). So the unindexed layer's cost multiset must be a strict
+    SUBSET of the indexed one's. This catches two opposite errors at once: a skipped
+    layer that kept the scorer (no saving), and one that also lost its top-k bound or
+    changed its attention kind (too much removed)."""
+    checked = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if t.get("compress_ratios"):
+            # DeepSeek-V4's layers differ by COMPRESSION RATIO, not by whether they
+            # index: its ratio-128 layers read a more heavily compressed stream and
+            # legitimately price an attention the ratio-4 layers do not. That is a
+            # different axis from the skip_topk one this relation is about, and it is
+            # pinned by test_v4_only_ratio_4_layers_have_an_indexer.
+            continue
+        g = graph_of(d)
+        kinds = {k["id"]: k for k in g["layer_kinds"]}
+        seq = set(layer_sequence(g["stack"]))
+        scoring = {k for k in seq
+                   if any(n.get("role") == "block_index_scores"
+                          for n in kinds[k]["nodes"])}
+        skipping = {k for k in seq - scoring
+                    if any(n["op"] == "Attention" for n in kinds[k]["nodes"])}
+        if not (scoring and skipping):
+            continue
+        # Compare like with like: same MLP flavour on both sides.
+        for sk in sorted(skipping):
+            mlp = "moe" if any(n["op"] == "GroupedGEMM"
+                               for n in kinds[sk]["nodes"]) else "dense"
+            peers = [k for k in sorted(scoring)
+                     if (("moe" if any(n["op"] == "GroupedGEMM"
+                                       for n in kinds[k]["nodes"]) else "dense") == mlp)]
+            if not peers:
+                continue
+            lo = collections.Counter(node_cost(n) for n in kinds[sk]["nodes"])
+            hi = collections.Counter(node_cost(n) for n in kinds[peers[0]]["nodes"])
+            extra = lo - hi
+            assert not extra, (
+                f"{d.name}: the unindexed layer {sk!r} prices work the indexed layer "
+                f"{peers[0]!r} does not: {sorted(extra)[:2]}. Skipping the indexer only "
+                f"removes the scoring pass; it cannot add or alter anything else")
+            assert hi - lo, (
+                f"{d.name}: the unindexed layer {sk!r} costs exactly what the indexed "
+                f"{peers[0]!r} costs, so skipping the indexer saved nothing")
+            checked += 1
+    assert checked, "no model mixes indexed and unindexed layers"
 
 
 def test_only_glm5next_recomputes_the_fp32_head_gate():
@@ -473,11 +671,28 @@ def test_kpool_indexer_prices_its_own_projections_and_pooled_scan(d: Path):
             f"{d.name}/{kind['id']}: the scorer states compress_ratio "
             f"{scorer.get('compress_ratio')}; index_kpool is {kpool}, and an unpooled "
             f"scan overstates the dominant long-context term by that factor")
-        assert scorer["index_topk"] == topk, (
-            f"{d.name}/{kind['id']}: the scorer selects "
-            f"{scorer.get('index_topk')}; index_topk is {topk}")
+        # index_topk must NOT be here: the scorer scans every pooled candidate to
+        # DISCOVER the top-k, and the selection bounds the main read instead. This test
+        # is dormant until a k-pool model is committed, so it would otherwise have
+        # contradicted the production code the moment one arrived.
+        assert "index_topk" not in scorer, (
+            f"{d.name}/{kind['id']}: the scorer carries index_topk, bounding it by the "
+            f"selection it is supposed to produce")
+        main = next(n for n in kind["nodes"]
+                    if n["op"] == "Attention"
+                    and n.get("role") != "block_index_scores")
+        assert main.get("index_topk") == topk, (
+            f"{d.name}/{kind['id']}: the main latent read selects "
+            f"{main.get('index_topk')}; index_topk is {topk}")
         assert scorer["d_h"] == dim and scorer["n_q"] == heads
         assert scorer["n_kv"] == 1, "the indexer scores against one pooled K stream"
+        # The APE is a resident FP32 parameter, not per-token traffic.
+        ape = next((n for n in kind["nodes"]
+                    if n.get("role") == "index_kpool_compress_ape"), None)
+        assert ape is not None and ape.get("weight_dtype") == "fp32", (
+            f"{d.name}/{kind['id']}: the FP32 [{kpool}, {dim}] APE is not counted in "
+            f"the weight footprint")
+        assert (ape["n"], ape["k"]) == (kpool, dim)
 
 
 def test_an_unpooled_indexer_prices_no_pooled_compression():
@@ -593,6 +808,74 @@ def test_indexer_runs_only_on_the_layers_the_config_indexes():
     assert checked, "no indexed model in the catalog to check"
 
 
+def test_the_draft_module_indexes_even_where_the_base_rule_skips():
+    """An MTP layer always builds an indexer, whatever the frequency says.
+
+    vLLM evaluates the draft at layer_id == num_hidden_layers and then constructs under
+    `if not skip_topk or is_mtp_layer` (deepseek_v32/attention.py:179-200), so the
+    is_mtp_layer term forces it. On a frequency-4 config the last DECLARED base kind is
+    the UNINDEXED one, so derive()'s mirror-a-target-layer fallback made the draft stack
+    unindexed -- underpricing the draft indexer on every speculative step.
+
+    Asserted on the draft layer's own nodes rather than on its kind id, so renaming a
+    kind leaves this passing and dropping the scorer fails it."""
+    checked = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if not (t.get("index_topk") and t.get("index_n_heads")):
+            continue
+        if t.get("compress_ratios"):
+            # DeepSeek-V4's draft is uncompressed by its OWN rule -- vLLM falls to
+            # compress_ratio 1 past num_hidden_layers, and a ratio-1 layer carries no
+            # indexer. That is pinned by
+            # test_v4_draft_module_is_an_uncompressed_layer_of_its_own; the skip_topk
+            # override this test is about does not apply to it.
+            continue
+        g = graph_of(d)
+        spec = g.get("speculator")
+        if not spec:
+            continue
+        kinds = {k["id"]: k for k in g["layer_kinds"]}
+        base_scoring = {kid for kid, k in kinds.items()
+                        if kid in set(layer_sequence(g["stack"]))
+                        and any(n.get("role") == "block_index_scores"
+                                for n in k["nodes"])}
+        for lid in layer_sequence(spec["stack"]):
+            nodes = kinds[lid]["nodes"]
+            # BEHAVIOURAL: the draft pass must pay for scoring. Asserted on the work in
+            # the layer, not on which kind id it happens to reuse.
+            assert any(n.get("role") == "block_index_scores" for n in nodes), (
+                f"{d.name}: the draft layer {lid!r} prices no indexer scorer, but vLLM "
+                f"forces one on the MTP layer regardless of the skip pattern")
+            assert any(n.get("role") == "index_wq_b" for n in nodes), (
+                f"{d.name}: the draft layer {lid!r} has a scorer with no projection "
+                f"to feed it")
+            # METAMORPHIC: the draft's ATTENTION side must cost exactly what an indexed
+            # base layer's does. vLLM builds both from the same decoder-layer code with
+            # the indexer on, so the scoring and projection work cannot differ. Compared
+            # on the attention prefix alone, because the MLP side is an independent
+            # dimension -- a draft mirroring a dense layer vs a sparse one is a separate
+            # question, pinned elsewhere.
+            if base_scoring:
+                ref = sorted(base_scoring)[0]
+                def attn_side(ns):
+                    out = []
+                    for n in ns:
+                        out.append(node_cost(n))
+                        if n.get("role") == "attn_out":
+                            break
+                    return collections.Counter(out)
+                draft_cost, ref_cost = attn_side(nodes), attn_side(kinds[ref]["nodes"])
+                assert draft_cost == ref_cost, (
+                    f"{d.name}: the draft layer {lid!r} and the indexed base layer "
+                    f"{ref!r} price their attention differently; vLLM builds both from "
+                    f"the same decoder layer with the indexer on. Only in draft: "
+                    f"{sorted(draft_cost - ref_cost)[:2]}; only in base: "
+                    f"{sorted(ref_cost - draft_cost)[:2]}")
+            checked += 1
+    assert checked, "no indexed model with a speculator to check"
+
+
 def test_kimi_attention_weights_keep_the_width_quantization_skips():
     """A compressed-tensors ignore list naming self_attn keeps those weights at base.
 
@@ -704,15 +987,21 @@ def test_mla_prices_its_low_rank_stages_not_one_fused_projection(d: Path):
         #     kimi-k2.5's text_config declares DeepseekV3ForCausalLM.
         #   fused -- one A-projection and one norm over both latents. deepseek_v32
         #     (registry.py:118 for GlmMoeDsaForCausalLM), kimi_k3, glm5next.
-        FUSED_ARCHES = {
+        # DeepseekV2DecoderLayer selects DeepseekV2MLAAttention whenever use_mla is
+        # true (deepseek_v2.py:1286-1291), and every latent model here takes that class
+        # -- the graphs assert it themselves by pricing kind=mla with n_kv=1. That class
+        # builds ONE fused A-projection (:1050-1057) with SEPARATE norms (:1081, :1097),
+        # since the wrapper never sets fuse_qkv_rmsnorm. So fused_a holds for every
+        # q-lora family, and only these opt into the norm fusion.
+        FUSED_NORM_ARCHES = {
             "GlmMoeDsaForCausalLM", "DeepseekV4ForCausalLM",
             "KimiK3ForConditionalGeneration", "KimiLinearForCausalLM",
             "Glm5NextForConditionalGeneration",
         }
         arches = (list(config_of(d).get("architectures") or ())
                   + list(t.get("architectures") or ()))
-        fused = any(a in FUSED_ARCHES for a in arches)
-        layout = {"fused_a": fused, "fused_norm": fused}
+        layout = {"fused_a": True,
+                  "fused_norm": any(a in FUSED_NORM_ARCHES for a in arches)}
 
         assert "qkv_proj" not in gemms, (
             f"{d.name}/{kind['id']}: still carries the fused qkv_proj alongside the "

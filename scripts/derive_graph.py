@@ -755,20 +755,29 @@ def chain(nodes: list[dict[str, Any]]) -> list[list[int]]:
 #   "KimiK3ForConditionalGeneration" -> vllm.models.kimi_k3
 #   "Glm5NextForConditionalGeneration" -> vllm.models.glm5next
 #
-# fused_a: one A-projection GEMM over [q_lora_rank, kv_lora_rank + rope], as
-#   DeepSeekV2FusedQkvAProjLinear / KimiK3MergedQKVGateLinear do. The generic
-#   DeepseekV2Attention instead builds a SEPARATE q_a_proj and kv_a_proj_with_mqa
-#   (deepseek_v2.py:493, 597, 605), which is two launches.
-# fused_norm: one norm over both latents, as kimi_k3's fused_q_kv_rmsnorm (mla.py:520)
-#   and glm5next's fuse_qkv_rmsnorm=True (glm5next/common/attention.py:604) do. The
-#   generic path calls q_a_layernorm then kv_a_layernorm separately (:598, :608).
+# The attention CLASS matters, not the module. deepseek_v2.py defines two, and
+# DeepseekV2DecoderLayer picks DeepseekV2MLAAttention whenever model_config.use_mla is
+# true, falling back to DeepseekV2Attention otherwise (deepseek_v2.py:1286-1291). Every
+# latent-cache model in this catalog takes the MLA class -- which the graphs themselves
+# assert, since they price kind=mla with n_kv=1 -- so the MLA class is what to read.
 #
-# An architecture absent here takes the generic layout, which is the conservative
-# reading: separate launches are what deepseek_v2.py shows, and a family that fuses has
-# to say so.
+# fused_a: one A-projection GEMM over [q_lora_rank, kv_lora_rank + rope].
+#   DeepseekV2MLAAttention builds DeepSeekV2FusedQkvAProjLinear over exactly that
+#   (deepseek_v2.py:1050-1057), as do KimiK3MergedQKVGateLinear and the deepseek_v32 and
+#   glm5next paths. Only the non-MLA DeepseekV2Attention splits them (:493, :605), and
+#   no model here takes that class.
+# fused_norm: one norm over BOTH latents. kimi_k3 calls fused_q_kv_rmsnorm (mla.py:520)
+#   and glm5next opts in with fuse_qkv_rmsnorm=True (glm5next/common/attention.py:604).
+#   DeepseekV2MLAAttention does NOT opt in: it builds q_a_layernorm and kv_a_layernorm
+#   separately (deepseek_v2.py:1081, 1097) and the wrapper never sets that flag, so the
+#   DeepSeek and Kimi-K2.5 graphs keep two norm launches with one fused projection.
+#
+# An architecture absent here takes {fused_a: True, fused_norm: False}, which is what
+# DeepseekV2MLAAttention does -- the shape every MLA family shares unless it opts into
+# the norm fusion.
 MLA_LAYOUTS = {
-    "DeepseekV2ForCausalLM": {"fused_a": False, "fused_norm": False},
-    "DeepseekV3ForCausalLM": {"fused_a": False, "fused_norm": False},
+    "DeepseekV2ForCausalLM": {"fused_a": True, "fused_norm": False},
+    "DeepseekV3ForCausalLM": {"fused_a": True, "fused_norm": False},
     "GlmMoeDsaForCausalLM": {"fused_a": True, "fused_norm": True},
     "DeepseekV4ForCausalLM": {"fused_a": True, "fused_norm": True},
     "KimiK3ForConditionalGeneration": {"fused_a": True, "fused_norm": True},
@@ -777,11 +786,12 @@ MLA_LAYOUTS = {
     # here rather than relying on which view the lookup happens to read.
     "KimiLinearForCausalLM": {"fused_a": True, "fused_norm": True},
     "Glm5NextForConditionalGeneration": {"fused_a": True, "fused_norm": True},
-    # kimi-k2.5 is NOT in the fused group. Its text_config declares
-    # DeepseekV3ForCausalLM and vLLM's registry sends that to deepseek_v2 (registry.py:90),
-    # whose DeepseekV2Attention builds a separate q_a_proj and calls the two latent norms
-    # separately. KimiK25ForConditionalGeneration wraps that text decoder, so it takes the
-    # generic layout by absence.
+    # kimi-k2.5 takes the DeepseekV2MLAAttention shape: its text_config declares
+    # DeepseekV3ForCausalLM, the registry sends that to deepseek_v2 (registry.py:90),
+    # and KimiK25ForConditionalGeneration initializes its text decoder through
+    # DeepseekV2ForCausalLM -- whose decoder layer selects the MLA class because its
+    # kimi_k2 text type keeps use_mla true. So: fused projection, separate norms, by the
+    # DeepseekV3ForCausalLM entry above.
 }
 
 
@@ -789,6 +799,27 @@ MLA_LAYOUTS = {
 # than slicing it out of the wk_weights_proj result. glm5next alone does this
 # (common/attention.py:341-350); deepseek_v32 slices and reuses
 # (deepseek_v32/attention.py:309-315).
+# Architectures that build their whole MLA module -- latent projections and indexer
+# alike -- with quant_config=None, so every one of those weights serves at the base
+# width whatever the checkpoint's global. glm5next states it in the call:
+# `quant_config=None,  # MLA projections are BF16 in checkpoint`
+# (glm5next/common/model.py:394). deepseek_v32 passes the real quant_config to its
+# indexer's wq_b and only forces None on wk_weights_proj (attention.py:71-86), so it is
+# NOT in this set and keeps the narrower override.
+MLA_MODULE_UNQUANTIZED = frozenset({
+    "Glm5NextForConditionalGeneration",
+})
+
+
+def mla_module_unquantized(raw: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Whether this architecture builds its entire MLA module unquantized."""
+    for arches in (raw.get("architectures"), cfg.get("architectures")):
+        for arch in arches or ():
+            if arch in MLA_MODULE_UNQUANTIZED:
+                return True
+    return False
+
+
 HEAD_GATE_RECOMPUTED = frozenset({
     "Glm5NextForConditionalGeneration",
 })
@@ -816,7 +847,10 @@ def mla_layout(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, bool]:
         for arch in arches or ():
             if arch in MLA_LAYOUTS:
                 return MLA_LAYOUTS[arch]
-    return {"fused_a": False, "fused_norm": False}
+    # The DeepseekV2MLAAttention shape, which is what an MLA family does unless it opts
+    # into the norm fusion. A latent layer reaching this function already has a latent
+    # cache, so the non-MLA class is not the right default for it.
+    return {"fused_a": True, "fused_norm": False}
 
 
 def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
@@ -1065,10 +1099,19 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
     # (deepseek_v32/attention.py:78-86, glm5next/common/attention.py:274-281), so it is
     # served unquantized whatever the checkpoint's global width. The fp8 GLM DSA graphs
     # would otherwise inherit fp8 for a matrix the runtime keeps at the base width.
+    base = base_dtype(cfg, raw, model)
+    # wk_weights_proj is built quant_config=None in BOTH implementations
+    # (deepseek_v32/attention.py:78-86, glm5next/common/attention.py:274-281), so it
+    # always takes the base width. wq_b takes it only where the whole module is
+    # unquantized: deepseek_v32 hands wq_b the real quant_config.
+    module_base = mla_module_unquantized(raw, cfg)
+    wq_b = gemm("index_wq_b", index_heads * index_dim, q_lora)
+    if module_base:
+        wq_b = dict(wq_b, weight_dtype=base)
     projections = [
-        gemm("index_wq_b", index_heads * index_dim, q_lora),
+        wq_b,
         dict(gemm("index_wk_weights_proj", index_dim + index_heads, hidden),
-             weight_dtype=base_dtype(cfg, raw, model)),
+             weight_dtype=base),
     ]
     # The FP32 head gate is glm5next's ALONE. Its forward keeps the first head_dim rows
     # of wk_weights_proj for K, then caches the remaining n_head rows transposed to FP32
@@ -1085,27 +1128,39 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
         projections.append(dict(gemm("index_head_gate_proj", index_heads, hidden),
                                 weight_dtype="fp32"))
     if kpool > 1:
-        # The pooled path adds a learned compression gate and an APE table, and the
-        # compression itself is real per-token work: a softmax-weighted pool over each
-        # group of index_kpool keys, then rotate, quantize and write one pooled state to
-        # the cache (glm5next common/attention.py:394-417). The gate GEMM is the only
-        # part with a weight shape; the pool/rotate/quantize pass is elementwise over the
-        # per-token key and its FP32 [index_kpool, index_head_dim] APE, so it is an
-        # Elementwise node with that traffic stated rather than left derivable.
-        projections.append(gemm("index_kpool_compress_gate", index_dim, hidden))
-        ape = kpool * index_dim * DTYPE_WIDTHS["fp32"]
         if raw is None:
             raise DeriveError(
                 f"{model}: the kpool compression pass sizes its traffic from the "
                 f"declared activation width, so this call must pass raw")
-        key = index_dim * DTYPE_WIDTHS[base_dtype(cfg, raw, model)]
+        # The compression gate is BF16 in the checkpoint, and glm5next -- the only
+        # family with a pooled indexer -- builds the module unquantized anyway.
+        projections.append(dict(gemm("index_kpool_compress_gate", index_dim, hidden),
+                                weight_dtype=base))
+        # The compression kernel runs ONE PROGRAM PER POOL, not per token
+        # (nvidia/ops/kpool_compress.py:165-245), so its figure is per-pool traffic
+        # amortized over the index_kpool tokens that fill one pool -- bytes_per_token is
+        # charged once per model token by a cost model.
+        #
+        # Per pool, read off the kernel: slot_score is loaded in BOTH passes (the
+        # per-dim max for softmax stability, then the weighted sum), the FP32 APE row
+        # likewise, slot_k once, and the result is one Hadamard-rotated fp8 vector plus
+        # its fp32 scale.
+        act = DTYPE_WIDTHS[base_dtype(cfg, raw, model)]
+        f32 = DTYPE_WIDTHS["fp32"]
+        per_pool = (2 * kpool * index_dim * f32       # slot_score, both passes
+                    + 2 * kpool * index_dim * f32     # APE rows, both passes
+                    + kpool * index_dim * act         # slot_k
+                    + index_dim + f32)                # fp8 vector + its scale
         projections.append({
             "op": "Elementwise",
             "role": "index_kpool_compress",
-            # Per token: its own key read, the APE table it is weighted against, and the
-            # pooled state written back at the cache's quantized width.
-            "bytes_per_token": key + ape + index_dim,
+            "bytes_per_token": per_pool // kpool,
         })
+        # The APE is a RESIDENT [index_kpool, index_head_dim] FP32 parameter. It was
+        # being charged as per-token traffic and never counted in the weight footprint;
+        # carried as a GEMM at its real dimensions so its bytes are counted once.
+        projections.append(dict(gemm("index_kpool_compress_ape", kpool, index_dim),
+                                weight_dtype="fp32"))
     # The norm reads and writes at the ACTIVATION width. glm5next's
     # _fused_indexer_k_norm is `F.layer_norm(x.float(), ...).type_as(x)`
     # (common/attention.py:55-59): the fp32 cast is a temporary inside the fused kernel,
@@ -1244,6 +1299,22 @@ def handler_moe(cfg, raw, model):
             return ""
         return "_indexed" if index else "_noindex"
 
+    # The MTP module always builds an indexer, whatever the base skip rule says. vLLM
+    # evaluates the draft at layer_id == num_hidden_layers and then constructs under
+    # `if not skip_topk or is_mtp_layer` (deepseek_v32/attention.py:179-200), so the
+    # is_mtp_layer term forces it even on a frequency-4 config whose layer 78 would skip.
+    # Without a declared draft kind, derive()'s fallback mirrors the last DECLARED kind,
+    # which on these configs is the unindexed one -- underpricing the draft indexer on
+    # every speculative step.
+    def declare_draft(kinds: list[dict[str, Any]]) -> None:
+        if not split_index:
+            return
+        if not int(pick(cfg, "num_spec_tokens") or 0):
+            return
+        nodes = sparse_nodes(window, True)
+        kinds.append({"id": DRAFT_KIND_ID, "nodes": nodes, "edges": chain(nodes)})
+
+
     # A per-layer ATTENTION-kind vector, which is a different thing from the per-layer
     # MLP-type vector handled below: this one says which layers see a bounded window
     # while every layer keeps the same MLP. gpt-oss declares it as layer_types over
@@ -1321,6 +1392,7 @@ def handler_moe(cfg, raw, model):
                     continue
                 nodes = builder(window, idx)
                 kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+        declare_draft(kinds)
         # compress() finds the trailing uniform run itself, which is the common shape
         # here: a short dense prologue then sparse throughout.
         return kinds, compress(sequence)
@@ -1340,6 +1412,7 @@ def handler_moe(cfg, raw, model):
             builder = dense_nodes if kid.startswith("attn_dense") else sparse_nodes
             nodes = builder(window, idx)
             kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+        declare_draft(kinds)
         return kinds, compress(sequence)
     sparse = sparse_nodes(window)
     kinds = [{"id": "attn_moe", "nodes": sparse, "edges": chain(sparse)}]

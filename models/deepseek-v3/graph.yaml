@@ -16,12 +16,8 @@ layer_kinds:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: q_a_proj
-    n: 1536
-    k: 7168
-  - op: GEMM
-    role: kv_a_proj
-    n: 576
+    role: qkv_a_proj
+    n: 2112
     k: 7168
   - op: Elementwise
     role: q_a_layernorm
@@ -89,19 +85,13 @@ layer_kinds:
     - 11
   - - 11
     - 12
-  - - 12
-    - 13
 - id: attn_moe
   nodes:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: q_a_proj
-    n: 1536
-    k: 7168
-  - op: GEMM
-    role: kv_a_proj
-    n: 576
+    role: qkv_a_proj
+    n: 2112
     k: 7168
   - op: Elementwise
     role: q_a_layernorm
@@ -171,8 +161,6 @@ layer_kinds:
     - 11
   - - 11
     - 12
-  - - 12
-    - 13
 stack:
   prologue:
   - attn_dense
