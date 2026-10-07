@@ -114,10 +114,10 @@ overhead/correction factor* (effective ÷ nominal) is a per-deployment number an
 lives in `blis-registry`, not here. That is what keeps "nothing measured or
 fitted" true of this repo.
 
-The allowed set of `Provenance` values is **open** — it admits any *declared*
-(non-measured, non-fitted) provenance, and the [catalog CI gate](#validation)
-validates membership so a typo (`vendor-spec`) or a measured value (`measured`)
-fails at authorship:
+The set of `Provenance` values is **open** — it is meant to carry any *declared*
+(non-measured, non-fitted) provenance. Which values a file may use is a schema
+rule, defined and enforced by the schema owner (see [Validation](#validation)),
+not here; the values the catalog uses today mean:
 
 - **`vendor_spec`** — a nominal figure taken from a vendor datasheet, including
   the datasheet's own unit normalisations (a bidirectional figure read per-GPU
@@ -125,9 +125,9 @@ fails at authorship:
   `vendor_spec`.
 - **`derived`** — reserved for a figure *computed* by the catalog from spec(s) via
   an arithmetic step the datasheet does not itself state — still declared, still
-  non-measured. No entry uses it yet; it is defined and validated so it can be
-  adopted later without a schema change. (Measured or fitted numbers never join
-  this set — they live in `blis-registry`.)
+  non-measured. No entry uses it yet; the open set lets it be adopted later
+  without a schema change. (Measured or fitted numbers never join this set — they
+  live in `blis-registry`.)
 
 `Provenance` is recorded **per file**, not per field. A finer per-field tag would
 let a file that mixes a stated figure (`TFlopsPeak`) with a computed one distinguish
@@ -135,8 +135,7 @@ them, but per-field tagging is a strictly *additive* refinement that changes no
 value and would alter the single-key contract the strict hardware loader reads
 ([inference-sim#1831](https://github.com/inference-sim/inference-sim/issues/1831));
 because every current figure is `vendor_spec`, a file-level tag loses nothing
-today, and the open, validated enum is what lets per-field land later without a
-value change.
+today, and the open enum is what lets per-field land later without a value change.
 
 - **PD KV-transfer** rides the fabric: its transfer bandwidth **is** that
   fabric's nominal `InterNodeBwGBps` (there is no separate figure), so different
@@ -157,45 +156,31 @@ value change.
   extension, and every directory pattern is anchored to the repo root — one
   unanchored or forgotten pattern and a model would silently drop out of the
   catalog, the failure NS-6 exists to prevent.
-- **Two layers of validation.** The catalog has its own [structural CI
-  gate](#validation) so a malformed entry fails *here*; the simulator additionally
-  validates the *semantics* of whatever it loads at run time, failing naming the
-  file and the problem.
+- **Validation is schema-owned.** Every committed entry is validated in CI by
+  [blis-schemas'](https://github.com/inference-sim/blis-schemas) `validate-catalog`
+  binary, which owns the schema and all its rules (see [Validation](#validation)).
+  A malformed entry fails *here*, in the repo that owns the data; the simulator
+  additionally validates the *semantics* of whatever it loads at run time.
 
 ## Validation
 
-A malformed or incomplete entry used to be caught only in a downstream `blis run`,
-in the wrong repository. Two complementary gates now cover it, and neither
-re-implements the other's checks:
+The schema and every structural rule a catalog entry must satisfy are defined and
+documented in [blis-schemas](https://github.com/inference-sim/blis-schemas). This
+repo re-implements none of them: there is no catalog-local *schema* validation
+logic, in code, tests, or prose. (The one catalog-local check that remains,
+`derive_graph.py --check` and its test suite, validates graph *derivation* — that
+each committed graph re-derives from its vendor config — not the schema.)
 
-- **Catalog-side (this repo, `scripts/validate_catalog.py`, run in CI).** The
-  **structural / schema** gate. It validates every committed entry across all
-  namespaces (`models/`, `hardware/`, `networks/`, `workloads/`, `devices/`) and
-  fails CI naming the file and the key when an entry is malformed:
-  - every file parses, and each model pairs a non-empty `config.json` with a
-    `model.yaml` whose `name` matches its directory and whose `source` records
-    `provider` / `repo` / `revision`;
-  - **`hardware/` carries only dimensioned physical quantities** — every value
-    field's name must carry a datasheet **unit** (`TFlops`, `TB/s`, `GiB`,
-    `GB/s`, …). The check tests the field's *units*, not a fixed list of names,
-    so a learned utilisation / MFU-like factor (dimensionless) is rejected even
-    if nobody has seen that field before — keeping "nothing here is learned or
-    fitted" load-bearing rather than aspirational;
-  - **`networks/` fabric classes** carry their required fields
-    (`InterNodeBwGBps`, `Provenance`), a **positive** `InterNodeBwGBps`, and a
-    `Provenance` drawn from the allowed enum;
-  - `workloads/` and `devices/` entries carry their required numeric fields with
-    sane bounds (token min ≤ max; positive bandwidths).
-- **Simulator-side ([inference-sim#1750](https://github.com/inference-sim/inference-sim/issues/1750)).**
-  The **loader-semantics** gate: it loads every catalog entry through the *real
-  simulator loader* (the `blis run` code path), catching anything the loader's
-  semantics reject. Structural facts live here in the repo that owns the data;
-  loader-semantics live in `inference-sim`.
-
-To run the catalog gate locally:
+CI validates every committed entry by running that owner's binary against the
+checkout, pinned by version:
 
 ```sh
-pip install -r requirements-dev.txt
-python3 scripts/validate_catalog.py    # validates this checkout; exits non-zero on any problem
-python3 -m pytest tests/               # exercises the gate's own good/bad fixtures
+go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.2.0 .
 ```
+
+It walks all five namespaces (`models/`, `hardware/`, `networks/`, `workloads/`,
+`devices/`), prints a per-entry summary, and fails naming the file when an entry
+is malformed. To learn *what* each namespace requires, or to add a rule, go to
+blis-schemas — not here. The simulator additionally validates the *semantics* of
+whatever it loads at run time ([inference-sim#1750](https://github.com/inference-sim/inference-sim/issues/1750)),
+the `blis run` code path; structural facts live in the schema that owns them.

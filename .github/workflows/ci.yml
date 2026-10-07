@@ -2,9 +2,11 @@ name: catalog-ci
 
 # Catalog-side structural gate (R2H3 — inference-sim/blis-catalog#8).
 # A malformed or incomplete entry fails CI HERE, in the repo that owns the data,
-# instead of surfacing later in a downstream `blis run`. This is the structural /
-# schema half; the loader-semantics half lives in inference-sim#1750 (which loads
-# every entry through the real simulator loader). The two do not duplicate checks.
+# instead of surfacing later in a downstream `blis run`. The schema rules themselves
+# are owned by blis-schemas and enforced by its validate-catalog binary — this repo
+# re-states none of them. The loader-semantics half lives in inference-sim#1750
+# (which loads every entry through the real simulator loader); the two do not
+# duplicate checks.
 
 on:
   push:
@@ -20,21 +22,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Validate every committed catalog entry (schema-owned gate)
+        # THE structural gate. The schema and every validation rule live in
+        # blis-schemas; this step runs that owner's binary against the checkout and
+        # fails naming the file when an entry is malformed. Nothing here re-implements
+        # a rule — pinned by version so the gate is reproducible and bumping it is a
+        # one-line change.
+        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.2.0 .
+
+  derive-graph:
+    name: check derived graphs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
-      - name: Validate every committed catalog entry
-        # THE gate: fails naming the file and key if any entry is malformed.
-        run: python3 scripts/validate_catalog.py
-      - name: Run the gate's own test suite
-        # Proves the checks actually fire (good data passes, bad data is rejected).
-        run: python3 -m pytest tests/ -q
       - name: Check every graph re-derives from its config
         # A ModelGraph is derived from the vendor config, never hand-written. This
         # re-derives all of them and fails if one differs from what is committed,
         # which catches both a hand-edited graph and a config changed without
         # re-deriving. Without it, the recorded source digest is provenance nobody
-        # enforces.
+        # enforces. Graph derivation is not schema validation, so it stays here.
         run: python3 scripts/derive_graph.py --check
+      - name: Run the derive-graph test suite
+        # --check only proves re-derivation equality on committed data. The suite
+        # in tests/test_derive_graph.py additionally exercises the derivation's
+        # fidelity to upstream (signatures, pricing distinctions, compression,
+        # attention/expert geometry, speculators) and its negative error paths.
+        # This is derivation coverage, not schema validation, so it belongs with
+        # the derive step — scoped to the one surviving test file.
+        run: python3 -m pytest tests/test_derive_graph.py -q
