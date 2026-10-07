@@ -1443,6 +1443,12 @@ def node_cost(n: dict) -> tuple:
         # them out made the collision tests blind to exactly the cases they were added
         # to protect.
         n.get("compress_ratio"), n.get("weight_dtype"),
+        # An Elementwise node's traffic is derived from hidden_size unless it states
+        # otherwise, so bytes_per_token is the only thing distinguishing a node that
+        # moves a multi-stream residual bundle from the ordinary norm it replaced.
+        # Omitted here, the signature read GLM-5.3-Flash's mHC mixing as two plain
+        # norms.
+        n.get("bytes_per_token"),
     )
 
 
@@ -2800,6 +2806,33 @@ def test_glm5_3_flash_prices_mhc_and_replaces_the_norms_it_fuses():
                 f"{mix}x{width}")
             assert node.get("weight_dtype") == "bf16", (
                 f"{lid}.{side} is priced at the global fp8 width; the header is BF16")
+        # The mixing nodes must state their traffic. An Elementwise node with no
+        # bytes_per_token is derivable from hidden_size, which is the ordinary norm
+        # these replaced; nothing in a ModelGraph carries hc_mult, so without the field
+        # the multi-stream mixing is priced as a single-stream norm.
+        for side in ("hc_attn_mix", "hc_ffn_mix"):
+            assert side in roles, f"{lid}: base layer carries no {side}"
+            node = next(x for x in nodes if x.get("role") == side)
+            assert node["op"] == "Elementwise"
+            stated = node.get("bytes_per_token")
+            assert stated, (
+                f"{lid}.{side} states no bytes_per_token, so it prices as a "
+                f"hidden-wide norm; the mixing moves {n} residual streams")
+            # One fused post+pre over the bundle, per the kernel's documented shapes:
+            # post reads x + bundle + the two mixes and writes the bundle; pre reads the
+            # bundle and writes the mixes + layer_input.
+            act, fp32 = 2, 4
+            bundle = n * hidden * act
+            mixes = n * fp32 + n * n * fp32
+            expected = (hidden * act + bundle + mixes + bundle) + (
+                bundle + mixes + hidden * act)
+            assert stated == expected, (
+                f"{lid}.{side} states {stated} B/token; one fused post+pre over "
+                f"{n} streams of {hidden} is {expected}")
+            assert stated > 2 * hidden * act, (
+                f"{lid}.{side} states {stated} B/token, no more than the "
+                f"{2 * hidden * act} an ordinary norm moves; the mixing would be free")
+
         # The fused norms must not also appear as separate passes.
         assert "input_norm" not in roles, (
             f"{lid}: both the mHC attention mixing and a separate input_norm are "

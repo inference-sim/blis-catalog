@@ -233,6 +233,51 @@ def compressed_tensors_skips_attention(cfg: dict[str, Any],
     return False
 
 
+def mhc_mixing_bytes(cfg: dict[str, Any], raw: dict[str, Any], model: str,
+                     hidden: int, hc_mult: int) -> int:
+    """Bytes per token the mHC mixing moves, which hidden_size alone does not give.
+
+    bytes_per_token is the Elementwise escape hatch for exactly this case: the schema
+    documents it as "bytes touched per token, when it is not derivable from HiddenSize
+    alone" (blis-schemas spec/model/graph.go). An ordinary RMSNorm IS derivable -- one
+    hidden-wide read and write -- which is why every other Elementwise node in this
+    catalog omits the field. mHC is not: it moves the whole hc_mult-stream residual
+    bundle, and nothing in a ModelGraph carries hc_mult, so an omitted value would price
+    this node as the ordinary norm it replaced.
+
+    Counted from the shapes vLLM's reference kernel documents
+    (model_executor/kernels/mhc/torch.py:60-78) for one fused post+pre, which is what
+    both sides run in steady state: the attention side fuses the PREVIOUS layer's
+    deferred hc_post with this layer's attention hc_pre, and the FFN side fuses its own
+    (common/model.py:555-603). MHCFusedPostPreOp is documented as "equivalent to applying
+    MHCPostOp and then MHCPreOp", so the two are summed:
+
+      post: read x (hidden) + residual (hc_mult x hidden) + post_mix (hc_mult)
+            + comb_mix (hc_mult^2), write residual (hc_mult x hidden)
+      pre:  read residual (hc_mult x hidden), write post_mix (hc_mult)
+            + comb_mix (hc_mult^2) + layer_input (hidden)
+
+    The residual streams and layer_input are bf16 (the kernel asserts it); post_mix and
+    comb_mix are fp32 (likewise). Two corners deliberately not modelled, because a layer
+    kind prices the common case and neither is it: layer 0's attention side runs a
+    standalone pre rather than a fused post+pre, and the final layer materializes a
+    trailing post. Each is one layer of 45.
+
+    The hc_sinkhorn_iters rounds iterate over the [mix_hc] logits, which at hc_mult 4 is
+    24 fp32 values against 32 KiB of residual traffic, so they are not counted."""
+    act = DTYPE_WIDTHS.get(base_dtype(cfg, raw, model))
+    if act is None:
+        raise DeriveError(
+            f"{model}: mHC mixing needs the activation width to size its residual "
+            f"traffic, and the base dtype has no byte width here")
+    fp32 = DTYPE_WIDTHS["fp32"]
+    bundle = hc_mult * hidden * act
+    mixes = hc_mult * fp32 + hc_mult * hc_mult * fp32
+    post = hidden * act + bundle + mixes + bundle
+    pre = bundle + mixes + hidden * act
+    return post + pre
+
+
 def fp8_unquantized_roles(cfg: dict[str, Any], raw: dict[str, Any], model: str,
                           roles: dict[str, str]) -> dict[str, str]:
     """Map node role -> base width, for roles an fp8 checkpoint leaves unquantized.
@@ -2298,6 +2343,7 @@ def handler_glm5_next(cfg, raw, model):
     # Resolved only when the mixing exists, so a future config in this family that
     # declares no dtype cannot fail here for a width it never uses.
     mhc_base = base_dtype(cfg, raw, model) if use_mhc else None
+    mhc_bytes = mhc_mixing_bytes(cfg, raw, model, hidden, hc_mult) if use_mhc else 0
 
     def mhc(nodes):
         """Replace each of a base layer's two norms with the mHC mixing that subsumes it.
@@ -2314,9 +2360,11 @@ def handler_glm5_next(cfg, raw, model):
         hc_mult residual streams. The projections are BF16 in the checkpoint, which the
         global fp8 width would otherwise understate.
 
-        bytes_per_token is omitted, as it is on every other Elementwise node in this
-        catalog: the volume follows from hidden_size and hc_mult, which a cost model has,
-        rather than from a figure this deriver would invent.
+        Each mixing node carries bytes_per_token, which every other Elementwise node in
+        this catalog omits. Those are ordinary norms, whose traffic a cost model derives
+        from hidden_size; this one moves the hc_mult-stream residual bundle, and no field
+        of a ModelGraph carries hc_mult -- so an omitted value would price the mixing as
+        the single-stream norm it replaced. See mhc_mixing_bytes().
 
         Returns the nodes untouched for any config that does not declare mhc, which is
         every other model in the catalog."""
@@ -2329,12 +2377,12 @@ def handler_glm5_next(cfg, raw, model):
             if role == "input_norm":
                 out.append(dict(gemm("hc_attn_fn", mhc_mix, mhc_width),
                                 weight_dtype=mhc_base))
-                out.append(norm("hc_attn_pre"))
+                out.append(dict(norm("hc_attn_mix"), bytes_per_token=mhc_bytes))
                 replaced.add(role)
             elif role == "post_attn_norm":
                 out.append(dict(gemm("hc_ffn_fn", mhc_mix, mhc_width),
                                 weight_dtype=mhc_base))
-                out.append(norm("hc_ffn_post_pre"))
+                out.append(dict(norm("hc_ffn_mix"), bytes_per_token=mhc_bytes))
                 replaced.add(role)
             else:
                 out.append(n)
