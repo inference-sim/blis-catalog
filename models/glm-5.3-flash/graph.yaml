@@ -229,23 +229,57 @@ layer_kinds:
     bytes_per_token: 114848
   - &id012
     op: GEMM
-    role: qkv_proj
-    n: 16384
+    role: qkv_a_proj
+    n: 2048
     k: 4096
   - &id013
+    op: Elementwise
+    role: q_a_layernorm
+  - &id014
+    op: Elementwise
+    role: kv_a_layernorm
+  - &id015
     op: GEMM
-    role: index_qk_proj
-    n: 4224
+    role: q_b_proj
+    n: 16384
+    k: 1536
+  - &id016
+    op: GEMM
+    role: kv_b_proj
+    n: 32768
+    k: 512
+    weight_dtype: bf16
+  - &id017
+    op: GEMM
+    role: index_wq_b
+    n: 4096
+    k: 1536
+    weight_dtype: bf16
+  - &id018
+    op: GEMM
+    role: index_wk_weights_proj
+    n: 160
     k: 4096
     weight_dtype: bf16
-  - &id014
+  - &id019
+    op: GEMM
+    role: index_kpool_compress_gate
+    n: 128
+    k: 4096
+    weight_dtype: bf16
+  - &id020
+    op: Elementwise
+    role: index_k_norm
+  - &id021
     op: Attention
     role: block_index_scores
-    kind: gqa
+    kind: sparse_mla
     n_q: 32
     n_kv: 1
     d_h: 128
-  - &id015
+    index_topk: 2048
+    compress_ratio: 4
+  - &id022
     op: Attention
     kind: sparse_mla
     n_q: 64
@@ -254,12 +288,12 @@ layer_kinds:
     kv_lora_rank: 512
     qk_rope_head_dim: 0
     index_topk: 2048
-  - &id016
+  - &id023
     op: GEMM
     role: o_proj
     n: 4096
     k: 16384
-  - &id017
+  - &id024
     op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -309,6 +343,20 @@ layer_kinds:
     - 11
   - - 11
     - 12
+  - - 12
+    - 13
+  - - 13
+    - 14
+  - - 14
+    - 15
+  - - 15
+    - 16
+  - - 16
+    - 17
+  - - 17
+    - 18
+  - - 18
+    - 19
 - id: mtp_moe
   nodes:
   - op: Elementwise
@@ -328,6 +376,13 @@ layer_kinds:
   - *id015
   - *id016
   - *id017
+  - *id018
+  - *id019
+  - *id020
+  - *id021
+  - *id022
+  - *id023
+  - *id024
   - op: Elementwise
     role: post_attn_norm
   - op: GroupedGEMM
@@ -374,6 +429,20 @@ layer_kinds:
     - 13
   - - 13
     - 14
+  - - 14
+    - 15
+  - - 15
+    - 16
+  - - 16
+    - 17
+  - - 17
+    - 18
+  - - 18
+    - 19
+  - - 19
+    - 20
+  - - 20
+    - 21
 stack:
   prologue:
   - kda_dense

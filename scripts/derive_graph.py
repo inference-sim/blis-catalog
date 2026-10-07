@@ -803,11 +803,11 @@ HEAD_UNQUANTIZED = {
 # excludes it on exactly the 34 linear_attention layers and on no sparse-attention layer;
 # the two have distinct roles, so the suffix cannot cross over.
 #
-# kv_b_proj is BF16 in the checkpoint and IS named by the config, but it has no node of
-# its own: attention_block() folds the whole latent projection into one qkv_proj, so
-# there is no role to width. Marking qkv_proj bf16 would reprice the fp8 q_a/q_b/kv_a
-# work it also stands for, which is worse than leaving it. Left at the global width
-# deliberately; the split that gives it a node is tracked separately.
+# kv_b_proj now has a node of its own, so the BF16 width the checkpoint states for it is
+# finally expressible: the latent up-projection is BF16 while q_a/q_b/kv_a beside it are
+# F8_E4M3, which a single fused qkv_proj could not represent at either width. The
+# indexer's three projections are BF16 too, and vLLM passes quant_config=None for the
+# fused wk_weights_proj outright.
 GLM5_NEXT_UNQUANTIZED = {
     "self_attn.q_proj": "kda_q_proj",
     "self_attn.k_proj": "kda_k_proj",
@@ -818,7 +818,10 @@ GLM5_NEXT_UNQUANTIZED = {
     "self_attn.g_a_proj": "kda_g_a_proj",
     "self_attn.g_b_proj": "kda_g_b_proj",
     "self_attn.o_proj": "kda_o_proj",
-    "self_attn.indexer.wk": "index_qk_proj",
+    "self_attn.kv_b_proj": "kv_b_proj",
+    "self_attn.indexer.wq_b": "index_wq_b",
+    "self_attn.indexer.wk": "index_wk_weights_proj",
+    "self_attn.indexer.index_kpool_compress_gate": "index_kpool_compress_gate",
     "eh_proj": "mtp_eh_proj",
     "lm_head": "lm_head",
 }
