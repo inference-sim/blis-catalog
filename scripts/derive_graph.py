@@ -770,7 +770,64 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
     GLM-5 family came to declare the full indexer spec and emit none of it."""
     index_heads = int(require_key(cfg, "index_n_heads", model))
     index_dim = int(require_key(cfg, "index_head_dim", model))
+    kpool = int(cfg.get("index_kpool") or 0)
+    q_lora = int(cfg.get("q_lora_rank") or 0)
     at = next(i for i, n in enumerate(nodes) if n.get("op") == "Attention")
+
+    if kpool > 1:
+        # The k-pool indexer, which vLLM implements for glm5next and whose projections
+        # the pinned GLM-5.3-Flash checkpoint states tensor by tensor. Three launches,
+        # not one, and the query stage reads the LATENT rather than hidden:
+        #
+        #   wq_b              q_lora_rank -> n_head * head_dim   (ReplicatedLinear)
+        #   wk_weights_proj   hidden -> [head_dim, n_head]       (fused, one GEMM)
+        #   kpool gate        hidden -> head_dim                 (F.linear over a Parameter)
+        #
+        # (common/attention.py:255-282; the fused pair is vLLM's own comment, "Fused wk
+        # + weights_proj: single GEMM producing [head_dim + n_head]".) Sourcing all of
+        # it from hidden at a single fused width, as the non-pooled branch below does,
+        # overstated this model's indexer projections by 2.3x.
+        if not q_lora:
+            raise DeriveError(
+                f"{model}: a kpool indexer projects its query from the latent rank, "
+                f"and the config declares no q_lora_rank to size wq_b from")
+        projections = [
+            gemm("index_wq_b", index_heads * index_dim, q_lora),
+            gemm("index_wk_weights_proj", index_dim + index_heads, hidden),
+            gemm("index_kpool_compress_gate", index_dim, hidden),
+            norm("index_k_norm"),
+        ]
+        # Scoring runs over POOLED candidates: one K state per index_kpool tokens, which
+        # vLLM expresses as the cache spec's tokens_per_state and sizes the scan with as
+        # max_model_len // index_kpool (common/attention.py:128-131, 314). The pooled
+        # scan is therefore ~1/kpool of the token context, on the one term that grows
+        # with context -- so recording it unpooled overstates the dominant long-context
+        # cost by that factor. compress_ratio is the schema's field for exactly this: a
+        # latent read bounded by a factor rather than by a window.
+        #
+        # The incomplete trailing pool is always kept, which vLLM requires rather than
+        # treats as optional -- it rejects a config with index_kpool_always_select_tail
+        # false (common/model.py:145-150) -- and it lives in its own tail cache. That is
+        # a kpool-1 addend on the selection, below the granularity a per-token node
+        # prices, so it is not a separate node; index_topk carries the selection.
+        scorer = {
+            "op": "Attention",
+            "role": "block_index_scores",
+            "kind": "sparse_mla",
+            "n_q": index_heads,
+            "n_kv": 1,
+            "d_h": index_dim,
+            "index_topk": int(require_key(cfg, "index_topk", model)),
+            "compress_ratio": kpool,
+        }
+        return nodes[:at] + projections + [scorer] + nodes[at:]
+
+    # The non-pooled indexer. Kept as one fused projection: the families that reach it
+    # (GlmMoeDsaForCausalLM, DeepseekV4ForCausalLM) declare no kpool fields, and this
+    # deriver has no per-tensor evidence for their indexer the way it does for the
+    # glm5next one above -- vLLM carries no GlmMoeDsa implementation at the commit this
+    # was read from. Splitting them on the glm5next shape would be extrapolation, so the
+    # shape they already had is left alone rather than changed on a guess.
     return nodes[:at] + [
         gemm("index_qk_proj", index_heads * index_dim + index_dim, hidden),
         {

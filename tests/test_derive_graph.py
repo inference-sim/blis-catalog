@@ -145,6 +145,107 @@ def test_attention_shape_matches_config(d: Path):
             assert n["n_kv"] == t["num_key_value_heads"]
 
 
+def kpool_models() -> list[Path]:
+    """Models whose config declares a pooled (k-pool) DSA indexer."""
+    return [d for d in model_dirs()
+            if int(text_config(config_of(d)).get("index_kpool") or 0) > 1]
+
+
+@pytest.mark.parametrize("d", kpool_models(), ids=lambda d: d.name)
+def test_kpool_indexer_prices_its_own_projections_and_pooled_scan(d: Path):
+    """A pooled indexer runs three projections and scores pooled candidates.
+
+    The fused single-GEMM form was wrong three ways for this family. vLLM builds wq_b
+    from the LATENT rank, not hidden; it fuses wk and weights_proj into one GEMM of
+    [head_dim, n_head]; and it adds a kpool compression gate (common/attention.py
+    255-282). Sourcing all of it from hidden at one fused width overstated the
+    projection work by 2.3x on GLM-5.3-Flash.
+
+    The scan is the bigger error. index_kpool pools the cache -- one K state per kpool
+    tokens, which vLLM sizes as max_model_len // index_kpool -- so an unpooled scorer
+    overstates the one term that grows with context by that factor.
+
+    Every width is asserted from the config, so a config update does not silently
+    invalidate the test."""
+    g, t = graph_of(d), text_config(config_of(d))
+    hidden = int(t["hidden_size"])
+    heads = int(t["index_n_heads"])
+    dim = int(t["index_head_dim"])
+    kpool = int(t["index_kpool"])
+    topk = int(t["index_topk"])
+    q_lora = int(t.get("q_lora_rank") or 0)
+    assert q_lora, "a pooled indexer sizes wq_b from the latent rank"
+
+    indexed = [k for k in g["layer_kinds"]
+               if any(n.get("role") == "block_index_scores" for n in k["nodes"])]
+    assert indexed, f"{d.name}: no layer kind carries an indexer scorer"
+
+    for kind in indexed:
+        gemms = {n.get("role"): (n["n"], n["k"]) for n in kind["nodes"]
+                 if n["op"] == "GEMM"}
+        assert "index_qk_proj" not in gemms, (
+            f"{d.name}/{kind['id']}: still carries the fused index_qk_proj, which "
+            f"sources the query stage from hidden instead of the latent rank")
+        assert gemms["index_wq_b"] == (heads * dim, q_lora), (
+            f"{d.name}/{kind['id']}: index_wq_b is {gemms['index_wq_b']}; the config "
+            f"gives {heads} * {dim} from the latent rank {q_lora}")
+        assert gemms["index_wk_weights_proj"] == (dim + heads, hidden), (
+            f"{d.name}/{kind['id']}: index_wk_weights_proj is "
+            f"{gemms['index_wk_weights_proj']}; vLLM fuses wk and weights_proj into "
+            f"one GEMM of [{dim}, {heads}] from {hidden}")
+        assert gemms["index_kpool_compress_gate"] == (dim, hidden), (
+            f"{d.name}/{kind['id']}: no kpool compression gate at {dim} from {hidden}")
+
+        scorer = next(n for n in kind["nodes"]
+                      if n.get("role") == "block_index_scores")
+        assert scorer["compress_ratio"] == kpool, (
+            f"{d.name}/{kind['id']}: the scorer states compress_ratio "
+            f"{scorer.get('compress_ratio')}; index_kpool is {kpool}, and an unpooled "
+            f"scan overstates the dominant long-context term by that factor")
+        assert scorer["index_topk"] == topk, (
+            f"{d.name}/{kind['id']}: the scorer selects "
+            f"{scorer.get('index_topk')}; index_topk is {topk}")
+        assert scorer["d_h"] == dim and scorer["n_q"] == heads
+        assert scorer["n_kv"] == 1, "the indexer scores against one pooled K stream"
+
+
+def test_an_unpooled_lightning_indexer_keeps_its_fused_projection():
+    """A config with no index_kpool must NOT be given the pooled shape.
+
+    GlmMoeDsaForCausalLM declares an indexer and no kpool fields, and this deriver has
+    no per-tensor evidence for its indexer the way it has for glm5next's -- vLLM carries
+    no GlmMoeDsa implementation at the commit the glm5next shapes were read from.
+    Retrofitting the pooled split onto it would be extrapolation, so it keeps the fused
+    node, and this pins that so the pooled branch cannot leak.
+
+    Scoped to the models that go through lightning_indexer(). DeepseekV4ForCausalLM has
+    its own handler, which already prices its indexer per tensor -- index_wq_proj from
+    q_lora_rank, a separate weights_proj and a fused compressor -- so it is neither
+    fused nor pooled and is not what this guards."""
+    checked = []
+    for path in model_dirs():
+        t = text_config(config_of(path))
+        if "index_topk" not in t or int(t.get("index_kpool") or 0) > 1:
+            continue
+        g = graph_of(path)
+        for kind in g["layer_kinds"]:
+            roles = {n.get("role") for n in kind["nodes"]}
+            if "block_index_scores" not in roles or "index_qk_proj" not in roles:
+                continue
+            checked.append(f"{path.name}/{kind['id']}")
+            assert "index_wq_b" not in roles, (
+                f"{path.name}/{kind['id']}: declares no index_kpool yet carries the "
+                f"pooled projections")
+            scorer = next(n for n in kind["nodes"]
+                          if n.get("role") == "block_index_scores")
+            assert not scorer.get("compress_ratio"), (
+                f"{path.name}/{kind['id']}: an unpooled scorer states a compress_ratio, "
+                f"so it prices a pooled scan the config never declares")
+    assert checked, (
+        "no model reached the fused lightning_indexer branch; this test guards its "
+        "shape and has nothing to check")
+
+
 def mla_models() -> list[Path]:
     """The models whose config declares a compressed latent KV."""
     return [d for d in model_dirs()
