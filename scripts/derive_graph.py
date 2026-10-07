@@ -505,7 +505,12 @@ def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
         # stores and therefore what a cost model reads.
         nope = int(pick(cfg, "qk_nope_head_dim") or 0)
         rope = int(pick(cfg, "qk_rope_head_dim") or 0)
-        if not rope:
+        # A NoPE variant states it: GLM-5.3-Flash sets mla_use_nope with
+        # qk_rope_head_dim 0, so its latent cache holds the rank alone and the width
+        # below is correct at rope == 0. Absent that declaration a zero is a missing
+        # field rather than a stated one, and accepting it would silently understate
+        # every per-token cache read, so the two cases are kept apart.
+        if not rope and not cfg.get("mla_use_nope"):
             raise DeriveError(f"{model}: latent attention with no qk_rope_head_dim")
         node["n_kv"] = 1
         node["d_h"] = int(lora) + rope
@@ -2113,6 +2118,140 @@ def handler_kimi_k3(cfg, raw, model):
     return kinds, compress(sequence)
 
 
+def handler_glm5_next(cfg, raw, model):
+    """GLM-5.3-Flash: KDA on most layers, sparse latent attention on the rest, and a
+    dense MLP prologue, with the composition stated by two per-layer vectors.
+
+    Three things differ from handler_kimi_k3, which this otherwise mirrors.
+
+    The layer sequence comes from `layer_types` and `mlp_layer_types` rather than from
+    `full_attn_layers` plus `first_k_dense_replace`. Both vectors are length
+    num_hidden_layers and they vary independently, so the kind of a layer is the pair:
+    34 `linear_attention` against 11 `deepseek_sparse_attention`, and 3 `dense` MLPs
+    before 42 `sparse` ones. Reading either vector as a period would misplace layers --
+    the attention layers sit at every fourth index, which no single period expresses
+    once the dense prologue is also in play.
+
+    The attention layers are `deepseek_sparse_attention`, so they carry a lightning
+    indexer. The config declares the full spec (`index_n_heads` 32, `index_head_dim`
+    128, `index_topk` 2048) and `lightning_indexer()` emits it. Without that node the
+    graph would record a top-k selection it never charges for, which is the omission
+    that helper's docstring records against this family.
+
+    `num_nextn_predict_layers` is 1 rather than kimi-k3's 0, so the model carries one
+    MTP module. That reaches the graph through the `num_spec_tokens` alias, as it does
+    for the DeepSeek-V3 family, rather than through a node here: an MTP module runs as
+    its own forward pass, not as part of a base layer.
+
+    The published repo is multimodal and ships a `vision_config`. Only the text path is
+    priced, as for the other multimodal entries: the vision tower runs once per image,
+    not per decode step, and the deployments this catalog serves are text."""
+    hidden = int(require(cfg, "hidden_size", model))
+    layers = int(require(cfg, "num_layers", model))
+
+    mixer_types = cfg.get("layer_types")
+    if not mixer_types:
+        raise DeriveError(f"{model}: no layer_types vector")
+    if len(mixer_types) != layers:
+        raise DeriveError(
+            f"{model}: layer_types has {len(mixer_types)} entries for {layers} layers"
+        )
+    mlp_types = cfg.get("mlp_layer_types")
+    if not mlp_types:
+        raise DeriveError(f"{model}: no mlp_layer_types vector")
+    if len(mlp_types) != layers:
+        raise DeriveError(
+            f"{model}: mlp_layer_types has {len(mlp_types)} entries for {layers} layers"
+        )
+
+    linear = cfg.get("linear_attn_config") or {}
+    if not linear:
+        raise DeriveError(f"{model}: no linear_attn_config")
+
+    def with_moe(mixer_nodes):
+        n = list(mixer_nodes)
+        n += [norm("post_attn_norm"), *moe_block(cfg, model, hidden),
+              collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+              collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
+        return n
+
+    def with_dense(mixer_nodes):
+        n = list(mixer_nodes)
+        n += [norm("post_attn_norm"), *dense_mlp(cfg, model, hidden),
+              collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE)]
+        return n
+
+    # The KDA mixer's dense projections, as for kimi-k3: RecurrentUpdate carries no N
+    # or K, so without these the layer has no producer GEMM for the reduction after it.
+    # This config states no use_full_rank_gate, so the low-rank g_a/g_b pair applies.
+    kda_heads = int(linear.get("num_heads") or require(cfg, "num_q_heads", model))
+    kda_dim = int(linear.get("head_dim") or head_dim(cfg, model))
+    kda_inner = kda_heads * kda_dim
+    kda_proj = [
+        gemm("kda_q_proj", kda_inner, hidden),
+        gemm("kda_k_proj", kda_inner, hidden),
+        gemm("kda_v_proj", kda_inner, hidden),
+        gemm("kda_f_a_proj", kda_dim, hidden),
+        gemm("kda_f_b_proj", kda_inner, kda_dim),
+        gemm("kda_b_proj", kda_heads, hidden),
+    ]
+    if linear.get("use_full_rank_gate"):
+        kda_proj.append(gemm("kda_g_proj", kda_inner, hidden))
+    else:
+        kda_proj += [
+            gemm("kda_g_a_proj", kda_dim, hidden),
+            gemm("kda_g_b_proj", kda_inner, kda_dim),
+        ]
+    conv = int(linear.get("short_conv_kernel_size") or 0)
+    recurrent = {
+        "op": "RecurrentUpdate",
+        "recurrent_kind": "kda",
+        "n_heads": kda_heads,
+        "state_size": kda_dim,
+        "state_dtype": "fp32",
+    }
+    if conv:
+        recurrent["conv_kernel"] = conv
+    kda_mixer = [
+        norm("input_norm"),
+        *kda_proj,
+        recurrent,
+        gemm("kda_o_proj", hidden, kda_inner),
+        collective("AllReduce", "mixer_out", EMIT_TENSOR_PARALLEL),
+    ]
+    # The sparse-attention layers are latent attention fronted by the indexer.
+    mla_mixer = lightning_indexer(cfg, model, hidden,
+                                  attention_block(cfg, model, hidden))
+
+    builders = {
+        ("kda", "moe"): lambda: with_moe(kda_mixer),
+        ("kda", "dense"): lambda: with_dense(kda_mixer),
+        ("mla", "moe"): lambda: with_moe(mla_mixer),
+        ("mla", "dense"): lambda: with_dense(mla_mixer),
+    }
+    sequence = []
+    for mixer_t, mlp_t in zip(mixer_types, mlp_types):
+        if mixer_t == "linear_attention":
+            mixer = "kda"
+        elif mixer_t == "deepseek_sparse_attention":
+            mixer = "mla"
+        else:
+            raise DeriveError(f"{model}: unknown layer_types entry {mixer_t!r}")
+        if mlp_t not in ("sparse", "dense"):
+            raise DeriveError(f"{model}: unknown mlp_layer_types entry {mlp_t!r}")
+        mlp = "moe" if mlp_t == "sparse" else "dense"
+        sequence.append(f"{mixer}_{mlp}")
+
+    kinds = []
+    for key, build in builders.items():
+        kid = f"{key[0]}_{key[1]}"
+        if kid not in set(sequence):
+            continue
+        nodes = build()
+        kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+    return kinds, compress(sequence)
+
+
 HANDLERS = {
     "LlamaForCausalLM": handler_dense,
     "MistralForCausalLM": handler_dense,
@@ -2148,6 +2287,7 @@ HANDLERS = {
     "NemotronHForCausalLM": handler_nemotron_h,
     "Qwen3_5MoeForConditionalGeneration": handler_qwen3_5_moe,
     "KimiK3ForConditionalGeneration": handler_kimi_k3,
+    "Glm5NextForConditionalGeneration": handler_glm5_next,
     # Kimi-K2.5 is a vision-language model whose TEXT decoder vLLM instantiates as
     # DeepseekV2ForCausalLM over config.text_config
     # (model_executor/models/kimi_k25.py:371-376, architectures=["DeepseekV2ForCausalLM"]),
@@ -2284,6 +2424,14 @@ SPEC_METHODS = {
     # MTP_MODULE_ARCHS.
     "DeepseekV4ForCausalLM": "deepseek_mtp",
     "Qwen3_5MoeForConditionalGeneration": "qwen3_5_mtp",
+    # vLLM rewrites model_type glm5_next to glm5_next_mtp and reads n_predict from
+    # get_text_config().num_nextn_predict_layers, architectures ["Glm5NextMTPModel"]
+    # (config/speculative.py:1060-1065 on vllm-project/vllm main, with
+    # "glm5_next_mtp" in its valid-method list at line 66). Read from upstream rather
+    # than inferred from the glm4_moe_mtp entry above: the two are distinct methods and
+    # this family is not the GLM-4 one. The alias table already resolves
+    # num_nextn_predict_layers, so this needs no MTP_MODULE_ARCHS entry.
+    "Glm5NextForConditionalGeneration": "glm5_next_mtp",
     # vLLM resolves both the VL wrapper and the text decoder to one method, reading
     # n_predict from num_mtp_modules rather than num_nextn_predict_layers
     # (config/speculative.py:958-974, and "minimax_m3_mtp" in its valid-method list).
