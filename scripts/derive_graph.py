@@ -871,7 +871,8 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
                     window: int | None = None,
                     compress_ratio: int | None = None,
                     index_topk: int | None = None,
-                    latent_width: int | None = None) -> list[dict[str, Any]]:
+                    latent_width: int | None = None,
+                    indexed: bool = True) -> list[dict[str, Any]]:
     """The nodes common to every attention layer: norm, QKV, attention, output, reduce."""
     nq = int(require(cfg, "num_q_heads", model))
     nkv = int(require(cfg, "num_kv_heads", model))
@@ -986,8 +987,15 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
                 # normalises and writes index_k -- fusion removes a LAUNCH, not the HBM
                 # traffic. Suppressing the separate index_k_norm node without adding its
                 # width here would delete bytes the kernel really moves.
+                # The folded width belongs only to layers that actually RUN the
+                # indexer. A skipped layer takes the else at
+                # deepseek_v32/attention.py:339-360 with has_indexer = False, and
+                # fused_norm_rope substitutes dummies and skips the indexer program
+                # under HAS_INDEXER -- so its norm moves the two latents alone. Gated on
+                # the per-layer state rather than the architecture, because
+                # attention_block() builds the skipped kinds too.
                 norm_width = q_lora + kv_lora
-                if layout["fused_index_norm"]:
+                if layout["fused_index_norm"] and indexed:
                     norm_width += int(require_key(cfg, "index_head_dim", model))
                 stages.append(latent_norm("qkv_a_layernorm", norm_width))
             else:
@@ -1317,7 +1325,7 @@ def handler_moe(cfg, raw, model):
 
     def attn_nodes(win=None, index=None):
         use = indexed_any if index is None else index
-        n = attention_block(cfg, model, hidden, raw=raw, window=win)
+        n = attention_block(cfg, model, hidden, raw=raw, window=win, indexed=use)
         return lightning_indexer(cfg, model, hidden, n, raw) if use else n
 
     def sparse_nodes(win=None, index=None):

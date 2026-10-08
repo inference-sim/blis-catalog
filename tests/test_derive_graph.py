@@ -522,6 +522,54 @@ def test_an_indexed_layer_never_costs_less_than_an_unindexed_one():
     assert checked, "no model mixes indexed and unindexed layers"
 
 
+def test_the_folded_index_norm_width_is_paired_with_the_layer_running_the_indexer():
+    """Only a layer that RUNS the indexer carries its folded norm width.
+
+    A skipped layer takes the else at deepseek_v32/attention.py:339-360 with
+    has_indexer = False, and fused_norm_rope substitutes dummies and skips the indexer
+    program under HAS_INDEXER. So its norm moves the two latents alone, while an indexed
+    layer in the same graph moves the latents plus index_head_dim.
+
+    Asserted as an exact pair ACROSS kinds of one graph, not as two independent values:
+    the per-layer gating is the property, and a graph where both kinds agree has lost it
+    in one direction or the other. This is the case the conservation test cannot see --
+    that one builds both families through indexer_nodes(), so both sides are indexed."""
+    checked = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if not (t.get("index_topk") and t.get("index_n_heads")):
+            continue
+        g = graph_of(d)
+        kinds = {k["id"]: k for k in g["layer_kinds"]}
+        seq = set(layer_sequence(g["stack"]))
+        def norm_of(kid):
+            return next((n.get("bytes_per_token") for n in kinds[kid]["nodes"]
+                         if n.get("role") == "qkv_a_layernorm"), None)
+        indexed = [k for k in seq
+                   if any(n.get("role") == "block_index_scores"
+                          for n in kinds[k]["nodes"])]
+        skipped = [k for k in seq if k not in indexed
+                   and norm_of(k) is not None]
+        if not (indexed and skipped):
+            continue
+        act = 2  # bf16; these configs declare bfloat16
+        latents = 2 * (int(t["q_lora_rank"]) + int(t["kv_lora_rank"])) * act
+        folded = latents + 2 * int(t["index_head_dim"]) * act
+        for kid in sorted(indexed):
+            assert norm_of(kid) == folded, (
+                f"{d.name}/{kid}: runs the indexer and states {norm_of(kid)} B/token; "
+                f"fused_norm_rope normalises index_k too, which gives {folded}")
+        for kid in sorted(skipped):
+            assert norm_of(kid) == latents, (
+                f"{d.name}/{kid}: has no block_index_scores node yet states "
+                f"{norm_of(kid)} B/token; has_indexer is False for such a layer, so its "
+                f"norm moves the two latents alone, which is {latents}")
+        assert folded != latents, "index_head_dim is zero, so this pair proves nothing"
+        checked += 1
+    if not checked:
+        pytest.skip("no graph mixes indexed and skipped layers with a fused index norm")
+
+
 def test_a_family_that_launches_its_index_norm_separately_keeps_the_node():
     """The negative case for the fusion, exercised directly.
 
