@@ -276,15 +276,15 @@ def test_kpool_prices_the_compression_pass_and_its_ape_state():
     assert comp["bytes_per_token"] > 0
     # The exact figure is pinned by
     # test_kpool_compression_traffic_is_per_pool_amortized, which derives it from the
-    # kernel's own reads. Here the point is that the pass exists AND that its resident
-    # FP32 APE parameter is counted.
-    ape = next((n for n in nodes
-                if n.get("role") == "index_kpool_compress_ape"), None)
-    assert ape is not None, (
-        "the FP32 [index_kpool, index_head_dim] APE is not counted anywhere; it is a "
-        "resident parameter, not per-token traffic")
-    assert (ape["n"], ape["k"]) == (cfg["index_kpool"], cfg["index_head_dim"])
-    assert ape.get("weight_dtype") == "fp32"
+    # kernel's own reads. Here the point is that the pass exists at all.
+    #
+    # The APE is deliberately NOT a node: the only primitive that could carry its bytes
+    # is a GEMM, and a GEMM means 2*n*k FLOPs per token plus a launch
+    # (blis-latency-kernel plan.go:266-269), which the storage-only table does not run.
+    # Its read traffic is inside the figure above.
+    assert not any(n.get("role") == "index_kpool_compress_ape" for n in nodes), (
+        "the APE is emitted as a node; the only primitive available is a GEMM, which "
+        "would invent FLOPs and a launch for a storage-only table")
 
 
 def test_kpool_indexer_widths_are_visible_against_a_quantized_global():
@@ -305,7 +305,6 @@ def test_kpool_indexer_widths_are_visible_against_a_quantized_global():
             f"{role} inherits the quantized global width; vLLM builds this module "
             f"unquantized")
     assert by_role["index_head_gate_proj"]["weight_dtype"] == "fp32"
-    assert by_role["index_kpool_compress_ape"]["weight_dtype"] == "fp32"
 
 
 def test_kpool_compression_traffic_is_per_pool_amortized():
@@ -323,16 +322,28 @@ def test_kpool_compression_traffic_is_per_pool_amortized():
     kpool, dim = cfg["index_kpool"], cfg["index_head_dim"]
     comp = next(n for n in indexer_nodes(cfg)
                 if n.get("role") == "index_kpool_compress")
-    per_pool = (2 * kpool * dim * 4     # slot_score, both passes, fp32
-                + 2 * kpool * dim * 4   # APE rows, both passes, fp32
-                + kpool * dim * 2       # slot_k, bf16
-                + dim + 4)              # fp8 vector + fp32 scale
+    # Each tensor at the width it is STORED at, which is the width an HBM read costs.
+    # slot_score is bf16 -- gate_score is F.linear over bf16 hidden states and the bf16
+    # compression gate, and the tail cache calls its copy the "bf16 gate score"
+    # (common/attention.py:172). Only the APE is fp32 in memory. The Triton loads cast
+    # to fp32 in registers, which moves no bytes.
+    BF16, FP32, FP8 = 2, 4, 1
+    per_pool = (2 * kpool * dim * BF16    # slot_score, both passes
+                + 2 * kpool * dim * FP32  # APE rows, both passes
+                + kpool * dim * BF16      # slot_k
+                + dim * FP8 + FP32)       # fp8 vector + its scale
     assert comp["bytes_per_token"] == per_pool // kpool, (
         f"compression states {comp['bytes_per_token']} B/token; the kernel moves "
         f"{per_pool} per pool over {kpool} tokens")
-    naive = dim * 2 + kpool * dim * 4 + dim
+    # Two specific wrong answers this must not give.
+    naive = dim * BF16 + kpool * dim * FP32 + dim
     assert comp["bytes_per_token"] != naive, (
         "compression is priced as if the whole APE table were read every token")
+    all_fp32 = (2 * kpool * dim * FP32 + 2 * kpool * dim * FP32
+                + kpool * dim * BF16 + dim + FP32) // kpool
+    assert comp["bytes_per_token"] != all_fp32, (
+        f"compression states {comp['bytes_per_token']}, the figure you get by sizing "
+        f"slot_score from the fp32 accumulation width rather than its bf16 storage")
 
 
 def test_a_config_without_kpool_gets_no_pooling_nodes_or_bound():
@@ -430,7 +441,8 @@ def test_indexer_projection_widths_track_the_declared_geometry(dim: int, heads: 
     assert g["index_wk_weights_proj"] == (dim + heads, cfg["hidden_size"])
     assert g["index_kpool_compress_gate"] == (dim, cfg["hidden_size"])
     assert g["index_head_gate_proj"] == (heads, cfg["hidden_size"])
-    assert g["index_kpool_compress_ape"] == (cfg["index_kpool"], dim)
+    assert "index_kpool_compress_ape" not in g, (
+        "the APE is a storage-only table and must not be a GEMM")
 
 
 @pytest.mark.parametrize("freq,offset,layers", [
@@ -686,13 +698,13 @@ def test_kpool_indexer_prices_its_own_projections_and_pooled_scan(d: Path):
             f"{main.get('index_topk')}; index_topk is {topk}")
         assert scorer["d_h"] == dim and scorer["n_q"] == heads
         assert scorer["n_kv"] == 1, "the indexer scores against one pooled K stream"
-        # The APE is a resident FP32 parameter, not per-token traffic.
-        ape = next((n for n in kind["nodes"]
-                    if n.get("role") == "index_kpool_compress_ape"), None)
-        assert ape is not None and ape.get("weight_dtype") == "fp32", (
-            f"{d.name}/{kind['id']}: the FP32 [{kpool}, {dim}] APE is not counted in "
-            f"the weight footprint")
-        assert (ape["n"], ape["k"]) == (kpool, dim)
+        # The APE must NOT appear as a GEMM: that primitive carries FLOPs and a launch
+        # the storage-only table does not run. Its read traffic is inside
+        # index_kpool_compress.
+        assert not any(n.get("role") == "index_kpool_compress_ape"
+                       for n in kind["nodes"]), (
+            f"{d.name}/{kind['id']}: the APE is emitted as a node, inventing "
+            f"{2 * kpool * dim} FLOPs/token and a launch for a storage-only table")
 
 
 def test_an_unpooled_indexer_prices_no_pooled_compression():

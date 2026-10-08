@@ -1145,22 +1145,31 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
         # per-dim max for softmax stability, then the weighted sum), the FP32 APE row
         # likewise, slot_k once, and the result is one Hadamard-rotated fp8 vector plus
         # its fp32 scale.
+        # Each tensor at its STORED width, not the width the kernel accumulates in.
+        # slot_score is bf16: gate_score comes from F.linear over bf16 hidden states and
+        # the bf16 compression gate, and the tail cache documents its own copy as the
+        # "bf16 gate score" (common/attention.py:172). The Triton load casts to fp32 in
+        # registers, which costs no HBM. Only the APE is genuinely fp32 in memory.
         act = DTYPE_WIDTHS[base_dtype(cfg, raw, model)]
         f32 = DTYPE_WIDTHS["fp32"]
-        per_pool = (2 * kpool * index_dim * f32       # slot_score, both passes
-                    + 2 * kpool * index_dim * f32     # APE rows, both passes
-                    + kpool * index_dim * act         # slot_k
-                    + index_dim + f32)                # fp8 vector + its scale
+        per_pool = (2 * kpool * index_dim * act       # slot_score, bf16, both passes
+                    + 2 * kpool * index_dim * f32     # APE rows, fp32, both passes
+                    + kpool * index_dim * act         # slot_k, bf16
+                    + index_dim + f32)                # fp8 vector + its fp32 scale
         projections.append({
             "op": "Elementwise",
             "role": "index_kpool_compress",
             "bytes_per_token": per_pool // kpool,
         })
-        # The APE is a RESIDENT [index_kpool, index_head_dim] FP32 parameter. It was
-        # being charged as per-token traffic and never counted in the weight footprint;
-        # carried as a GEMM at its real dimensions so its bytes are counted once.
-        projections.append(dict(gemm("index_kpool_compress_ape", kpool, index_dim),
-                                weight_dtype="fp32"))
+        # The APE's read traffic is already inside that figure. It is NOT emitted as a
+        # node of its own: the only primitive that could carry its bytes is a GEMM, and
+        # a GEMM means 2*n*k FLOPs per token plus a launch in the consuming kernel
+        # (blis-latency-kernel internal/price/plan.go:266-269). The APE is a storage-only
+        # [index_kpool, index_head_dim] fp32 table consumed inside the pooling kernel, so
+        # a GEMM would invent 1,024 FLOPs/token and a launch per indexed layer -- a worse
+        # error than the residency it would record. Representing resident parameter bytes
+        # that carry no compute needs a schema primitive the ModelGraph does not have;
+        # tracked rather than faked.
     # The norm reads and writes at the ACTIVATION width. glm5next's
     # _fused_indexer_k_norm is `F.layer_norm(x.float(), ...).type_as(x)`
     # (common/attention.py:55-59): the fp32 cast is a temporary inside the fused kernel,
