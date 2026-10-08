@@ -977,8 +977,19 @@ def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
                 # One launch, not two. Kimi-K3 calls fused_q_kv_rmsnorm over both
                 # latents (kimi_k3/nvidia/mla.py:520) and glm5next asks the shared MLA
                 # module for the same with fuse_qkv_rmsnorm=True
-                # (glm5next common/attention.py:604). The traffic is both latents.
-                stages.append(latent_norm("qkv_a_layernorm", q_lora + kv_lora))
+                # (glm5next common/attention.py:604).
+                #
+                # Where the family ALSO folds the indexer's k-norm into that same call,
+                # its width joins this node's traffic. deepseek_v32 passes index_k and
+                # the indexer's norm weight/bias/eps into the one fused_norm_rope
+                # (deepseek_v32/attention.py:378-392), and that kernel still reads,
+                # normalises and writes index_k -- fusion removes a LAUNCH, not the HBM
+                # traffic. Suppressing the separate index_k_norm node without adding its
+                # width here would delete bytes the kernel really moves.
+                norm_width = q_lora + kv_lora
+                if layout["fused_index_norm"]:
+                    norm_width += int(require_key(cfg, "index_head_dim", model))
+                stages.append(latent_norm("qkv_a_layernorm", norm_width))
             else:
                 # Two calls, in the order the generic forward makes them: q_a_layernorm
                 # right after q_a_proj (deepseek_v2.py:598) and kv_a_layernorm after the

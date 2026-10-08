@@ -21,7 +21,7 @@ layer_kinds:
     k: 6144
   - op: Elementwise
     role: qkv_a_layernorm
-    bytes_per_token: 10240
+    bytes_per_token: 10752
   - op: GEMM
     role: q_b_proj
     n: 16384
@@ -112,7 +112,7 @@ layer_kinds:
     k: 6144
   - op: Elementwise
     role: qkv_a_layernorm
-    bytes_per_token: 10240
+    bytes_per_token: 10752
   - op: GEMM
     role: q_b_proj
     n: 16384
@@ -205,7 +205,7 @@ layer_kinds:
     k: 6144
   - op: Elementwise
     role: qkv_a_layernorm
-    bytes_per_token: 10240
+    bytes_per_token: 10752
   - op: GEMM
     role: q_b_proj
     n: 16384
@@ -277,7 +277,7 @@ layer_kinds:
     k: 6144
   - op: Elementwise
     role: qkv_a_layernorm
-    bytes_per_token: 10240
+    bytes_per_token: 10752
   - op: GEMM
     role: q_b_proj
     n: 16384

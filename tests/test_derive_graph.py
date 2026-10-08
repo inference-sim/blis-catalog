@@ -545,12 +545,30 @@ def test_a_family_that_launches_its_index_norm_separately_keeps_the_node():
         f"index_k_norm states {kn[0]['bytes_per_token']} B/token; a bf16 read and write "
         f"over {dim} is {2 * dim * 2}")
 
-    # And the fused family, same helper, must not carry it.
-    fused = dict(cfg, architectures=["GlmMoeDsaForCausalLM"])
-    assert not any(n.get("role") == "index_k_norm"
-                   for n in indexer_nodes(fused)), (
+    # And the fused family, same helper, must not carry it -- but must account for its
+    # bytes in the surviving node. Checked as a CONSERVATION property: total normalisation
+    # traffic is the same either way, since fusion removes a launch and not the HBM work.
+    fused_cfg = dict(cfg, architectures=["GlmMoeDsaForCausalLM"])
+    fused_nodes = indexer_nodes(fused_cfg)
+    assert not any(n.get("role") == "index_k_norm" for n in fused_nodes), (
         "a GlmMoeDsa-shaped config prices a separate index_k_norm, but that family "
         "folds it into the same fused_norm_rope launch as the latent norms")
+
+    def norm_bytes(ns):
+        return sum(n.get("bytes_per_token", 0) for n in ns
+                   if n["op"] == "Elementwise"
+                   and str(n.get("role") or "") in
+                   ("qkv_a_layernorm", "index_k_norm"))
+
+    # indexer_nodes() already splices the attention_block stages in, so summing it
+    # ALONE is the whole layer -- adding attn_stages() again double-counts the latent
+    # norm, which is how the first draft of this assertion failed.
+    sep = norm_bytes(indexer_nodes(cfg))
+    fus = norm_bytes(fused_nodes)
+    assert sep == fus, (
+        f"the separate-launch family moves {sep} B/token of normalisation and the fused "
+        f"one {fus}; fusing removes a kernel launch, not the bytes it reads and writes, "
+        f"so the totals must agree")
 
 
 def test_the_glm_dsa_speculative_method_is_the_one_vllm_rewrites_to():
@@ -613,11 +631,31 @@ def test_a_fused_index_norm_is_not_also_priced_as_its_own_node():
             assert not any(x.get("role") == "index_k_norm" for x in k["nodes"]), (
                 f"{d.name}/{k['id']}: prices a separate index_k_norm, but this family "
                 f"folds it into the same fused_norm_rope launch as the latent norms")
-            # The latent norm it was folded into must still be there, or the traffic
-            # has gone missing rather than moved.
-            assert any(x.get("role") == "qkv_a_layernorm" for x in k["nodes"]), (
+            # The latent norm it was folded into must still be there AND must carry the
+            # folded width. fusion removes a LAUNCH, not the HBM traffic: that kernel
+            # still reads, normalises and writes index_k, so suppressing the separate
+            # node without widening this one deletes bytes the kernel really moves.
+            fused = next((x for x in k["nodes"]
+                          if x.get("role") == "qkv_a_layernorm"), None)
+            assert fused is not None, (
                 f"{d.name}/{k['id']}: the fused latent norm is absent, so the folded "
                 f"k-norm traffic is unaccounted for")
+            act = 2  # bf16; these configs declare bfloat16
+            want = 2 * (int(t["q_lora_rank"]) + int(t["kv_lora_rank"])
+                        + int(t["index_head_dim"])) * act
+            assert fused["bytes_per_token"] == want, (
+                f"{d.name}/{k['id']}: the fused norm states "
+                f"{fused['bytes_per_token']} B/token; it normalises the two latents AND "
+                f"index_k in one launch, which over "
+                f"{t['q_lora_rank']} + {t['kv_lora_rank']} + {t['index_head_dim']} at "
+                f"{act} bytes is {want}")
+            # The latents-only figure is the specific wrong answer: it is what you get
+            # by suppressing the index norm's node and forgetting its bytes.
+            latents_only = 2 * (int(t["q_lora_rank"]) + int(t["kv_lora_rank"])) * act
+            assert fused["bytes_per_token"] != latents_only, (
+                f"{d.name}/{k['id']}: the fused norm states the latents-only figure "
+                f"{latents_only}; the folded index-norm traffic has been dropped rather "
+                f"than moved")
             checked += 1
     assert checked, (
         "no model in the catalog fuses its index norm, so this test guards nothing")
