@@ -16,9 +16,20 @@ layer_kinds:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
+    role: kv_a_proj
+    n: 576
+    k: 2048
+  - op: Elementwise
+    role: kv_a_layernorm
+    bytes_per_token: 2048
+  - op: GEMM
+    role: q_proj
     n: 3072
     k: 2048
+  - op: GEMM
+    role: kv_b_proj
+    n: 4096
+    k: 512
   - op: Attention
     kind: mla
     n_q: 16
@@ -63,14 +74,31 @@ layer_kinds:
     - 7
   - - 7
     - 8
+  - - 8
+    - 9
+  - - 9
+    - 10
+  - - 10
+    - 11
 - id: attn_moe
   nodes:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
+    role: kv_a_proj
+    n: 576
+    k: 2048
+  - op: Elementwise
+    role: kv_a_layernorm
+    bytes_per_token: 2048
+  - op: GEMM
+    role: q_proj
     n: 3072
     k: 2048
+  - op: GEMM
+    role: kv_b_proj
+    n: 4096
+    k: 512
   - op: Attention
     kind: mla
     n_q: 16
@@ -117,6 +145,12 @@ layer_kinds:
     - 7
   - - 7
     - 8
+  - - 8
+    - 9
+  - - 9
+    - 10
+  - - 10
+    - 11
 stack:
   prologue:
   - attn_dense

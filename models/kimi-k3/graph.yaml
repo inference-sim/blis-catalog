@@ -21,36 +21,43 @@ layer_kinds:
     role: kda_q_proj
     n: 12288
     k: 7168
+    weight_dtype: bf16
   - &id003
     op: GEMM
     role: kda_k_proj
     n: 12288
     k: 7168
+    weight_dtype: bf16
   - &id004
     op: GEMM
     role: kda_v_proj
     n: 12288
     k: 7168
+    weight_dtype: bf16
   - &id005
     op: GEMM
     role: kda_f_a_proj
     n: 128
     k: 7168
+    weight_dtype: bf16
   - &id006
     op: GEMM
     role: kda_f_b_proj
     n: 12288
     k: 128
+    weight_dtype: bf16
   - &id007
     op: GEMM
     role: kda_b_proj
     n: 96
     k: 7168
+    weight_dtype: bf16
   - &id008
     op: GEMM
     role: kda_g_proj
     n: 12288
     k: 7168
+    weight_dtype: bf16
   - &id009
     op: RecurrentUpdate
     recurrent_kind: kda
@@ -63,6 +70,7 @@ layer_kinds:
     role: kda_o_proj
     n: 7168
     k: 12288
+    weight_dtype: bf16
   - &id011
     op: AllReduce
     role: mixer_out
@@ -129,9 +137,23 @@ layer_kinds:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
-    n: 18432
+    role: qkv_a_proj
+    n: 14400
     k: 7168
+    weight_dtype: bf16
+  - op: Elementwise
+    role: qkv_a_layernorm
+    bytes_per_token: 8192
+  - op: GEMM
+    role: q_b_proj
+    n: 18432
+    k: 1536
+    weight_dtype: bf16
+  - op: GEMM
+    role: kv_b_proj
+    n: 24576
+    k: 512
+    weight_dtype: bf16
   - op: Attention
     kind: mla
     n_q: 96
@@ -139,10 +161,14 @@ layer_kinds:
     d_h: 576
     kv_lora_rank: 512
     qk_rope_head_dim: 64
+  - op: Elementwise
+    role: mla_output_gate
+    bytes_per_token: 73728
   - op: GEMM
     role: o_proj
     n: 7168
     k: 12288
+    weight_dtype: bf16
   - op: AllReduce
     role: attn_out
     emit: tensor_parallel
@@ -191,6 +217,14 @@ layer_kinds:
     - 9
   - - 9
     - 10
+  - - 10
+    - 11
+  - - 11
+    - 12
+  - - 12
+    - 13
+  - - 13
+    - 14
 - id: kda_dense
   nodes:
   - *id001

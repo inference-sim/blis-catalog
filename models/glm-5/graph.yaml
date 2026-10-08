@@ -16,13 +16,29 @@ layer_kinds:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
-    n: 16384
+    role: qkv_a_proj
+    n: 2624
     k: 6144
+  - op: Elementwise
+    role: qkv_a_layernorm
+    bytes_per_token: 10752
   - op: GEMM
-    role: index_qk_proj
-    n: 4224
+    role: q_b_proj
+    n: 16384
+    k: 2048
+  - op: GEMM
+    role: kv_b_proj
+    n: 28672
+    k: 512
+  - op: GEMM
+    role: index_wq_b
+    n: 4096
+    k: 2048
+  - op: GEMM
+    role: index_wk_weights_proj
+    n: 160
     k: 6144
+    weight_dtype: bf16
   - op: Attention
     role: block_index_scores
     kind: gqa
@@ -78,18 +94,42 @@ layer_kinds:
     - 9
   - - 9
     - 10
+  - - 10
+    - 11
+  - - 11
+    - 12
+  - - 12
+    - 13
+  - - 13
+    - 14
 - id: attn_moe
   nodes:
   - op: Elementwise
     role: input_norm
   - op: GEMM
-    role: qkv_proj
-    n: 16384
+    role: qkv_a_proj
+    n: 2624
     k: 6144
+  - op: Elementwise
+    role: qkv_a_layernorm
+    bytes_per_token: 10752
   - op: GEMM
-    role: index_qk_proj
-    n: 4224
+    role: q_b_proj
+    n: 16384
+    k: 2048
+  - op: GEMM
+    role: kv_b_proj
+    n: 28672
+    k: 512
+  - op: GEMM
+    role: index_wq_b
+    n: 4096
+    k: 2048
+  - op: GEMM
+    role: index_wk_weights_proj
+    n: 160
     k: 6144
+    weight_dtype: bf16
   - op: Attention
     role: block_index_scores
     kind: gqa
@@ -147,6 +187,14 @@ layer_kinds:
     - 9
   - - 9
     - 10
+  - - 10
+    - 11
+  - - 11
+    - 12
+  - - 12
+    - 13
+  - - 13
+    - 14
 stack:
   prologue:
   - attn_dense
@@ -163,7 +211,7 @@ head:
   n: 154880
   k: 6144
 speculator:
-  method: glm4_moe_mtp
+  method: deepseek_mtp
   num_spec_tokens: 1
   stack:
     pattern:
