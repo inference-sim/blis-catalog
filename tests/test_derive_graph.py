@@ -508,13 +508,25 @@ def test_an_indexed_layer_never_costs_less_than_an_unindexed_one():
                                        for n in kinds[k]["nodes"]) else "dense") == mlp)]
             if not peers:
                 continue
-            lo = collections.Counter(node_cost(n) for n in kinds[sk]["nodes"])
-            hi = collections.Counter(node_cost(n) for n in kinds[peers[0]]["nodes"])
+            # Compared on the nodes a skip cannot legitimately change. The latent norm
+            # IS legitimately different: where the family folds the index norm into it,
+            # a skipped layer's is narrower, because fused_norm_rope substitutes dummies
+            # and skips the indexer program under HAS_INDEXER
+            # (deepseek_v32/attention.py:339-360). That reduction is the point of
+            # skipping, not added work, and it is pinned by
+            # test_the_folded_index_norm_width_is_paired_with_the_layer_running_the_indexer.
+            def comparable(kid):
+                return collections.Counter(
+                    node_cost(n) for n in kinds[kid]["nodes"]
+                    if n.get("role") != "qkv_a_layernorm")
+
+            lo, hi = comparable(sk), comparable(peers[0])
             extra = lo - hi
             assert not extra, (
                 f"{d.name}: the unindexed layer {sk!r} prices work the indexed layer "
                 f"{peers[0]!r} does not: {sorted(extra)[:2]}. Skipping the indexer only "
-                f"removes the scoring pass; it cannot add or alter anything else")
+                f"removes the scoring pass and narrows the fused norm; it cannot add or "
+                f"alter anything else")
             assert hi - lo, (
                 f"{d.name}: the unindexed layer {sk!r} costs exactly what the indexed "
                 f"{peers[0]!r} costs, so skipping the indexer saved nothing")
