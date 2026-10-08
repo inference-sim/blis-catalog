@@ -522,6 +522,107 @@ def test_an_indexed_layer_never_costs_less_than_an_unindexed_one():
     assert checked, "no model mixes indexed and unindexed layers"
 
 
+def test_a_family_that_launches_its_index_norm_separately_keeps_the_node():
+    """The negative case for the fusion, exercised directly.
+
+    glm5next runs _fused_indexer_k_norm as its OWN call
+    (glm5next/common/attention.py:352) after fusing only the two latent norms
+    (fuse_qkv_rmsnorm=True, :604), so its indexer must carry an index_k_norm node.
+    deepseek_v32 folds all four into fused_norm_rope and must not.
+
+    Called directly because no committed config on this branch is glm5next -- that model
+    arrives with the branch consuming this one. Without this, suppressing the node for
+    EVERY family would pass: nothing here keeps it."""
+    d = deriver()
+    cfg = kpool_config()
+    nodes = indexer_nodes(cfg)
+    kn = [n for n in nodes if n.get("role") == "index_k_norm"]
+    assert len(kn) == 1, (
+        f"a glm5next-shaped config prices {len(kn)} index_k_norm nodes; it launches that "
+        f"norm itself, so exactly one is right")
+    dim = cfg["index_head_dim"]
+    assert kn[0]["bytes_per_token"] == 2 * dim * 2, (
+        f"index_k_norm states {kn[0]['bytes_per_token']} B/token; a bf16 read and write "
+        f"over {dim} is {2 * dim * 2}")
+
+    # And the fused family, same helper, must not carry it.
+    fused = dict(cfg, architectures=["GlmMoeDsaForCausalLM"])
+    assert not any(n.get("role") == "index_k_norm"
+                   for n in indexer_nodes(fused)), (
+        "a GlmMoeDsa-shaped config prices a separate index_k_norm, but that family "
+        "folds it into the same fused_norm_rope launch as the latent norms")
+
+
+def test_the_glm_dsa_speculative_method_is_the_one_vllm_rewrites_to():
+    """model_type glm_moe_dsa resolves to deepseek_mtp, not glm4_moe_mtp.
+
+    vLLM lists it in one branch with the DeepSeek types --
+    `if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"):
+    hf_config.model_type = "deepseek_mtp"` (config/speculative.py:678-685) -- and
+    glm4_moe_mtp is set on a different branch (:780) for a different family. Naming the
+    wrong one records a draft method no engine would select for these checkpoints.
+
+    Keyed off the config's declared model_type rather than its architecture, because that
+    is the field vLLM's resolution actually reads."""
+    checked = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if t.get("model_type") != "glm_moe_dsa":
+            continue
+        g = graph_of(d)
+        spec = g.get("speculator")
+        if spec is None:
+            continue
+        assert spec["method"] == "deepseek_mtp", (
+            f"{d.name}: declares model_type glm_moe_dsa and draft method "
+            f"{spec['method']!r}; vLLM rewrites that model_type to deepseek_mtp")
+        checked += 1
+    assert checked, "no glm_moe_dsa model with a speculator in the catalog"
+
+
+def test_a_fused_index_norm_is_not_also_priced_as_its_own_node():
+    """Where vLLM folds the indexer k-norm into the latent-norm launch, it is one node.
+
+    deepseek_v32 calls fused_norm_rope once per layer, unconditionally on the shared code
+    path, and passes the q norm, the kv norm, the rope cache AND the indexer's k-norm
+    weight/bias/eps into that single launch (deepseek_v32/attention.py:378-392). Emitting
+    a separate index_k_norm there charges a normalisation kernel the family does not
+    launch -- its traffic is already inside the fused latent norm.
+
+    glm5next is the negative case: it fuses the two LATENT norms (fuse_qkv_rmsnorm=True,
+    glm5next/common/attention.py:604) and runs _fused_indexer_k_norm as its own call
+    (:352), so it keeps the node. That model arrives with the branch consuming this one,
+    so the negative half is asserted there and here only by the layout table's default.
+
+    Named by architecture rather than read from MLA_LAYOUTS: a test that imports the
+    table it checks moves with it and catches nothing."""
+    FUSES_INDEX_NORM = {"GlmMoeDsaForCausalLM"}
+    checked = 0
+    for d in model_dirs():
+        t = text_config(config_of(d))
+        if not (t.get("index_topk") and t.get("index_n_heads")):
+            continue
+        arches = (list(config_of(d).get("architectures") or ())
+                  + list(t.get("architectures") or ()))
+        if not any(a in FUSES_INDEX_NORM for a in arches):
+            continue
+        g = graph_of(d)
+        for k in g["layer_kinds"]:
+            if not any(x.get("role") == "block_index_scores" for x in k["nodes"]):
+                continue
+            assert not any(x.get("role") == "index_k_norm" for x in k["nodes"]), (
+                f"{d.name}/{k['id']}: prices a separate index_k_norm, but this family "
+                f"folds it into the same fused_norm_rope launch as the latent norms")
+            # The latent norm it was folded into must still be there, or the traffic
+            # has gone missing rather than moved.
+            assert any(x.get("role") == "qkv_a_layernorm" for x in k["nodes"]), (
+                f"{d.name}/{k['id']}: the fused latent norm is absent, so the folded "
+                f"k-norm traffic is unaccounted for")
+            checked += 1
+    assert checked, (
+        "no model in the catalog fuses its index norm, so this test guards nothing")
+
+
 def test_only_glm5next_recomputes_the_fp32_head_gate():
     """The FP32 head-gate matmul is one architecture's, not every indexer's.
 
@@ -607,10 +708,19 @@ def test_the_indexer_norm_prices_activation_width_not_the_accumulation_dtype():
     glm5next's _fused_indexer_k_norm is `F.layer_norm(x.float(), ...).type_as(x)`
     (common/attention.py:55-59), and x is the BF16 output of the unquantized
     wk_weights_proj. Sizing the traffic from fp32 would double it."""
+    # Only the families that launch the k-norm SEPARATELY have a node to check.
+    # deepseek_v32 folds it into fused_norm_rope with the two latent norms
+    # (attention.py:378-392), so its graphs carry none by design -- asserted by
+    # test_a_fused_index_norm_is_not_also_priced_as_its_own_node.
+    FUSES_INDEX_NORM = {"GlmMoeDsaForCausalLM"}
     checked = 0
     for d in model_dirs():
         t = text_config(config_of(d))
         if not (t.get("index_topk") and t.get("index_n_heads")):
+            continue
+        arches = (list(config_of(d).get("architectures") or ())
+                  + list(t.get("architectures") or ()))
+        if any(a in FUSES_INDEX_NORM for a in arches):
             continue
         dim = int(t["index_head_dim"])
         for k in graph_of(d)["layer_kinds"]:
@@ -623,7 +733,9 @@ def test_the_indexer_norm_prices_activation_width_not_the_accumulation_dtype():
                 f"{n.get('bytes_per_token')} B/token; a BF16 read and write over "
                 f"{dim} is {2 * dim * 2}")
             checked += 1
-    assert checked, "no indexer norm in the catalog to check"
+    if not checked:
+        pytest.skip("every indexed model in the catalog fuses its k-norm, so there is "
+                    "no separately-launched one to size")
 
 
 def kpool_models() -> list[Path]:

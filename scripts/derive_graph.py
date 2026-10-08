@@ -778,7 +778,15 @@ def chain(nodes: list[dict[str, Any]]) -> list[list[int]]:
 MLA_LAYOUTS = {
     "DeepseekV2ForCausalLM": {"fused_a": True, "fused_norm": False},
     "DeepseekV3ForCausalLM": {"fused_a": True, "fused_norm": False},
-    "GlmMoeDsaForCausalLM": {"fused_a": True, "fused_norm": True},
+    # fused_index_norm: deepseek_v32 calls fused_norm_rope ONCE per layer,
+    # unconditionally on the shared code path, passing the q norm, the kv norm, the rope
+    # cache AND the indexer's k-norm weight/bias/eps into that single launch
+    # (deepseek_v32/attention.py:378-392). glm5next does not: it fuses the two latent
+    # norms (fuse_qkv_rmsnorm=True, glm5next/common/attention.py:604) and runs
+    # _fused_indexer_k_norm as its own call (:352). So this family launches one norm
+    # kernel where glm5next launches two.
+    "GlmMoeDsaForCausalLM": {"fused_a": True, "fused_norm": True,
+                             "fused_index_norm": True},
     "DeepseekV4ForCausalLM": {"fused_a": True, "fused_norm": True},
     "KimiK3ForConditionalGeneration": {"fused_a": True, "fused_norm": True},
     # kimi-k3's text_config names KimiLinearForCausalLM while the outer config names
@@ -843,14 +851,18 @@ def mla_layout(raw: dict[str, Any], cfg: dict[str, Any]) -> dict[str, bool]:
     # DeepseekV3ForCausalLM inside, and there the INNER one is the text decoder vLLM
     # actually instantiates -- so both views are consulted and an entry for either
     # spelling resolves the same way.
+    #
+    # Every flag defaults off against the base shape, so an entry states only what it
+    # differs in and a new flag cannot silently change a family that never declared it.
+    base = {"fused_a": True, "fused_norm": False, "fused_index_norm": False}
     for arches in (raw.get("architectures"), cfg.get("architectures")):
         for arch in arches or ():
             if arch in MLA_LAYOUTS:
-                return MLA_LAYOUTS[arch]
+                return {**base, **MLA_LAYOUTS[arch]}
     # The DeepseekV2MLAAttention shape, which is what an MLA family does unless it opts
     # into the norm fusion. A latent layer reaching this function already has a latent
     # cache, so the non-MLA class is not the right default for it.
-    return {"fused_a": True, "fused_norm": False}
+    return base
 
 
 def attention_block(cfg: dict[str, Any], model: str, hidden: int, *,
@@ -1170,14 +1182,22 @@ def lightning_indexer(cfg: dict[str, Any], model: str, hidden: int,
         # error than the residency it would record. Representing resident parameter bytes
         # that carry no compute needs a schema primitive the ModelGraph does not have;
         # tracked rather than faked.
-    # The norm reads and writes at the ACTIVATION width. glm5next's
+    # The indexer's k-norm is a node only where it is its OWN launch. deepseek_v32 folds
+    # it into the same fused_norm_rope call as the two latent norms
+    # (deepseek_v32/attention.py:378-392), so emitting it there would charge a
+    # normalisation kernel that family does not launch -- the traffic is already in the
+    # fused latent norm. glm5next runs _fused_indexer_k_norm separately (:352), so it
+    # keeps its node.
+    #
+    # Where it is emitted, it reads and writes at the ACTIVATION width:
     # _fused_indexer_k_norm is `F.layer_norm(x.float(), ...).type_as(x)`
-    # (common/attention.py:55-59): the fp32 cast is a temporary inside the fused kernel,
-    # and x is the BF16 output of the unquantized wk_weights_proj. Sizing this from the
-    # accumulation dtype would double its HBM traffic.
-    projections.append(dict(norm("index_k_norm"),
-                            bytes_per_token=2 * index_dim
-                            * DTYPE_WIDTHS[base_dtype(cfg, raw, model)]))
+    # (glm5next/common/attention.py:55-59), so the fp32 cast is a temporary inside the
+    # fused kernel and x is the bf16 output of the unquantized wk_weights_proj. Sizing
+    # this from the accumulation dtype would double its HBM traffic.
+    if not mla_layout(raw or {}, cfg).get("fused_index_norm"):
+        projections.append(dict(norm("index_k_norm"),
+                                bytes_per_token=2 * index_dim
+                                * DTYPE_WIDTHS[base_dtype(cfg, raw, model)]))
 
     scorer = {
         "op": "Attention",
@@ -2220,7 +2240,15 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
 # rather than a config field, so it is recorded here per family rather than guessed
 # from the model name.
 SPEC_METHODS = {
-    "GlmMoeDsaForCausalLM": "glm4_moe_mtp",
+    # glm_moe_dsa is rewritten to deepseek_mtp, NOT to glm4_moe_mtp. vLLM lists it
+    # alongside deepseek_v3 and deepseek_v32 in one branch -- `if hf_config.model_type in
+    # ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"): hf_config.model_type =
+    # "deepseek_mtp"` (config/speculative.py:678-685) -- and all four committed GLM DSA
+    # configs declare model_type glm_moe_dsa. glm4_moe_mtp is set on a different branch
+    # (:780) for a different family, so naming it here priced the wrong draft method.
+    # The comment below already stated the correct mapping while this entry contradicted
+    # it, which is how the error survived.
+    "GlmMoeDsaForCausalLM": "deepseek_mtp",
     "KimiK3ForConditionalGeneration": "kimi_k3_mtp",
     "NemotronHForCausalLM": "nemotron_h_mtp",
     "InklingForConditionalGeneration": "inkling_mtp",
