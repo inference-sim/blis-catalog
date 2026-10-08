@@ -232,6 +232,7 @@ layer_kinds:
     role: qkv_a_proj
     n: 2048
     k: 4096
+    weight_dtype: bf16
   - &id013
     op: Elementwise
     role: qkv_a_layernorm
@@ -241,6 +242,7 @@ layer_kinds:
     role: q_b_proj
     n: 16384
     k: 1536
+    weight_dtype: bf16
   - &id015
     op: GEMM
     role: kv_b_proj
@@ -301,6 +303,7 @@ layer_kinds:
     role: o_proj
     n: 4096
     k: 16384
+    weight_dtype: bf16
   - &id025
     op: AllReduce
     role: attn_out

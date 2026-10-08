@@ -2788,62 +2788,77 @@ def test_glm5_3_flash_prices_unquantized_tensors_at_the_base_width():
                 assert n.get("weight_dtype") == "bf16", (
                     "the indexer projection is priced fp8; every indexer tensor is BF16")
 
-    # The other side of the same list: what it does NOT exclude keeps the global width.
+    # The other side of the same list: a tensor the quantizer really did convert, and
+    # that no loader converts back, keeps the global width. The routed experts are the
+    # case -- they are neither in modules_to_not_convert nor in the loader's dequant map,
+    # so they are fp8 in the checkpoint AND fp8 in HBM.
+    #
+    # The MLA projections are deliberately NOT in this list: they are stored fp8 and
+    # dequantized on load, which
+    # test_loader_dequantized_projections_carry_their_resident_bf16_width covers.
     for k in kinds.values():
         for n in k["nodes"]:
-            if n.get("role") in ("experts", "qkv_proj", "o_proj"):
+            if n.get("role") == "experts":
                 assert "weight_dtype" not in n, (
-                    f"{n['role']!r} carries an override; the checkpoint stores it fp8 "
-                    f"and it should take the global width")
+                    "the routed experts carry an override; the checkpoint quantizes "
+                    "them and no loader path converts them back, so they take the "
+                    "global fp8 width")
 
     lm_head = next(n for n in g["head"] if n.get("role") == "lm_head")
     assert lm_head.get("weight_dtype") == "bf16", (
         "lm_head is priced fp8; the config excludes it and the header is BF16")
 
 
-def test_a_scaled_fp8_tensor_keeps_the_fp8_width_whatever_the_module_declares():
-    """A weight shipped FP8 WITH a scale is quantized, and must be priced at one byte.
+def test_loader_dequantized_projections_carry_their_resident_bf16_width():
+    """A projection this model's loader dequantizes on load is resident at BF16.
 
-    glm5next builds its MLA module `quant_config=None` with the comment "MLA projections
-    are BF16 in checkpoint" (common/model.py:394). For the pinned revision that comment
-    does not hold: q_a_proj, q_b_proj, kv_a_proj_with_mqa and o_proj are all F8_E4M3 and
-    each ships a matching `weight_scale_inv`, which is the unambiguous marker of a real
-    quantized weight -- 17 FP8 tensors in the layers inspected, 17 scales, one-to-one.
-    Only kv_b_proj is genuinely BF16, with no scale, and it alone carries the override.
+    The checkpoint ships q_a_proj, kv_a_proj_with_mqa, q_b_proj and o_proj as block-FP8,
+    each with a weight_scale_inv. That is NOT the end of the story: glm5next's
+    load_weights routes every weight and scale through _try_load_fp8_attn_proj before the
+    normal loader (common/model.py:876-913), whose map covers exactly those four
+    (:1369-1374). Once both pieces arrive it calls _dequant_fp8_block, produces BF16, and
+    loads that into the unquantized parameter (:1415-1441). Its docstring states the
+    intent outright: "Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on
+    load ... the model holds them in BF16".
 
-    So the per-tensor split the exclusion list produces must be preserved rather than
-    flattened to the module's declaration. Marking the scaled tensors bf16 would DOUBLE
-    their priced weight bytes against tensors the checkpoint stores at one byte.
+    So the resident width is BF16 and the stored width is FP8, and the graph prices what
+    is resident -- the same rule the mHC matrices follow, where vLLM allocates fp32 over
+    a bf16 checkpoint. An earlier revision of this file asserted the opposite on the
+    grounds that an absent quant_config "cannot dequantize a tensor whose scales it never
+    reads"; that was wrong, because this loader reads them explicitly.
 
-    The rule this pins: the checkpoint is authoritative for stored bytes, and a module
-    declaration can only override it where the runtime demonstrably re-materializes the
-    tensor at another width -- as the mHC matrices do, being allocated and asserted fp32.
-    An absent quant_config cannot dequantize a tensor whose scales it never reads."""
+    q_a and kv_a both feed the fused A-projection, so the graph's single qkv_a_proj node
+    takes BF16 when either is dequantized -- here both are."""
     d = ROOT / "models" / "glm-5.3-flash"
     if not d.is_dir():
         pytest.skip("glm-5.3-flash is not in the catalog")
-    g, t = graph_of(d), text_config(config_of(d))
+    g = graph_of(d)
     glob = g["global"]["weight_dtype"]
-    assert glob == "fp8", (
-        f"the global width is {glob!r}; this test is about tensors that correctly take "
-        f"an fp8 global")
+    assert glob != "bf16", (
+        f"the global width is {glob!r}; with a bf16 global these overrides would be "
+        f"unobservable and this test could not tell them from the default")
 
     kinds = {k["id"]: k for k in g["layer_kinds"]}
-    scaled = ("qkv_a_proj", "q_b_proj", "o_proj")
-    checked = 0
+    dequantized = ("qkv_a_proj", "q_b_proj", "o_proj")
+    seen = set()
     for kid, kind in kinds.items():
         for n in kind["nodes"]:
-            if n.get("role") in scaled:
-                assert "weight_dtype" not in n, (
-                    f"{kid}.{n['role']} carries a {n.get('weight_dtype')!r} override; "
-                    f"the checkpoint ships it F8_E4M3 with a weight_scale_inv, so the "
-                    f"fp8 global is the stored width and an override doubles its bytes")
-                checked += 1
-            if n.get("role") == "kv_b_proj":
+            role = n.get("role")
+            if role in dequantized:
                 assert n.get("weight_dtype") == "bf16", (
-                    f"{kid}.kv_b_proj is priced at the global fp8 width; it is the one "
-                    f"latent projection the checkpoint ships BF16, with no scale")
-    assert checked, "no scaled fp8 projection found to check"
+                    f"{kid}.{role} is priced {n.get('weight_dtype') or glob!r}; "
+                    f"_try_load_fp8_attn_proj dequantizes it to BF16 on load, so BF16 is "
+                    f"the width resident in HBM whatever the checkpoint stores")
+                seen.add(role)
+            if role == "kv_b_proj":
+                # The control: BF16 in the checkpoint with no scale, so it needs no
+                # loader conversion and reaches the same width by the other route.
+                assert n.get("weight_dtype") == "bf16", (
+                    f"{kid}.kv_b_proj is priced at the global width; the checkpoint "
+                    f"ships it BF16 with no scale")
+    assert seen == set(dequantized), (
+        f"only {sorted(seen)} of {sorted(dequantized)} were found in the graph, so this "
+        f"test does not cover what it claims")
 
 
 def test_glm5_3_flash_prices_mhc_and_replaces_the_norms_it_fuses():

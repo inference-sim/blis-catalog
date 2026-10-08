@@ -808,6 +808,32 @@ HEAD_UNQUANTIZED = {
 # F8_E4M3, which a single fused qkv_proj could not represent at either width. The
 # indexer's three projections are BF16 too, and vLLM passes quant_config=None for the
 # fused wk_weights_proj outright.
+# Projections a MODEL-SPECIFIC LOADER dequantizes at load time, so the resident
+# parameter is the base width even though the checkpoint ships FP8 with scales.
+#
+# This is a different mechanism from modules_to_not_convert, and the distinction matters:
+# those tensors are never quantized, while these are stored quantized and converted on
+# the way in. glm5next's load_weights routes every weight and scale through
+# _try_load_fp8_attn_proj before the normal loader (common/model.py:876-913), whose map
+# covers q_a_proj, kv_a_proj_with_mqa, q_b_proj and o_proj (:1369-1374). Once both the
+# FP8 weight and its weight_scale_inv have arrived it calls _dequant_fp8_block, produces
+# BF16, and loads that into the unquantized parameter (:1415-1441). Its own docstring
+# states the intent: "Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on
+# load ... the model holds them in BF16".
+#
+# q_a and kv_a both feed the fused A-projection, so the graph's single qkv_a_proj node
+# takes the base width when EITHER is dequantized -- here both are.
+#
+# The guard the loader itself applies is `if target_s in params_dict: return False` --
+# it declines where the model really did keep an FP8 parameter. So the rule is the
+# resident parameter's width, and for this family the loader decides it.
+GLM5_NEXT_LOADER_DEQUANTIZED = (
+    "qkv_a_proj",
+    "q_b_proj",
+    "o_proj",
+)
+
+
 GLM5_NEXT_UNQUANTIZED = {
     "self_attn.q_proj": "kda_q_proj",
     "self_attn.k_proj": "kda_k_proj",
@@ -2486,19 +2512,30 @@ def handler_glm5_next(cfg, raw, model):
     # and every indexer tensor, and the pinned safetensors headers agree.
     unquant = fp8_unquantized_roles(cfg, raw, model, GLM5_NEXT_UNQUANTIZED)
 
+    # Two separate reasons a GEMM here holds base-width parameters, and they are not the
+    # same mechanism. modules_to_not_convert names tensors the quantizer SKIPS, so they
+    # were never quantized. GLM5_NEXT_LOADER_DEQUANTIZED names tensors the checkpoint
+    # ships quantized and this model's own loader converts on the way in. Both end at
+    # the base width in HBM, which is what the graph prices; keeping them distinct is
+    # what keeps each one's evidence checkable.
+    loader_base = base_dtype(cfg, raw, model)
+
     def priced(nodes):
-        """Stamp the base width on the GEMMs this checkpoint does not quantize.
+        """Stamp the base width on the GEMMs whose resident parameters are not quantized.
 
         Only a GEMM or GroupedGEMM may carry a per-node weight_dtype -- a norm holds no
         parameters -- so a role naming anything else would be a mistake here."""
         for n in nodes:
-            width = unquant.get(n.get("role"))
+            role = n.get("role")
+            width = unquant.get(role)
+            if width is None and role in GLM5_NEXT_LOADER_DEQUANTIZED:
+                width = loader_base
             if width is None:
                 continue
             if n["op"] not in ("GEMM", "GroupedGEMM"):
                 raise DeriveError(
-                    f"{model}: role {n['role']!r} is excluded from quantization but is "
-                    f"a {n['op']}, which holds no parameters to width")
+                    f"{model}: role {role!r} holds base-width parameters but is a "
+                    f"{n['op']}, which holds no parameters to width")
             n["weight_dtype"] = width
         return nodes
 
