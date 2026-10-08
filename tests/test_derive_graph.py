@@ -2789,6 +2789,51 @@ def test_glm5_3_flash_prices_unquantized_tensors_at_the_base_width():
         "lm_head is priced fp8; the config excludes it and the header is BF16")
 
 
+def test_a_scaled_fp8_tensor_keeps_the_fp8_width_whatever_the_module_declares():
+    """A weight shipped FP8 WITH a scale is quantized, and must be priced at one byte.
+
+    glm5next builds its MLA module `quant_config=None` with the comment "MLA projections
+    are BF16 in checkpoint" (common/model.py:394). For the pinned revision that comment
+    does not hold: q_a_proj, q_b_proj, kv_a_proj_with_mqa and o_proj are all F8_E4M3 and
+    each ships a matching `weight_scale_inv`, which is the unambiguous marker of a real
+    quantized weight -- 17 FP8 tensors in the layers inspected, 17 scales, one-to-one.
+    Only kv_b_proj is genuinely BF16, with no scale, and it alone carries the override.
+
+    So the per-tensor split the exclusion list produces must be preserved rather than
+    flattened to the module's declaration. Marking the scaled tensors bf16 would DOUBLE
+    their priced weight bytes against tensors the checkpoint stores at one byte.
+
+    The rule this pins: the checkpoint is authoritative for stored bytes, and a module
+    declaration can only override it where the runtime demonstrably re-materializes the
+    tensor at another width -- as the mHC matrices do, being allocated and asserted fp32.
+    An absent quant_config cannot dequantize a tensor whose scales it never reads."""
+    d = ROOT / "models" / "glm-5.3-flash"
+    if not d.is_dir():
+        pytest.skip("glm-5.3-flash is not in the catalog")
+    g, t = graph_of(d), text_config(config_of(d))
+    glob = g["global"]["weight_dtype"]
+    assert glob == "fp8", (
+        f"the global width is {glob!r}; this test is about tensors that correctly take "
+        f"an fp8 global")
+
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    scaled = ("qkv_a_proj", "q_b_proj", "o_proj")
+    checked = 0
+    for kid, kind in kinds.items():
+        for n in kind["nodes"]:
+            if n.get("role") in scaled:
+                assert "weight_dtype" not in n, (
+                    f"{kid}.{n['role']} carries a {n.get('weight_dtype')!r} override; "
+                    f"the checkpoint ships it F8_E4M3 with a weight_scale_inv, so the "
+                    f"fp8 global is the stored width and an override doubles its bytes")
+                checked += 1
+            if n.get("role") == "kv_b_proj":
+                assert n.get("weight_dtype") == "bf16", (
+                    f"{kid}.kv_b_proj is priced at the global fp8 width; it is the one "
+                    f"latent projection the checkpoint ships BF16, with no scale")
+    assert checked, "no scaled fp8 projection found to check"
+
+
 def test_glm5_3_flash_prices_mhc_and_replaces_the_norms_it_fuses():
     """mhc: true adds a mixing projection per side, standing in for the norm it fuses.
 
@@ -2818,8 +2863,16 @@ def test_glm5_3_flash_prices_mhc_and_replaces_the_norms_it_fuses():
             assert (node["n"], node["k"]) == (mix, width), (
                 f"{lid}.{side} is {node['n']}x{node['k']}; hc_mult {n} gives "
                 f"{mix}x{width}")
-            assert node.get("weight_dtype") == "bf16", (
-                f"{lid}.{side} is priced at the global fp8 width; the header is BF16")
+            # FP32, which is the RUNTIME width rather than the stored one. vLLM
+            # allocates both matrices as torch.float32
+            # (glm5next/common/model.py:454-463) and the mixing kernel asserts it
+            # (model_executor/kernels/mhc/torch.py:82), so a load-time upcast must occur.
+            # The checkpoint stores them bf16; pricing that halves the bytes the kernel
+            # reads, across both matrices of every layer.
+            assert node.get("weight_dtype") == "fp32", (
+                f"{lid}.{side} is priced {node.get('weight_dtype')!r}; the mixing kernel "
+                f"asserts fp32 and vLLM allocates the parameter as fp32, so that is the "
+                f"width resident in HBM whatever the checkpoint stores")
         # The mixing nodes must state their traffic. An Elementwise node with no
         # bytes_per_token is derivable from hidden_size, which is the ordinary norm
         # these replaced; nothing in a ModelGraph carries hc_mult, so without the field

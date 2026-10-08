@@ -2345,7 +2345,19 @@ def handler_glm5_next(cfg, raw, model):
     mhc_width = hc_mult * hidden if use_mhc else 0
     # Resolved only when the mixing exists, so a future config in this family that
     # declares no dtype cannot fail here for a width it never uses.
-    mhc_base = base_dtype(cfg, raw, model) if use_mhc else None
+    # The mixing matrices are FP32 AT RUNTIME, whatever the checkpoint stores. vLLM
+    # allocates both as `nn.Parameter(torch.empty(mix_hc, d_model, dtype=torch.float32))`
+    # (glm5next/common/model.py:454-463) and the kernel asserts it --
+    # `assert fn.dtype == torch.float32` (model_executor/kernels/mhc/torch.py:82) -- so
+    # a load-time upcast must occur for the graph to run at all. The pinned checkpoint
+    # stores them BF16, which is why this is an override rather than the base width:
+    # pricing the stored width halves the bytes the kernel actually reads, across both
+    # matrices of all 45 layers.
+    #
+    # This is the one place in this handler where the resident width and the stored width
+    # differ. Everywhere else the checkpoint is authoritative, because an absent
+    # quant_config cannot dequantize a tensor that ships with weight_scale_inv.
+    mhc_weight_dtype = "fp32" if use_mhc else None
     mhc_bytes = mhc_mixing_bytes(cfg, raw, model, hidden, hc_mult) if use_mhc else 0
 
     def mhc(nodes):
@@ -2379,12 +2391,12 @@ def handler_glm5_next(cfg, raw, model):
             role = n.get("role")
             if role == "input_norm":
                 out.append(dict(gemm("hc_attn_fn", mhc_mix, mhc_width),
-                                weight_dtype=mhc_base))
+                                weight_dtype=mhc_weight_dtype))
                 out.append(dict(norm("hc_attn_mix"), bytes_per_token=mhc_bytes))
                 replaced.add(role)
             elif role == "post_attn_norm":
                 out.append(dict(gemm("hc_ffn_fn", mhc_mix, mhc_width),
-                                weight_dtype=mhc_base))
+                                weight_dtype=mhc_weight_dtype))
                 out.append(dict(norm("hc_ffn_mix"), bytes_per_token=mhc_bytes))
                 replaced.add(role)
             else:

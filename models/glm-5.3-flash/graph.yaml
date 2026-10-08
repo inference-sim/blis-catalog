@@ -17,7 +17,7 @@ layer_kinds:
     role: hc_attn_fn
     n: 24
     k: 16384
-    weight_dtype: bf16
+    weight_dtype: fp32
   - op: Elementwise
     role: hc_attn_mix
     bytes_per_token: 114848
@@ -90,7 +90,7 @@ layer_kinds:
     role: hc_ffn_fn
     n: 24
     k: 16384
-    weight_dtype: bf16
+    weight_dtype: fp32
   - op: Elementwise
     role: hc_ffn_mix
     bytes_per_token: 114848
@@ -148,7 +148,7 @@ layer_kinds:
     role: hc_attn_fn
     n: 24
     k: 16384
-    weight_dtype: bf16
+    weight_dtype: fp32
   - op: Elementwise
     role: hc_attn_mix
     bytes_per_token: 114848
@@ -167,7 +167,7 @@ layer_kinds:
     role: hc_ffn_fn
     n: 24
     k: 16384
-    weight_dtype: bf16
+    weight_dtype: fp32
   - op: Elementwise
     role: hc_ffn_mix
     bytes_per_token: 114848
@@ -223,7 +223,7 @@ layer_kinds:
     role: hc_attn_fn
     n: 24
     k: 16384
-    weight_dtype: bf16
+    weight_dtype: fp32
   - op: Elementwise
     role: hc_attn_mix
     bytes_per_token: 114848
@@ -309,7 +309,7 @@ layer_kinds:
     role: hc_ffn_fn
     n: 24
     k: 16384
-    weight_dtype: bf16
+    weight_dtype: fp32
   - op: Elementwise
     role: hc_ffn_mix
     bytes_per_token: 114848
