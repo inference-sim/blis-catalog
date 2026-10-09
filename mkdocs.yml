@@ -1,0 +1,119 @@
+site_name: BLIS Catalog
+site_description: >-
+  The declared facts BLIS simulates with: models, chips, fabrics, workloads and
+  storage tiers, each traceable to the source it was written down from.
+site_url: https://inference-sim.github.io/blis-catalog/
+repo_url: https://github.com/inference-sim/blis-catalog
+repo_name: inference-sim/blis-catalog
+edit_uri: ""
+
+# One page per model is generated under reference/models/ and reached from the table
+# on its index page; listing all of them in the sidebar would bury the other pages.
+not_in_nav: |
+  /reference/models/*.md
+
+# The reference pages are generated from these, so `mkdocs serve` rebuilds when they change.
+watch:
+  - scripts/docs
+  - models
+  - hardware
+  - networks
+  - workloads
+  - devices
+
+copyright: Apache License 2.0
+
+# The reference pages are generated from the catalog data at build time; see the
+# module docstring of the hook for how.
+hooks:
+  - scripts/docs/catalog_pages.py
+
+theme:
+  name: material
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.footer
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+
+extra:
+  version:
+    provider: mike
+    default: latest
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Using:
+      - using/index.md
+      - Point BLIS at the catalog: using/point-blis.md
+      - Releases and pinning: using/releases.md
+      - Experiment with a scratch clone: using/scratch-clone.md
+  - Contributing:
+      - contributing/index.md
+      - Add a model: contributing/add-model.md
+      - Add a chip, fabric or storage tier: contributing/add-hardware.md
+      - Add a workload: contributing/add-workload.md
+      - Checks and CI: contributing/checks.md
+      - Releasing and the docs site: contributing/releasing.md
+  - Concepts:
+      - concepts/index.md
+      - The catalog in BLIS: concepts/repositories.md
+      - Declared, learned, chosen: concepts/declared-facts.md
+      - Model graphs: concepts/model-graphs.md
+      - Glossary: concepts/glossary.md
+  - Reference:
+      - reference/index.md
+      - File formats: reference/formats.md
+      - Models: reference/models/index.md
+      - Chips: reference/hardware.md
+      - Fabrics: reference/networks.md
+      - Workloads: reference/workloads.md
+      - Storage tiers: reference/storage.md

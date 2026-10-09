@@ -1,0 +1,163 @@
+name: docs
+
+# Builds the documentation site on every pull request and publishes it to the gh-pages
+# branch with mike: docs version `dev` from main, and docs version MAJOR.MINOR from each
+# full release. The reference pages are generated from the catalog data in the commit
+# being built (scripts/docs/catalog_pages.py), so a release's documentation describes
+# exactly that release's files. docs/contributing/releasing.md describes the scheme.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  release:
+    # `released` fires when a full release is published and when a pre-release is
+    # promoted to one, never for a pre-release, so no pre-release is published.
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to rebuild, for example 0.2.1"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # Material prints a banner about MkDocs 2.0 on every run; the build pins MkDocs 1.6.1
+  # (requirements-docs.txt), so the banner only hides real warnings in the log.
+  NO_MKDOCS_2_WARNING: "1"
+
+jobs:
+  build:
+    name: build the site
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install docs dependencies
+        run: pip install -r requirements-docs.txt -r requirements-dev.txt
+      - name: Test the page generator
+        run: python3 -m pytest tests/test_docs_pages.py -q
+      - name: Build (strict)
+        # --strict turns every warning, including a broken link, into a failure; an
+        # unknown [[catalog.NAME]] placeholder fails the build regardless.
+        run: mkdocs build --strict
+
+  deploy-dev:
+    name: publish dev
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # A newer merge supersedes a pending dev deploy, which is the behavior wanted.
+    concurrency:
+      group: docs-dev
+      cancel-in-progress: false
+    env:
+      # Empty means `main`, even when main's head is also a release tag.
+      CATALOG_RELEASE: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install docs dependencies
+        run: pip install -r requirements-docs.txt
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Deploy dev
+        run: bash scripts/docs/mike-push.sh deploy --title "dev (main)" dev
+
+  deploy-release:
+    name: publish the release
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Its own group, so a merge to main can never cancel a pending release deploy.
+    # The two deploys may then push to gh-pages at once; mike-push.sh retries a push
+    # that loses that race.
+    concurrency:
+      group: docs-release
+      cancel-in-progress: false
+    env:
+      # Read through the environment, never interpolated into a script, so a tag name
+      # cannot inject shell.
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check the tag
+        run: |
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag '$TAG' is not MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          prerelease=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)
+          if [[ "$prerelease" != false ]]; then
+            echo "::error::'$TAG' is not a published full release"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+      - name: Decide the docs version
+        id: version
+        run: |
+          if [[ ! -f mkdocs.yml ]]; then
+            echo "::error::tag '$TAG' predates the documentation site; it has no mkdocs.yml"
+            exit 1
+          fi
+          minor="${TAG%.*}"
+          # Judged from published full releases, not raw tags, so a stray or
+          # pre-release tag neither blocks a publish nor takes `latest`.
+          releases=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+                       --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+                     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          newest_on_line=$(grep -E "^${minor//./\\.}\.[0-9]+$" <<<"$releases" | tail -n 1)
+          highest=$(tail -n 1 <<<"$releases")
+          if [[ "$TAG" != "$newest_on_line" ]]; then
+            echo "::error::'$TAG' is older than $newest_on_line; docs version $minor describes the newest patch on its line"
+            exit 1
+          fi
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+          echo "latest=$([[ "$TAG" == "$highest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG as docs version $minor; the highest release is $highest"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install docs dependencies
+        run: pip install -r requirements-docs.txt -r requirements-dev.txt
+      - name: Test and build (strict)
+        env:
+          CATALOG_RELEASE: ${{ env.TAG }}
+        run: |
+          python3 -m pytest tests/test_docs_pages.py -q
+          mkdocs build --strict
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Deploy ${{ steps.version.outputs.minor }}
+        env:
+          CATALOG_RELEASE: ${{ env.TAG }}
+          MINOR: ${{ steps.version.outputs.minor }}
+          LATEST: ${{ steps.version.outputs.latest }}
+        run: |
+          if [[ "$LATEST" == true ]]; then
+            # The highest release takes the `latest` alias, which the site root serves.
+            bash scripts/docs/mike-push.sh deploy --update-aliases --title "$MINOR ($TAG)" "$MINOR" latest
+            bash scripts/docs/mike-push.sh set-default latest
+          else
+            # A patch on an older line updates that line and leaves `latest` alone.
+            bash scripts/docs/mike-push.sh deploy --title "$MINOR ($TAG)" "$MINOR"
+          fi
