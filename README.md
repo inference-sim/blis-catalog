@@ -9,6 +9,10 @@ prefill/decode estimates, measured fabric-overhead corrections, PD-transfer
 estimates) live in `blis-registry`; deployment choices (GPU type,
 tensor-parallel degree) are stated on the command line, not here.
 
+**Documentation:** <https://inference-sim.github.io/blis-catalog/>: how to use the
+catalog, how to add to it, why it is shaped the way it is, and a reference generated from
+the data in each release.
+
 This is the **data half** of the North Star architecture, toward the goal *a
 model runs if and only if it is in the catalog* (invariant NS-6). This repository
 provides the catalog contents; `inference-sim` reads it via `--catalog` /

@@ -1,0 +1,9 @@
+# Documentation build (mkdocs.yml, scripts/docs/catalog_pages.py). Pinned exactly so
+# a docs build is reproducible and a theme upgrade is a deliberate one-line change.
+# mkdocs itself is pinned because Material for MkDocs does not support MkDocs 2.
+# Nothing here is needed to read or validate the catalog.
+mkdocs==1.6.1
+mkdocs-material==9.7.3
+pymdown-extensions==12.1
+mike==2.1.3
+PyYAML==6.0.3

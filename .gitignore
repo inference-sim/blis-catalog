@@ -28,3 +28,7 @@ Thumbs.db
 /.pytest_cache/
 /.venv/
 /node_modules/
+
+# Documentation build output and the docs hook's cache, anchored like the rest.
+/site/
+/scripts/docs/__pycache__/
