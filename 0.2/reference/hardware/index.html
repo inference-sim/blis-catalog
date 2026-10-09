@@ -1,0 +1,1664 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="The declared facts BLIS simulates with: models, chips, fabrics, workloads and storage tiers, each traceable to the source it was written down from.">
+      
+      
+      
+        <link rel="canonical" href="https://inference-sim.github.io/blis-catalog/0.2/reference/hardware/">
+      
+      
+        <link rel="prev" href="../models/">
+      
+      
+        <link rel="next" href="../networks/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.3">
+    
+    
+      
+        <title>Chips - BLIS Catalog</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CJetBrains+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#chips" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="BLIS Catalog" class="md-header__button md-logo" aria-label="BLIS Catalog" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            BLIS Catalog
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Chips
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/inference-sim/blis-catalog" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    inference-sim/blis-catalog
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../using/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Using
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+                
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="BLIS Catalog" class="md-nav__button md-logo" aria-label="BLIS Catalog" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    BLIS Catalog
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/inference-sim/blis-catalog" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    inference-sim/blis-catalog
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../using/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Using
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../using/point-blis/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Point BLIS at the catalog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../using/releases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Releases and pinning
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../using/scratch-clone/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Experiment with a scratch clone
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/add-model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Add a model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/add-hardware/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Add a chip, fabric or storage tier
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/add-workload/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Add a workload
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/checks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checks and CI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/releasing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Releasing and the docs site
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/repositories/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The catalog in BLIS
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/declared-facts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Declared, learned, chosen
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/model-graphs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model graphs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/glossary/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Glossary
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../formats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    File formats
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../models/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Models
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Chips
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Chips
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#rack-scale-chips" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rack-scale chips
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sources" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sources
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../networks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fabrics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../workloads/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workloads
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../storage/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Storage tiers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+                
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" hidden>
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#rack-scale-chips" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rack-scale chips
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sources" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sources
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+  
+
+
+
+
+<h1 id="chips">Chips<a class="headerlink" href="#chips" title="Permanent link">&para;</a></h1>
+<p>9 chips. Figures are nominal and per GPU. Most come from vendor datasheets; the others come from published simulator descriptors, vendor APIs or public measurements, and each file's notes say which. See <a href="#sources">Sources</a>. What a chip achieves in practice is a coefficient in <a href="https://github.com/inference-sim/blis-registry">blis-registry</a>.</p>
+<figure>
+<div class="cf-scroll"><svg class="cf-figure" viewBox="0 0 714 258" role="img" aria-label="Peak compute, memory bandwidth, memory capacity and their ratio for each chip" xmlns="http://www.w3.org/2000/svg"><title>Peak compute, memory bandwidth, memory capacity and their ratio for each chip</title><text class="cf-label" x="94" y="49.0" text-anchor="end">gb200-nvl72</text><text class="cf-label" x="94" y="71.0" text-anchor="end">gb300</text><text class="cf-label" x="94" y="93.0" text-anchor="end">b200</text><text class="cf-label" x="94" y="115.0" text-anchor="end">b300</text><text class="cf-label" x="94" y="137.0" text-anchor="end">h100</text><text class="cf-label" x="94" y="159.0" text-anchor="end">h200</text><text class="cf-label" x="94" y="181.0" text-anchor="end">l40s</text><text class="cf-label" x="94" y="203.0" text-anchor="end">a100-80</text><text class="cf-label" x="94" y="225.0" text-anchor="end">a100-sxm</text><text class="cf-title" x="104" y="14">Dense BF16, TFLOP/s</text><line class="cf-grid" x1="104.0" x2="104.0" y1="28" y2="236"/><text class="cf-tick" x="104.0" y="250" text-anchor="middle">0</text><line class="cf-grid" x1="148.0" x2="148.0" y1="28" y2="236"/><text class="cf-tick" x="148.0" y="250" text-anchor="middle">1 000</text><line class="cf-grid" x1="192.0" x2="192.0" y1="28" y2="236"/><text class="cf-tick" x="192.0" y="250" text-anchor="middle">2 000</text><line class="cf-grid" x1="236.0" x2="236.0" y1="28" y2="236"/><text class="cf-tick" x="236.0" y="250" text-anchor="middle">3 000</text><line class="cf-rule" x1="104" x2="236" y1="45.0" y2="45.0"/><circle class="cf-dot" cx="214.0" cy="45.0" r="4"><title>gb200-nvl72: 2 500</title></circle><line class="cf-rule" x1="104" x2="236" y1="67.0" y2="67.0"/><circle class="cf-dot" cx="214.0" cy="67.0" r="4"><title>gb300: 2 500</title></circle><line class="cf-rule" x1="104" x2="236" y1="89.0" y2="89.0"/><circle class="cf-dot" cx="203.0" cy="89.0" r="4"><title>b200: 2 250</title></circle><line class="cf-rule" x1="104" x2="236" y1="111.0" y2="111.0"/><circle class="cf-dot" cx="203.0" cy="111.0" r="4"><title>b300: 2 250</title></circle><line class="cf-rule" x1="104" x2="236" y1="133.0" y2="133.0"/><circle class="cf-dot" cx="147.5" cy="133.0" r="4"><title>h100: 989.5</title></circle><line class="cf-rule" x1="104" x2="236" y1="155.0" y2="155.0"/><circle class="cf-dot" cx="147.5" cy="155.0" r="4"><title>h200: 989.5</title></circle><line class="cf-rule" x1="104" x2="236" y1="177.0" y2="177.0"/><circle class="cf-dot" cx="119.9" cy="177.0" r="4"><title>l40s: 362.05</title></circle><line class="cf-rule" x1="104" x2="236" y1="199.0" y2="199.0"/><circle class="cf-dot" cx="117.7" cy="199.0" r="4"><title>a100-80: 312</title></circle><line class="cf-rule" x1="104" x2="236" y1="221.0" y2="221.0"/><circle class="cf-dot" cx="117.7" cy="221.0" r="4"><title>a100-sxm: 312</title></circle><text class="cf-title" x="258" y="14">HBM bandwidth, TB/s</text><line class="cf-grid" x1="258.0" x2="258.0" y1="28" y2="236"/><text class="cf-tick" x="258.0" y="250" text-anchor="middle">0</text><line class="cf-grid" x1="291.0" x2="291.0" y1="28" y2="236"/><text class="cf-tick" x="291.0" y="250" text-anchor="middle">2</text><line class="cf-grid" x1="324.0" x2="324.0" y1="28" y2="236"/><text class="cf-tick" x="324.0" y="250" text-anchor="middle">4</text><line class="cf-grid" x1="357.0" x2="357.0" y1="28" y2="236"/><text class="cf-tick" x="357.0" y="250" text-anchor="middle">6</text><line class="cf-grid" x1="390.0" x2="390.0" y1="28" y2="236"/><text class="cf-tick" x="390.0" y="250" text-anchor="middle">8</text><line class="cf-rule" x1="258" x2="390" y1="45.0" y2="45.0"/><circle class="cf-dot" cx="390.0" cy="45.0" r="4"><title>gb200-nvl72: 8</title></circle><line class="cf-rule" x1="258" x2="390" y1="67.0" y2="67.0"/><circle class="cf-dot" cx="390.0" cy="67.0" r="4"><title>gb300: 8</title></circle><line class="cf-rule" x1="258" x2="390" y1="89.0" y2="89.0"/><circle class="cf-dot" cx="385.1" cy="89.0" r="4"><title>b200: 7.7</title></circle><line class="cf-rule" x1="258" x2="390" y1="111.0" y2="111.0"/><circle class="cf-dot" cx="385.9" cy="111.0" r="4"><title>b300: 7.75</title></circle><line class="cf-rule" x1="258" x2="390" y1="133.0" y2="133.0"/><circle class="cf-dot" cx="313.3" cy="133.0" r="4"><title>h100: 3.35</title></circle><line class="cf-rule" x1="258" x2="390" y1="155.0" y2="155.0"/><circle class="cf-dot" cx="337.2" cy="155.0" r="4"><title>h200: 4.8</title></circle><line class="cf-rule" x1="258" x2="390" y1="177.0" y2="177.0"/><circle class="cf-dot" cx="272.3" cy="177.0" r="4"><title>l40s: 0.864</title></circle><line class="cf-rule" x1="258" x2="390" y1="199.0" y2="199.0"/><circle class="cf-dot" cx="291.6" cy="199.0" r="4"><title>a100-80: 2.039</title></circle><line class="cf-rule" x1="258" x2="390" y1="221.0" y2="221.0"/><circle class="cf-dot" cx="291.6" cy="221.0" r="4"><title>a100-sxm: 2.039</title></circle><text class="cf-title" x="412" y="14">HBM capacity, GiB</text><line class="cf-grid" x1="412.0" x2="412.0" y1="28" y2="236"/><text class="cf-tick" x="412.0" y="250" text-anchor="middle">0</text><line class="cf-grid" x1="456.0" x2="456.0" y1="28" y2="236"/><text class="cf-tick" x="456.0" y="250" text-anchor="middle">100</text><line class="cf-grid" x1="500.0" x2="500.0" y1="28" y2="236"/><text class="cf-tick" x="500.0" y="250" text-anchor="middle">200</text><line class="cf-grid" x1="544.0" x2="544.0" y1="28" y2="236"/><text class="cf-tick" x="544.0" y="250" text-anchor="middle">300</text><line class="cf-rule" x1="412" x2="544" y1="45.0" y2="45.0"/><circle class="cf-dot" cx="488.2" cy="45.0" r="4"><title>gb200-nvl72: 173.2</title></circle><line class="cf-rule" x1="412" x2="544" y1="67.0" y2="67.0"/><circle class="cf-dot" cx="534.1" cy="67.0" r="4"><title>gb300: 277.5</title></circle><line class="cf-rule" x1="412" x2="544" y1="89.0" y2="89.0"/><circle class="cf-dot" cx="491.2" cy="89.0" r="4"><title>b200: 180</title></circle><line class="cf-rule" x1="412" x2="544" y1="111.0" y2="111.0"/><circle class="cf-dot" cx="530.2" cy="111.0" r="4"><title>b300: 268.6</title></circle><line class="cf-rule" x1="412" x2="544" y1="133.0" y2="133.0"/><circle class="cf-dot" cx="447.2" cy="133.0" r="4"><title>h100: 80</title></circle><line class="cf-rule" x1="412" x2="544" y1="155.0" y2="155.0"/><circle class="cf-dot" cx="474.0" cy="155.0" r="4"><title>h200: 141</title></circle><line class="cf-rule" x1="412" x2="544" y1="177.0" y2="177.0"/><circle class="cf-dot" cx="433.1" cy="177.0" r="4"><title>l40s: 48</title></circle><line class="cf-rule" x1="412" x2="544" y1="199.0" y2="199.0"/><circle class="cf-dot" cx="447.2" cy="199.0" r="4"><title>a100-80: 80</title></circle><line class="cf-rule" x1="412" x2="544" y1="221.0" y2="221.0"/><circle class="cf-dot" cx="447.2" cy="221.0" r="4"><title>a100-sxm: 80</title></circle><text class="cf-title" x="566" y="14">BF16 FLOP per HBM byte</text><line class="cf-grid" x1="566.0" x2="566.0" y1="28" y2="236"/><text class="cf-tick" x="566.0" y="250" text-anchor="middle">0</text><line class="cf-grid" x1="610.0" x2="610.0" y1="28" y2="236"/><text class="cf-tick" x="610.0" y="250" text-anchor="middle">200</text><line class="cf-grid" x1="654.0" x2="654.0" y1="28" y2="236"/><text class="cf-tick" x="654.0" y="250" text-anchor="middle">400</text><line class="cf-grid" x1="698.0" x2="698.0" y1="28" y2="236"/><text class="cf-tick" x="698.0" y="250" text-anchor="middle">600</text><line class="cf-rule" x1="566" x2="698" y1="45.0" y2="45.0"/><circle class="cf-dot" cx="634.8" cy="45.0" r="4"><title>gb200-nvl72: 312.5</title></circle><line class="cf-rule" x1="566" x2="698" y1="67.0" y2="67.0"/><circle class="cf-dot" cx="634.8" cy="67.0" r="4"><title>gb300: 312.5</title></circle><line class="cf-rule" x1="566" x2="698" y1="89.0" y2="89.0"/><circle class="cf-dot" cx="630.3" cy="89.0" r="4"><title>b200: 292.208</title></circle><line class="cf-rule" x1="566" x2="698" y1="111.0" y2="111.0"/><circle class="cf-dot" cx="629.9" cy="111.0" r="4"><title>b300: 290.323</title></circle><line class="cf-rule" x1="566" x2="698" y1="133.0" y2="133.0"/><circle class="cf-dot" cx="631.0" cy="133.0" r="4"><title>h100: 295.373</title></circle><line class="cf-rule" x1="566" x2="698" y1="155.0" y2="155.0"/><circle class="cf-dot" cx="611.4" cy="155.0" r="4"><title>h200: 206.146</title></circle><line class="cf-rule" x1="566" x2="698" y1="177.0" y2="177.0"/><circle class="cf-dot" cx="658.2" cy="177.0" r="4"><title>l40s: 419.039</title></circle><line class="cf-rule" x1="566" x2="698" y1="199.0" y2="199.0"/><circle class="cf-dot" cx="599.7" cy="199.0" r="4"><title>a100-80: 153.016</title></circle><line class="cf-rule" x1="566" x2="698" y1="221.0" y2="221.0"/><circle class="cf-dot" cx="599.7" cy="221.0" r="4"><title>a100-sxm: 153.016</title></circle></svg></div>
+<figcaption>Chips ordered by dense BF16 peak. Each panel has its own scale, starting at zero. The last panel divides the first by the second: how many BF16 operations a chip can perform per byte it reads from HBM. GPU code that performs fewer operations per byte than this is limited by memory bandwidth rather than by compute. The ratio is computed for this figure; it is not a catalog field.</figcaption>
+</figure>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Chip</th>
+<th style="text-align: right;">BF16</th>
+<th style="text-align: right;">FP8</th>
+<th style="text-align: right;">NVFP4</th>
+<th style="text-align: right;">HBM TB/s</th>
+<th style="text-align: right;">HBM GiB</th>
+<th style="text-align: right;">Intra-node GB/s</th>
+<th style="text-align: right;">SMs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>gb200-nvl72</code></td>
+<td style="text-align: right;">2 500</td>
+<td style="text-align: right;">5 000</td>
+<td style="text-align: right;">10 000</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">173.2</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">148</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>gb300</code></td>
+<td style="text-align: right;">2 500</td>
+<td style="text-align: right;">5 000</td>
+<td style="text-align: right;">15 000</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">277.5</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">152</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>b200</code></td>
+<td style="text-align: right;">2 250</td>
+<td style="text-align: right;">4 500</td>
+<td style="text-align: right;">9 000</td>
+<td style="text-align: right;">7.7</td>
+<td style="text-align: right;">180</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">148</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>b300</code></td>
+<td style="text-align: right;">2 250</td>
+<td style="text-align: right;">4 500</td>
+<td style="text-align: right;">14 000</td>
+<td style="text-align: right;">7.75</td>
+<td style="text-align: right;">268.6</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">148</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>h100</code></td>
+<td style="text-align: right;">989.5</td>
+<td style="text-align: right;">1 979</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">3.35</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">450</td>
+<td style="text-align: right;">132</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>h200</code></td>
+<td style="text-align: right;">989.5</td>
+<td style="text-align: right;">1 979</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">4.8</td>
+<td style="text-align: right;">141</td>
+<td style="text-align: right;">450</td>
+<td style="text-align: right;">132</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>l40s</code></td>
+<td style="text-align: right;">362.05</td>
+<td style="text-align: right;">733</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">0.864</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">142</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>a100-80</code></td>
+<td style="text-align: right;">312</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">2.039</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">300</td>
+<td style="text-align: right;">108</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>a100-sxm</code></td>
+<td style="text-align: right;">312</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">2.039</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">300</td>
+<td style="text-align: right;">108</td>
+</tr>
+</tbody>
+</table>
+<p>Peak rates are dense, in TFLOP/s. A dash means the chip has no native support for the format. Intra-node bandwidth is NVLink where present, per GPU and per direction. <code>a100-80</code> is an alias of <code>a100-sxm</code>, kept because inference-sim and some blis-registry scopes name the A100 that way.</p>
+<h2 id="rack-scale-chips">Rack-scale chips<a class="headerlink" href="#rack-scale-chips" title="Permanent link">&para;</a></h2>
+<p>On these chips an NVLink domain spans a rack of several nodes, so a third tier sits between the node and the inter-node fabric. Traffic that leaves the rack uses the fabric the scenario names.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Chip</th>
+<th style="text-align: right;">GPUs per node</th>
+<th style="text-align: right;">GPUs per rack</th>
+<th style="text-align: right;">Intra-node GB/s</th>
+<th style="text-align: right;">Intra-rack GB/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>gb200-nvl72</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">72</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">900</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>gb300</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">72</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">900</td>
+</tr>
+</tbody>
+</table>
+<h2 id="sources">Sources<a class="headerlink" href="#sources" title="Permanent link">&para;</a></h2>
+<p>Each file records the source of its figures, and any conversion applied to them, in its <code>_comment</code> keys. They are reproduced here as written, including where a figure is not a datasheet figure.</p>
+<details class="quote"><summary>a100-80: provenance notes</summary><p><code>_comment</code> Alias for A100-SXM — defaults.yaml uses A100-80 for all A100 model entries (BC-14).</p><p><code>_comment_interconnect</code> IntraNodeBwGBps is the on-package NVLink 3 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s (alias of A100-SXM; same interconnect). vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/roce-200g.yaml), paired with this chip per deployment (a cluster/pool concept, #1662).</p><p><code>_comment_sm</code> SMCount is the count of enabled Streaming Multiprocessors on the GA100 die as shipped in this part, from the NVIDIA datasheet (<a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf">https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf</a>). A100 enables 108 of the GA100 die&#x27;s 128 SMs. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 9.09% at 132 SMs and 11.11% at 108.</p></details>
+
+<details class="quote"><summary>a100-sxm: provenance notes</summary><p><code>_comment_interconnect</code> IntraNodeBwGBps is the on-package NVLink 3 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s: 600 GB/s bidirectional datasheet spec =&gt; 300 unidirectional per GPU. vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/roce-200g.yaml), paired with this chip per deployment (a cluster/pool concept, #1662).</p><p><code>_comment_sm</code> SMCount is the count of enabled Streaming Multiprocessors on the GA100 die as shipped in this part, from the NVIDIA datasheet (<a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf">https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf</a>). A100 enables 108 of the GA100 die&#x27;s 128 SMs. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 9.09% at 132 SMs and 11.11% at 108.</p></details>
+
+<details class="quote"><summary>b200: provenance notes</summary><p><code>_comment</code> B200 SXM. Peak FLOPs, HBM capacity and HBM bandwidth are the figures NVIDIA ships in AISimulate&#x27;s own system descriptor (systems/b200_sxm.yaml), which is the same source the h200 and gb200 entries cite: dense BF16 2250 TFLOPS, dense FP8 4500 TFLOPS, dense FP4 9000 TFLOPS, 7.7 TB/s HBM3e. FP4 has native Tensor-Core support on this part, where on Hopper it is a bandwidth saving only. CAVEAT (memory unit): the descriptor states mem_capacity as 193273528320 bytes, which is exactly 180 GiB, so this entry records the GiB reading the source itself uses rather than converting.</p><p><code>_comment_interconnect</code> IntraNodeBwGBps is the NVLink 5 per-GPU unidirectional figure, 900 GB/s (1800 GB/s bidirectional per GPU / 2). A node&#x27;s GPU count is a property of the deployment rather than of this part, so it comes from the scenario&#x27;s cluster block; the common chassis is the 8-GPU HGX B200 baseboard. Unlike GB200 this part carries no rack tier: its NVLink domain is the baseboard, so crossing a node boundary is a bandwidth change and the fabric governs (networks/roce-200g.yaml at 50 GB/s per GPU is the descriptor&#x27;s reference, CX7 400GbE RoCEv2). No GPUsPerRack or IntraRackBwGBps is stated here because there is no rack-wide NVLink domain to describe.</p><p><code>_comment_sm</code> SMCount is the count of ENABLED Streaming Multiprocessors on the two GB100 dies this part carries. 148, from NVIDIA&#x27;s own Hot Chips 2024 Blackwell disclosure: each die physically contains 80 SMs and enables 74, giving 148 across the GPU (<a href="https://chipsandcheese.com/p/nvidias-b200-keeping-the-cuda-juggernaut">https://chipsandcheese.com/p/nvidias-b200-keeping-the-cuda-juggernaut</a>, reporting that presentation&#x27;s specifications table). NOT a datasheet figure the way the Hopper and Ada entries&#x27; counts are: NVIDIA&#x27;s B200 datasheet publishes no SM count, and the AISimulate descriptor this entry cites for FLOPs and HBM (systems/b200_sxm.yaml) states none either, so this is the most authoritative public source rather than a vendor spec sheet. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 8.11% at 148 SMs.</p></details>
+
+<details class="quote"><summary>b300: provenance notes</summary><p><code>_comment</code> B300 SXM (Blackwell Ultra). Peak FLOPs, HBM capacity and HBM bandwidth are the figures NVIDIA ships in AISimulate&#x27;s own system descriptor (systems/b300_sxm.yaml): dense BF16 2250 TFLOPS, dense FP8 4500 TFLOPS, dense FP4 14000 TFLOPS, 7.75 TB/s HBM3e, and a capacity the descriptor records as what nvidia-smi reports rather than as a datasheet figure. Two things distinguish this part from B200 and both are recorded because a cost model reads them: dense FP4 is 14000 TFLOPS against B200&#x27;s 9000, a 1.56x step with no change to the BF16 or FP8 rates; and the descriptor&#x27;s int8_tc_flops is 153.5 TFLOPS, three orders of magnitude below its FP8 figure. That INT8 value is transcribed by the source from a sparse TOPS number and is not consistent with the rest of the row, so this entry omits an INT8 field rather than carry a figure its own source contradicts.</p><p><code>_comment_interconnect</code> IntraNodeBwGBps is the NVLink 5 per-GPU unidirectional figure, 900 GB/s (1.8 TB/s bidirectional / 2), the same as B200. The inter-node fabric differs: the descriptor states 100 GB/s per GPU for a 1:1 CX8 XDR 800 Gb/s configuration, double B200&#x27;s CX7, so a cross-node collective on this part pays half the penalty. That fabric figure lives with the reusable fabric class rather than here; no catalog fabric matches 100 GB/s per GPU yet, so a B300 multi-node scenario has no fabric to name. Single-node B300 scenarios are unaffected. Like B200 and unlike GB200 there is no rack-wide NVLink domain, so no rack tier is stated.</p><p><code>_comment_sm</code> SMCount is the count of ENABLED Streaming Multiprocessors, recorded as 148 for consistency with B200. CAVEAT (provenance is weaker here than on any other chip in this directory, and this figure is the one to challenge first if a B300 prediction is off): NVIDIA&#x27;s Blackwell Ultra architecture blog states 160 SMs across the two dies in the full GPU implementation, and footnotes that available SM count and HBM capacity varies by SKU (<a href="https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era">https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era</a>). It publishes no enabled count for the SXM SKU this entry describes, the AISimulate descriptor cited above for FLOPs and HBM (systems/b300_sxm.yaml) states none, and no NVIDIA datasheet gives one. So 148 is carried over from B200 by die-sharing INFERENCE, not cited: the true value lies between 148 and 160, and if it is 160 this entry understates the per-SM FLOPs share by 8%. Recorded rather than omitted because the cost model needs a number and B200&#x27;s is the better-attested of the two candidates; it will be corrected when NVIDIA publishes a per-SKU count. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 8.11% at 148 SMs.</p></details>
+
+<details class="quote"><summary>gb200-nvl72: provenance notes</summary><p><code>_comment</code> GB200 in the NVL72 rack configuration. Peak FLOPs, HBM capacity and HBM bandwidth are the InferenceX /api/v1/views/gpu-specs figures for gb200 — the same source as every other chip here (calibration companion §5.2): dense BF16 2500 TFLOPS, dense FP8 5000 TFLOPS, dense FP4 10000 TFLOPS, 186 GB HBM3e at 8 TB/s. Two structural differences from Hopper carry over regardless of the numbers: FP4 has native Tensor-Core support here where on Hopper fp4Tflops is null, confirming FP4 is a bandwidth saving only on that part; and the CPU link is NVLink-C2C rather than PCIe, which changes the offload arithmetic. CAVEAT (memory unit): 186 GB is read here as decimal GB (173.2 GiB), where the H200 entry reads NVIDIA&#x27;s advertised &#x27;141GB&#x27; as GiB. The two entries therefore apply different readings of the same kind of figure, because each follows its own source&#x27;s units; the readings differ by 7.4% and the choice is not free of consequence for capacity planning.</p><p><code>_comment_interconnect</code> This part is the reason the topology needs three tiers rather than two. IntraNodeBwGBps is the NVLink 5 per-GPU published figure, 900 GB/s. A node here is one Grace-Blackwell tray — two Grace CPUs with two GPUs each — so GPUsPerNode is 4, not 8. IntraRackBwGBps is ALSO 900: the NVLink 5 switch fabric spans all 72 GPUs in the rack at full per-GPU bandwidth, so crossing a tray boundary inside the rack is not a bandwidth change at all. Only the rack boundary is, and it is an 18x step down to InfiniBand (networks/ib-400g.yaml, 50 GB/s nominal). A model keyed on tp &gt; GPUsPerNode alone would wrongly derate this part: the condition is the link, not the chassis count. That 18x step at the rack boundary is what makes EP up to 72 viable within one rack, since at EP=72 no expert traffic leaves it. AISimulate&#x27;s gb200 descriptor states the same three tiers, and adds inter_rack_latency: 5 µs — a rack-boundary latency figure the catalog has no field for, so it lives in blis-registry with the other floors.</p><p><code>_comment_sm</code> SMCount is the count of ENABLED Streaming Multiprocessors per GPU, 148: GB200 carries the same two GB100 dies as B200 at the same 74-of-80 enabled count, from NVIDIA&#x27;s Hot Chips 2024 Blackwell disclosure (<a href="https://chipsandcheese.com/p/nvidias-b200-keeping-the-cuda-juggernaut">https://chipsandcheese.com/p/nvidias-b200-keeping-the-cuda-juggernaut</a>, reporting that presentation&#x27;s specifications table). This is a PER-GPU figure, not a per-rack one — the 72 GPUs of the NVL72 domain give the rack 10,656 SMs, but the cost model reads this field per device. NOT a datasheet figure the way the Hopper and Ada entries&#x27; counts are: the InferenceX /api/v1/views/gpu-specs record cited above supplies this part&#x27;s FLOPs and HBM but carries no SM count, and no NVIDIA datasheet publishes one, so this is the most authoritative public source rather than a vendor spec sheet. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 8.11% at 148 SMs.</p></details>
+
+<details class="quote"><summary>gb300: provenance notes</summary><p><code>_comment</code> GB300 (Grace-Blackwell Ultra) in its rack-scale configuration. Peak FLOPs, HBM capacity and HBM bandwidth are the figures NVIDIA ships in AISimulate&#x27;s own system descriptor (systems/gb300.yaml, citing <a href="https://resources.nvidia.com/en-us-blackwell-architecture/blackwell-ultra-datasheet">https://resources.nvidia.com/en-us-blackwell-architecture/blackwell-ultra-datasheet</a>): dense BF16 2500 TFLOPS, dense FP8 5000 TFLOPS, dense FP4 15000 TFLOPS, 8 TB/s HBM3e. This is the same source and the same reading b200, b300 and gb200-nvl72 already cite. Two things place this part between B300 and GB200: it carries the Blackwell Ultra die (dense FP4 15000 TFLOPS, a 1.5x step over GB200&#x27;s 10000 and above even B300&#x27;s 14000) at the higher 2500 TFLOPS BF16 rate of the Grace-Blackwell bin rather than B300 SXM&#x27;s 2250, while keeping GB200&#x27;s rack-scale NVLink domain. Like b300, the descriptor&#x27;s int8_tc_flops is 165 TFLOPS — ~30x below its FP8 figure, a value the source transcribes from a sparse TOPS number and that is not consistent with the rest of the row; this entry omits an INT8 field rather than carry a figure its own source contradicts (the catalog has no INT8 field in any case). CAVEAT (memory unit): the descriptor records mem_capacity as 298013687808 bytes, labelled &#x27;284208MiB reported by nvidia-smi&#x27;. That byte count is exactly 284208 MiB, i.e. 277.5 GiB, so this entry records the GiB reading of the source&#x27;s own figure rather than converting it to decimal GB — the same choice b200 and b300 make, and the opposite of gb200-nvl72, which reads its source&#x27;s advertised decimal GB.</p><p><code>_comment_interconnect</code> Like gb200-nvl72 and unlike B200/B300, this part needs three topology tiers rather than two, and for the same reason. IntraNodeBwGBps is the NVLink 5 per-GPU unidirectional figure, 900 GB/s. A node here is one Grace-Blackwell tray — two Grace CPUs with two GPUs each — so GPUsPerNode is 4, not 8. IntraRackBwGBps is ALSO 900: the descriptor&#x27;s inter_node_bw (NVLink via NVSwitch within the rack) equals its intra_node_bw, so the NVSwitch fabric spans all 72 GPUs in the rack at full per-GPU bandwidth and crossing a tray boundary inside the rack is not a bandwidth change at all. Only the rack boundary is, and it is a step down to InfiniBand: the descriptor&#x27;s inter_rack_bw is 100 GB/s per GPU (CX8 XDR 800 Gb/s), double the gb200-nvl72 rack-boundary reference. That inter-rack fabric is a property of the cluster, not the die, so it lives with the reusable fabric classes rather than here; no catalog fabric matches 100 GB/s per GPU yet, so a GB300 inter-rack scenario has no fabric to name (the same gap B300 notes for its 100 GB/s inter-node fabric). A model keyed on tp &gt; GPUsPerNode alone would wrongly derate this part: the condition is the link, not the chassis count, and the step is at the rack boundary. The descriptor also states inter_rack_latency: 5 µs — a rack-boundary latency figure the catalog has no field for, so it lives in blis-registry with the other floors, as it does for gb200.</p><p><code>_comment_sm</code> SMCount is the count of ENABLED Streaming Multiprocessors per GPU, 152, from direct measurement on GB300 systems. FlashInfer&#x27;s SM103 dispatch-plan tests record measured counts of B200 148, GB300 152 (JHB nodes) and key the sm_103a plan on 152 (<a href="https://github.com/flashinfer-ai/flashinfer/blob/26fe42d91acc1d56bd27560f64e9bf727d623cca/tests/experimental/test_cake_kimi_k3_fp8_projection.py#L65-L68">https://github.com/flashinfer-ai/flashinfer/blob/26fe42d91acc1d56bd27560f64e9bf727d623cca/tests/experimental/test_cake_kimi_k3_fp8_projection.py#L65-L68</a>); sm_103a is this part&#x27;s architecture, matching the AISimulate descriptor&#x27;s sm_version: 103. This is a PER-GPU figure, not a per-rack one — the cost model reads it per device. The measured 152 supersedes a B300 die-sharing inference of 148 that an earlier draft carried: the AISimulate descriptor cited above for FLOPs and HBM states no SM count (only sm_version: 103), NVIDIA&#x27;s Blackwell Ultra architecture blog states 160 SMs across the two dies in the FULL implementation and footnotes that available SM count varies by SKU (<a href="https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era">https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era</a>), and no NVIDIA datasheet publishes an enabled count — so the measured 152 (between B300&#x27;s 148 and the full-die 160) is the best-attested value and is cited rather than inferred. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 7.89% at 152 SMs.</p></details>
+
+<details class="quote"><summary>h100: provenance notes</summary><p><code>_comment_interconnect</code> IntraNodeBwGBps is the on-package NVLink 4 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s: 900 GB/s bidirectional datasheet spec =&gt; 450 unidirectional per GPU. vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/ib-400g.yaml), paired with this chip per deployment (a cluster/pool concept, #1662).</p><p><code>_comment_sm</code> SMCount is the count of enabled Streaming Multiprocessors on the GH100 die as shipped in this part, from the NVIDIA datasheet (<a href="https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet">https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet</a>). H100 SXM5 enables 132 of the GH100 die&#x27;s 144 SMs. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 9.09% at 132 SMs and 11.11% at 108.</p></details>
+
+<details class="quote"><summary>h200: provenance notes</summary><p><code>_comment</code> SXM H200 shares the H100 GH100 Hopper compute die (same SMs/Tensor Cores) =&gt; identical peak FLOPs; differs only in memory: 141 GiB HBM3e vs 80, 4.8 TB/s vs 3.35. FLOPs &amp; bandwidth are the NVIDIA H200 datasheet spec (<a href="https://www.nvidia.com/en-us/data-center/h200/">https://www.nvidia.com/en-us/data-center/h200/</a>; dense BF16 989.5 TFLOPS, dense FP8 1979 TFLOPS). CAVEAT (memory unit): reading NVIDIA&#x27;s advertised &#x27;141GB&#x27; as 141 GiB is a choice; the decimal-GB reading is 131.3 GiB, and that lower value reorders the top two placement topologies in capacity planning — so the GiB interpretation is not free of consequence.</p><p><code>_comment_interconnect</code> IntraNodeBwGBps is the on-package NVLink 4 link as a per-GPU NOMINAL unidirectional bandwidth in GB/s: 900 GB/s bidirectional per GPU (NVIDIA H200 datasheet) =&gt; 450 unidirectional. vendor_spec (bidirectional / 2), NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/ib-400g.yaml), paired with this chip per deployment (a cluster/pool concept, #1662).</p><p><code>_comment_sm</code> SMCount is the count of enabled Streaming Multiprocessors on the GH100 die as shipped in this part, from the NVIDIA datasheet (<a href="https://www.nvidia.com/en-us/data-center/h200/">https://www.nvidia.com/en-us/data-center/h200/</a>). H200 SXM shares the GH100 die and its 132 enabled SMs with H100 SXM5. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 9.09% at 132 SMs and 11.11% at 108.</p></details>
+
+<details class="quote"><summary>l40s: provenance notes</summary><p><code>_comment</code> TFlopsFP8=733 is DENSE FP8, consistent with TFlopsPeak=362.05 being DENSE BF16 (NVIDIA L40S datasheet: FP8 733 dense / 1466 sparse; BF16 362.05 dense / 733 sparse), giving a ~2.0x dense FP8:BF16 ratio (733/362.05=2.02, the datasheet dense pair; H100/H200 are exactly 2.0x). Corrected from the migrated 1466 (the WITH-SPARSITY figure, which mixed sparsity conventions for an architecturally-impossible 4.05x ratio) per blis-catalog#2 / inference-sim#1738.</p><p><code>_comment_interconnect</code> IntraNodeBwGBps is the on-package link as a per-GPU NOMINAL unidirectional bandwidth in GB/s: no NVLink, so peer-to-peer runs over PCIe Gen4 x16 (~32 GB/s per direction, vendor_spec). NOT measured effective throughput; any measured correction is a per-cluster blis-registry number. The inter-node fabric figure and the intra:inter ratio it feeds (#1530) live with the reusable Network fabric class (networks/ethernet-100gbe.yaml), paired with this chip per deployment (a cluster/pool concept, #1662).</p><p><code>_comment_sm</code> SMCount is the count of enabled Streaming Multiprocessors on the AD102 die as shipped in this part, from the NVIDIA datasheet (<a href="https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413">https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413</a>). L40S enables 142 of the AD102 die&#x27;s 144 SMs. The cost model uses SMCount for two things: the per-SM share of peak FLOPs, and the 12-SM derate a Triton-path KV fetch withholds while it overlaps a forward pass (cost model §8.3), which is 8.45% at this part&#x27;s 142 SMs.</p></details>
+
+
+
+
+
+
+
+  
+  
+
+
+
+
+  
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+        
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../models/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Models">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Models
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../networks/" class="md-footer__link md-footer__link--next" aria-label="Next: Fabrics">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Fabrics
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache License 2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.indexes", "navigation.footer", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "latest", "provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
