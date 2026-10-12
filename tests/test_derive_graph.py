@@ -80,6 +80,31 @@ def test_hand_edit_is_detected(tmp_path):
     assert target.name in r.stderr
 
 
+def test_a_failure_names_its_model_once(tmp_path):
+    """Each failure line names the model exactly once (blis-catalog#28).
+
+    A DeriveError carries the model name itself, because derive() is called directly
+    and its message has to stand alone there; main() prefixed it again, printing
+    `qwen9-1t: qwen9-1t: no handler ...`. Both failure classes are covered: a
+    DeriveError, which must not gain a prefix, and a missing config.json, which has no
+    other source for the name and must keep it."""
+    models = tmp_path / "models"
+    (models / "qwen9-1t").mkdir(parents=True)
+    (models / "qwen9-1t" / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen9ForCausalLM"]}))
+    (models / "no-config").mkdir()
+
+    r = subprocess.run([sys.executable, str(DERIVER), str(tmp_path), "--check"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    lines = r.stderr.splitlines()
+    handler = [ln for ln in lines if "no handler for architecture" in ln]
+    assert handler == [
+        "qwen9-1t: no handler for architecture 'Qwen9ForCausalLM'; add one rather "
+        "than letting a default misprice the model"], r.stderr
+    assert "no-config: no config.json" in lines, r.stderr
+
+
 @pytest.mark.parametrize("d", model_dirs(), ids=lambda d: d.name)
 def test_layer_count_matches_config(d: Path):
     """Depth must agree with the config, whichever way the config states it.

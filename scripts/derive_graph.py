@@ -2830,16 +2830,19 @@ def main() -> int:
         if args.model and entry.name != args.model:
             continue
         cfg = entry / "config.json"
+        # Each entry is the full line to print. A DeriveError already names the model,
+        # because derive() is also called directly and its message has to stand alone
+        # there; the other failures do not, so only they get the prefix.
         if not cfg.is_file():
-            failed.append((entry.name, "no config.json"))
+            failed.append(f"{entry.name}: no config.json")
             continue
         try:
             graph = derive(cfg, entry.name)
         except DeriveError as exc:
-            failed.append((entry.name, str(exc)))
+            failed.append(str(exc))
             continue
         except (KeyError, ValueError, TypeError) as exc:
-            failed.append((entry.name, f"{type(exc).__name__}: {exc}"))
+            failed.append(f"{entry.name}: {type(exc).__name__}: {exc}")
             continue
 
         text = dump(graph)
@@ -2858,8 +2861,8 @@ def main() -> int:
             out.write_text(text)
             written.append(entry.name)
 
-    for name, why in failed:
-        print(f"{name}: {why}", file=sys.stderr)
+    for line in failed:
+        print(line, file=sys.stderr)
     for name, why in stale:
         print(f"{name}: {why}", file=sys.stderr)
 
