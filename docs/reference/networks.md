@@ -8,6 +8,6 @@ Bandwidth is nominal, per GPU and per direction: the line rate of the network ca
 
 ## Sources
 
-The comments are reproduced as written. Where they describe another repository, they can lag it: the PD-transfer base latency they place in blis-registry is, today, inference-sim's `--pd-transfer-base-latency` flag.
+Each file records the source of its figure, and the conversion applied to it, in its `_comment` keys. They are reproduced here as written.
 
 [[catalog.networks.notes]]

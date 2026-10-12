@@ -37,21 +37,21 @@ Each chip and fabric file states its provenance in one field, `Provenance`. The 
 `derived`
 :   The figures are computed from vendor figures by other arithmetic. They are still declared and still unmeasured.
 
-The label applies to a whole file, and every chip and fabric file is labeled `vendor_spec` today, including files that hold figures of other origin (see below). Read a file's comments, not only its label, before relying on a figure. The [Chips](../reference/hardware.md#sources) and [Fabrics](../reference/networks.md#sources) references reproduce every comment.
+The label applies to a whole file. The schema has no label for a figure that is neither of these, such as a capacity or SM count that a device reports, so a file holding one keeps the label that fits the rest of its figures and says which fields are exceptions in its comments. Every chip and fabric file is labeled `vendor_spec` today. Read a file's comments, not only its label, before relying on a figure. The [Chips](../reference/hardware.md#sources) and [Fabrics](../reference/networks.md#sources) references reproduce every comment.
 
 ## Where the catalog falls short of its rule
 
 The rule is the aim, and some current entries do not yet meet it. As of this release:
 
-- Some chip figures come from published simulator descriptors or vendor APIs rather than datasheets. Several SM counts come from public measurements because no datasheet states them, and one, for B300, is assumed equal to B200's. Each chip's comments say which.
-- The storage tiers were copied from the simulator's earlier defaults and cite no source.
-- The workloads cite no source.
+- Every chip's peak rates and HBM bandwidth are vendor datasheet figures, but some memory capacities and SM counts are not. The capacities of `b300` and `gb300` are what `nvidia-smi` reports. The SM count of `b300` comes from a device-properties listing NVIDIA publishes. The SM count of `gb200-nvl72` rests on NVIDIA's die-level disclosure for B200. The SM count of `gb300` comes from a third party's record of what the device reports. No datasheet states any of these, and each chip's comments say which source applies.
+- The storage tiers are representative device classes chosen by the simulator's authors. They cite no source.
+- The workloads are presets chosen by the simulator's authors. They cite no trace or dataset.
 
-A pull request that replaces one of these with a cited declared figure, or moves an assumed number to blis-registry, is welcome.
+Each of these files says so in its own comments. A pull request that replaces one of these with a cited declared figure, or moves a chosen number to blis-registry, is welcome.
 
 ## What the catalog leaves out
 
 - Achieved efficiencies and overheads, such as model FLOPs utilization (MFU), effective bandwidth and fabric overhead, are learned numbers.
-- Latency floors no vendor states, such as the fixed cost of moving a KV cache from a prefill server to a decode server, are modeling inputs. That one is an inference-sim setting today (`--pd-transfer-base-latency`); [blis-registry#10](https://github.com/inference-sim/blis-registry/issues/10) tracks moving it to the registry.
+- Latency floors no vendor states, such as the fixed cost of moving a KV cache from a prefill server to a decode server, are modeling inputs. That one is an inference-sim setting today (`--pd-transfer-base-latency`, 0.05 ms). blis-registry briefly held it ([blis-registry#10](https://github.com/inference-sim/blis-registry/issues/10)), then removed it because nothing read it there.
 - Run choices, such as GPU count, parallelism and engine settings, are stated in the scenario file.
 - A cluster that pairs a chip with a fabric is a run choice too. The catalog defines chips and fabrics separately, and the scenario pairs them.
