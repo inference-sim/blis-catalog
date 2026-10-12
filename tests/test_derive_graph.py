@@ -576,6 +576,14 @@ def test_the_folded_index_norm_width_is_paired_with_the_layer_running_the_indexe
         t = text_config(config_of(d))
         if not (t.get("index_topk") and t.get("index_n_heads")):
             continue
+        # The folded width is fused_norm_rope's, over the q and kv LoRA latents. A
+        # family that states no kv_lora_rank does not run that kernel: DeepSeek-V4.1
+        # norms its latents with fused_q_kv_rmsnorm on every layer alike and gives the
+        # index key its own k_norm launch (deepseek_v41/attention.py:757-763, 1288-1298),
+        # which test_deepseek_v41_charges_each_launch_the_traffic_its_kernel_moves
+        # pins.
+        if not t.get("kv_lora_rank"):
+            continue
         g = graph_of(d)
         kinds = {k["id"]: k for k in g["layer_kinds"]}
         seq = set(layer_sequence(g["stack"]))
@@ -956,6 +964,12 @@ def test_an_unpooled_indexer_prices_no_pooled_compression():
     for path in model_dirs():
         t = text_config(config_of(path))
         if "index_topk" not in t or int(t.get("index_kpool") or 0) > 1:
+            continue
+        # A family whose cache is itself compressed scans that compressed stream, so
+        # its scorer is bounded by the layer's own compress_ratios entry rather than by
+        # a pooling the indexer adds. DeepSeek-V4.1 is the case; its scorer's ratio is
+        # pinned against its KV source in test_deepseek_v41_each_layer_pays_for_what_its_source_vectors_assign.
+        if t.get("compress_ratios") and t.get("kv_source_layer_ids"):
             continue
         g = graph_of(path)
         for kind in g["layer_kinds"]:
@@ -1372,6 +1386,23 @@ def test_expert_shape_matches_config(d: Path):
     # The ROUTED expert node. A shared-expert node is a separate grouped GEMM where the
     # checkpoint stores the two at different widths, and it is sized by the shared count
     # rather than the routed one, so it is checked below instead.
+    #
+    # A draft layer may route over its own expert set: DeepSeek-V4.1's DSpark layers
+    # take dspark_n_routed_experts at dspark_num_experts_per_tok
+    # (deepseek_v41/nvidia/model.py:118-145), so kinds only the speculator uses are
+    # checked against those fields where the config states them.
+    target_kinds = set(layer_sequence(g["stack"]))
+    draft_only = ({k for k in layer_sequence(g["speculator"]["stack"])} - target_kinds
+                  if g.get("speculator") else set())
+    if draft_only and t.get("dspark_n_routed_experts"):
+        for k in g["layer_kinds"]:
+            if k["id"] not in draft_only:
+                continue
+            for n in k["nodes"]:
+                if n["op"] == "GroupedGEMM" and n.get("role") != "shared_experts":
+                    assert n["experts"] == t["dspark_n_routed_experts"]
+                    assert n["top_k"] == t["dspark_num_experts_per_tok"]
+        g = dict(g, layer_kinds=[k for k in g["layer_kinds"] if k["id"] not in draft_only])
     nodes = [n for k in g["layer_kinds"] for n in k["nodes"]
              if n["op"] == "GroupedGEMM" and n.get("role") != "shared_experts"]
     experts = (t.get("num_local_experts") or t.get("n_routed_experts")
@@ -1921,6 +1952,12 @@ def test_a_latent_moe_states_its_projections_wherever_it_appears():
 def indexed_layer_rule(t: dict) -> bool:
     """Whether this config declares a rule that skips the indexer on some layers."""
     if t.get("index_topk_pattern"):
+        return True
+    # DeepSeek-V4.1 names its indexing layers outright. The rest read the top-k the last
+    # indexer wrote into the shared buffer (deepseek_v41/attention.py:1208-1213), which
+    # test_deepseek_v41_each_layer_pays_for_what_its_source_vectors_assign pins
+    # layer by layer.
+    if t.get("index_source_layer_ids"):
         return True
     return int(t.get("index_topk_freq") or 1) > 1
 
@@ -3444,3 +3481,524 @@ def test_an_unmapped_expert_dtype_is_an_error_not_a_fallback():
         assert "fp6" in str(exc)
         return
     raise AssertionError("an unmapped expert_dtype was accepted")
+
+
+# --- DeepSeek-V4.1-Flash ------------------------------------------------------------
+# Every assertion below is about what the graph CHARGES -- weight bytes, FLOPs, traffic,
+# which bounded read a layer performs -- and never about kind ids or node order, so a
+# handler that renames or regroups its kinds without changing a price keeps passing.
+# The per-layer rules are checked three ways: against the committed config, as a
+# property over generated source vectors, and as metamorphic relations between configs
+# that differ in one declared layer.
+
+V41 = MODELS / "deepseek-v4.1-flash"
+
+# Bytes per stored element at the widths this graph uses. mxfp4 is payload only, which
+# is also what blis-schemas' DType.Bytes() returns; the E8M0 scales are not counted on
+# either side of the comparisons below.
+WIDTH = {"fp32": 4, "bf16": 2, "fp8": 1, "mxfp4": 0.5}
+
+
+def v41_graph() -> dict:
+    if not V41.is_dir():
+        pytest.skip("deepseek-v4.1-flash not in the catalog")
+    return graph_of(V41)
+
+
+def expanded_layers(g: dict, stack: dict | None = None) -> list[list[dict]]:
+    kinds = {k["id"]: k["nodes"] for k in g["layer_kinds"]}
+    return [kinds[k] for k in layer_sequence(stack or g["stack"])]
+
+
+def weight_cost(n: dict, global_dtype: str) -> tuple[float, float]:
+    """(stored elements, resident bytes) a weight-bearing node charges."""
+    w = WIDTH[n.get("weight_dtype") or global_dtype]
+    if n["op"] == "GEMM":
+        return n["n"] * n["k"], n["n"] * n["k"] * w
+    if n["op"] == "GroupedGEMM":
+        e = 3 * n["n"] * n["k"] * n["experts"]
+        return e, e * w
+    return 0, 0
+
+
+def traffic_of(nodes: list[dict], role_prefix: str) -> int:
+    return sum(n.get("bytes_per_token", 0) for n in nodes
+               if n["op"] == "Elementwise" and n.get("role", "").startswith(role_prefix))
+
+
+def compressed_read(nodes: list[dict]) -> dict | None:
+    """The layer's primary (roleless) attention: what it reads per decoded token."""
+    return next(n for n in nodes if n["op"] == "Attention" and not n.get("role"))
+
+
+def scoring_scans(nodes: list[dict]) -> list[dict]:
+    return [n for n in nodes if n["op"] == "Attention" and n.get("role")]
+
+
+def gemm_elements(nodes: list[dict], *roles: str) -> int:
+    return sum(n["n"] * n["k"] for n in nodes
+               if n["op"] == "GEMM" and n.get("role") in roles)
+
+
+# Matrix shapes and stored dtypes read from the safetensors headers at the pinned
+# revision 5254448103b6254fc646dacbca1cbbf20e9216c1 (ranged reads of all 48 shard
+# headers; every layer's shapes are identical, the per-layer differences are which
+# tensors exist). (out, in, stored dtype). The routed experts are packed two FP4 values
+# per I8 byte, so [2304, 2560] stores a 2304 x 5120 matrix.
+V41_CHECKPOINT = {
+    "every_layer": [
+        (1280, 5120, "fp8"),    # attn.wq_a
+        (512, 5120, "fp8"),     # attn.wkv
+        (32768, 1280, "fp8"),   # attn.wq_b
+        (8192, 4096, "fp8"),    # attn.wo_a
+        (5120, 8192, "fp8"),    # attn.wo_b
+        (384, 5120, "bf16"),    # ffn.gate
+        (2304, 5120, "fp8"),    # ffn.shared_experts.w1
+        (2304, 5120, "fp8"),    # ffn.shared_experts.w3
+        (5120, 2304, "fp8"),    # ffn.shared_experts.w2
+        (24, 20480, "fp32"),    # hc_attn_fn
+        (24, 20480, "fp32"),    # hc_ffn_fn
+    ],
+    "routed_expert": [(2304, 5120, "mxfp4"), (2304, 5120, "mxfp4"),
+                      (5120, 2304, "mxfp4")],
+    "compressor_gated": [(512, 5120, "bf16"), (512, 5120, "bf16")],   # wkv, wgate
+    "compressor_ungated": [(512, 5120, "bf16")],                     # layer 20: no wgate
+    "index_query": [(4096, 1280, "fp8"), (32, 5120, "bf16")],        # wq_b, weights_proj
+    "index_key": [(128, 512, "bf16")],                               # wk
+    "engram": [(25600, 6144, "fp8")],                                # engram.wkv
+}
+# What vLLM v0.31.0 holds resident at another width than the checkpoint stores, on SM90.
+# wo_a is a batched MXFP8 matmul whose only SM90 kernel dequantizes it to BF16 at load
+# (mxfp8/emulation.py:31-50). Nothing else is converted.
+V41_RESIDENT_OVERRIDES = {(8192, 4096): "bf16"}
+
+
+def v41_checkpoint_layer(t: dict, i: int) -> list[tuple[int, int, str]]:
+    kv = set(t["kv_source_layer_ids"])
+    idx = set(t["index_source_layer_ids"])
+    mats = list(V41_CHECKPOINT["every_layer"])
+    mats += V41_CHECKPOINT["routed_expert"] * t["n_routed_experts"]
+    if i in kv:
+        mats += V41_CHECKPOINT["compressor_gated" if t["compress_ratios"][i] > 1
+                               else "compressor_ungated"]
+    if i in idx:
+        mats += V41_CHECKPOINT["index_query"]
+        if i in kv:
+            mats += V41_CHECKPOINT["index_key"]
+    if i in t["engram_layer_ids"]:
+        mats += V41_CHECKPOINT["engram"]
+    if i == 0:
+        # The broadcast pre projects the embedding with hc_attn_fn summed over its
+        # hc_mult copies (nvidia/model.py:1178-1191): a derived (24, 5120) FP32 matrix in
+        # place of the (24, 20480) one, which layer 0 still loads but never multiplies.
+        mats.remove((24, 20480, "fp32"))
+        mats.append((24, 5120, "fp32"))
+    return mats
+
+
+def test_deepseek_v41_charges_the_weights_the_checkpoint_stores_at_their_resident_width():
+    """Every target layer's priced weights equal its checkpoint tensors, element for
+    element and byte for byte at the width vLLM holds them in.
+
+    The two sums are compared per layer, so a missing projection, a fused node that
+    double-counts a stage, a node at the wrong width or a layer that pays for a module it
+    does not build each move one side and not the other. The resident widths differ
+    from the stored ones only where V41_RESIDENT_OVERRIDES says, which is where a loader
+    converts."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    glob = g["global"]["weight_dtype"]
+    for i, nodes in enumerate(expanded_layers(g)):
+        priced = [weight_cost(n, glob) for n in nodes]
+        want = v41_checkpoint_layer(t, i)
+        want_elems = sum(n * k for n, k, _ in want)
+        want_bytes = sum(n * k * WIDTH[V41_RESIDENT_OVERRIDES.get((n, k), dt)]
+                         for n, k, dt in want)
+        assert sum(e for e, _ in priced) == want_elems, (
+            f"layer {i}: graph prices {sum(e for e, _ in priced):,} weight elements, "
+            f"the checkpoint stores {want_elems:,}")
+        assert sum(b for _, b in priced) == want_bytes, (
+            f"layer {i}: graph prices {sum(b for _, b in priced):,} resident bytes, "
+            f"vLLM holds {want_bytes:,}")
+
+
+def test_deepseek_v41_head_is_priced_at_the_unquantized_width():
+    """The LM head is built with no quant_config (nvidia/model.py:1338-1342) and stored
+    BF16, so it costs vocab x hidden x 2 bytes, not the global FP8 width."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    head = [weight_cost(n, g["global"]["weight_dtype"]) for n in g["head"]]
+    assert sum(b for _, b in head) == t["vocab_size"] * t["hidden_size"] * 2
+
+
+def v41_layer_facts(nodes: list[dict]) -> dict:
+    """What a layer pays for, read from its costs rather than its labels."""
+    read = compressed_read(nodes)
+    scans = scoring_scans(nodes)
+    return {
+        "owns_stream": traffic_of(nodes, "compressor") > 0,
+        "scores": len(scans),
+        "scan_ratio": scans[0].get("compress_ratio") if scans else None,
+        "owns_keys": traffic_of(nodes, "index_k") > 0,
+        "engram": traffic_of(nodes, "engram") > 0,
+        "read_ratio": read.get("compress_ratio"),
+        "read_topk": read.get("index_topk"),
+        "read_window": read.get("window"),
+        "mhc_bytes": traffic_of(nodes, "mhc"),
+    }
+
+
+def v41_expected(t: dict, i: int) -> dict:
+    r = t["compress_ratios"][i]
+    kv, idx = t["kv_source_layer_ids"], t["index_source_layer_ids"]
+    src = max((s for s in kv if s <= i), default=None) if r else None
+    return {
+        "owns_stream": i in kv,
+        "scores": int(i in idx),
+        "scan_ratio": t["compress_ratios"][src] if i in idx else None,
+        "owns_keys": i in kv and i in idx,
+        "engram": i in t["engram_layer_ids"],
+        # The read is the window plus at most index_topk positions whatever the ratio
+        # (nvidia/flashmla.py:230-246); the ratio bounds only the scorer's scan.
+        "read_ratio": None,
+        "read_topk": t["index_topk"] if r else None,
+        "read_window": t["sliding_window"],
+    }
+
+
+def test_deepseek_v41_each_layer_pays_for_what_its_source_vectors_assign():
+    """Layer by layer, the committed graph charges exactly the work vLLM builds there.
+
+    Only the KV sources pay for a compressor and its cache insert (attention.py:565-575,
+    1105-1106); only the index sources pay for a scoring scan, and only those that are
+    also KV sources pay for the key path (:421-449, 1288-1298); the engram layers pay
+    for the lookup. Every compressed layer reads its window plus at most a top-k of its
+    source's stream, whatever that stream's ratio; a ratio-0 layer reads its window
+    alone."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    layers = expanded_layers(g)
+    assert len(layers) == t["num_hidden_layers"]
+    for i, nodes in enumerate(layers):
+        got = v41_layer_facts(nodes)
+        got.pop("mhc_bytes")
+        assert got == v41_expected(t, i), f"layer {i}"
+
+
+def v41_config(**over) -> dict:
+    """The published text config, with overrides, for direct calls to the handler."""
+    t = dict(text_config(config_of(V41)))
+    t.update(over)
+    return t
+
+
+def v41_derive(t: dict) -> dict:
+    """Build a graph from a text config through the same path derive() takes."""
+    dg = deriver()
+    raw = dict(config_of(V41), text_config=t)
+    kinds, stack, extras = dg.handler_deepseek_v41(t, raw, "synthetic")
+    return {"layer_kinds": kinds, "stack": stack, "speculator": extras["speculator"],
+            "global": {"weight_dtype": "fp8"}}
+
+
+def random_v41_vectors(rng, layers: int) -> dict:
+    """A config whose source vectors are valid by vLLM's rules: each compressed span
+    starts at a KV source of its own ratio, and index sources are compressed layers."""
+    swa_head = rng.randint(0, 3)
+    ratios, kv = [0] * swa_head, []
+    i = swa_head
+    while i < layers:
+        span = rng.randint(1, max(1, layers - i))
+        r = rng.choice((1, 2))
+        kv.append(i)
+        ratios += [r] * span
+        i += span
+    compressed = [j for j, r in enumerate(ratios) if r]
+    # Any compressed layers may index, subject to vLLM's two rules: the first compressed
+    # layer needs an index source at or below it, and an index source that is not a KV
+    # source needs its KV source to index too (attention.py:326-338, 437-449). KV
+    # sources that do not index are therefore drawn as well.
+    idx = set(rng.sample(compressed, rng.randint(0, len(compressed)))) | {compressed[0]}
+    for j in list(idx):
+        if j not in kv:
+            idx.add(max(s for s in kv if s <= j))
+    idx = sorted(idx)
+    engram = sorted(rng.sample(range(1, layers), rng.randint(0, 2)))
+    return {"num_hidden_layers": layers, "compress_ratios": ratios + [0, 0, 0],
+            "kv_source_layer_ids": kv, "index_source_layer_ids": idx,
+            "engram_layer_ids": engram}
+
+
+def test_deepseek_v41_layer_rules_hold_for_any_valid_source_vectors():
+    """The same per-layer rule, as a property over generated configs.
+
+    The committed config exercises one arrangement. 300 seeded draws vary the depth,
+    the number and placement of KV sources, which compressed layers index and where the
+    engram layers fall, and each graph must charge every layer what v41_expected says.
+    The draws include index sources that are not KV sources at ratio 2, which the
+    published config never has."""
+    import random
+    rng = random.Random(4101)
+    for draw in range(300):
+        t = v41_config(**random_v41_vectors(rng, rng.randint(4, 24)))
+        layers = expanded_layers(v41_derive(t))
+        assert len(layers) == t["num_hidden_layers"], draw
+        for i, nodes in enumerate(layers):
+            got = v41_layer_facts(nodes)
+            got.pop("mhc_bytes")
+            assert got == v41_expected(t, i), (draw, i, t["compress_ratios"],
+                                               t["kv_source_layer_ids"])
+
+
+def work_by_layer(g: dict) -> list[collections.Counter]:
+    return [collections.Counter(node_cost(n) for n in nodes) for nodes in expanded_layers(g)]
+
+
+def test_deepseek_v41_adding_a_kv_source_moves_exactly_one_compressor():
+    """Metamorphic: declaring one more KV source inside a compressed span adds exactly
+    one compressor's work to that layer and changes no other layer's price.
+
+    The new source owns the stream from there on, but every reader still reads the same
+    window and top-k of a stream at the same ratio, so nothing a reader pays changes --
+    which is the property that makes a per-layer KV-ownership field necessary rather
+    than derivable from the reads."""
+    base = v41_config()
+    added = v41_config(kv_source_layer_ids=sorted(base["kv_source_layer_ids"] + [5]))
+    before, after = work_by_layer(v41_derive(base)), work_by_layer(v41_derive(added))
+    for i, (b, a) in enumerate(zip(before, after)):
+        if i != 5:
+            assert a == b, f"layer {i} changed price when layer 5 became a KV source"
+    gained = after[5] - before[5]
+    lost = before[5] - after[5]
+    assert not lost
+    roles = {n.get("role") for n in expanded_layers(v41_derive(added))[5]
+             if node_cost(n) in gained}
+    assert roles == {"compressor_fused_wkv_wgate", "compressor_pool_norm",
+                     "compressor_rope_quant_insert"}, roles
+
+
+def test_deepseek_v41_halving_the_pool_doubles_the_scan_and_the_insert_traffic():
+    """Metamorphic: at ratio 1 a compressed stream holds one entry per token where
+    ratio 2 holds one per pair. So the scorer scans twice the positions (its ratio
+    halves, 2 -> 1), the per-token cache-insert traffic doubles, and the main read is
+    unchanged, because top-k and window are counts of positions, not fractions of the
+    context."""
+    two = v41_config()
+    one = v41_config(compress_ratios=[r if r != 2 else 1 for r in two["compress_ratios"]])
+    l2, l1 = expanded_layers(v41_derive(two))[2], expanded_layers(v41_derive(one))[2]
+    assert scoring_scans(l1)[0]["compress_ratio"] * 2 == scoring_scans(l2)[0]["compress_ratio"]
+    for role in ("compressor_rope_quant_insert", "index_k_norm_rope_store"):
+        assert traffic_of(l1, role) == 2 * traffic_of(l2, role), role
+    for field in ("index_topk", "window"):
+        assert compressed_read(l1)[field] == compressed_read(l2)[field]
+
+
+def test_deepseek_v41_engram_splits_the_mhc_boundary_without_changing_its_traffic():
+    """Conservation: an engram layer runs the mHC post and pre as two launches around
+    the injection (nvidia/model.py:522-552), where every other layer runs them fused.
+    The split moves no bytes: post + pre on the engram layer equals the fused boundary
+    on its neighbour, and the engram adds only its own lookup and gate."""
+    g = v41_graph()
+    layers = expanded_layers(g)
+    t = text_config(config_of(V41))
+    plain = layers[3]
+    for i in t["engram_layer_ids"]:
+        assert (traffic_of(layers[i], "mhc_attn_post") + traffic_of(layers[i], "mhc_attn_pre")
+                == traffic_of(plain, "mhc_attn_post_pre"))
+        assert traffic_of(layers[i], "mhc") == traffic_of(plain, "mhc"), i
+
+
+def test_deepseek_v41_mhc_runs_once_per_sublayer_at_fp32():
+    """Every sublayer of every layer pays one mHC projection, at FP32 (nvidia/model.py:
+    400-444), and pays no separate RMSNorm, which the TileLang epilogue fuses.
+
+    Summed over the stack, the FP32 projection weights are 2 x layers x mix_hc x
+    hc_mult x hidden x 4 bytes, less layer 0's attention side, which projects the
+    broadcast embedding at hidden width."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    hc, hidden, layers = t["hc_mult"], t["hidden_size"], t["num_hidden_layers"]
+    mix = (2 + hc) * hc
+    fp32 = sum(weight_cost(n, "fp8")[1] for nodes in expanded_layers(g) for n in nodes
+               if n.get("weight_dtype") == "fp32")
+    assert fp32 == (2 * layers - 1) * mix * hc * hidden * 4 + mix * hidden * 4
+    for nodes in expanded_layers(g):
+        plain_norms = [n for n in nodes if n["op"] == "Elementwise"
+                       and "bytes_per_token" not in n]
+        assert not plain_norms, [n.get("role") for n in plain_norms]
+
+
+def test_deepseek_v41_draft_module_drafts_a_block_through_its_own_experts():
+    """The DSpark draft: dspark_block_size tokens per step (config/speculative.py:
+    1475-1482), through num_nextn_predict_layers layers that read only their window
+    (attention.py:322-324), route over dspark_n_routed_experts at
+    dspark_num_experts_per_tok, and run no engram and no indexer."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    spec = g["speculator"]
+    assert spec["method"] == "dspark"
+    assert spec["num_spec_tokens"] == t["dspark_block_size"]
+    draft = expanded_layers(g, spec["stack"])
+    assert len(draft) == t["num_nextn_predict_layers"]
+    for nodes in draft:
+        read = compressed_read(nodes)
+        assert not read.get("compress_ratio") and not read.get("index_topk")
+        assert read["window"] == t["sliding_window"]
+        assert not scoring_scans(nodes)
+        assert traffic_of(nodes, "engram") == 0
+        routed = [n for n in nodes if n["op"] == "GroupedGEMM"
+                  and n.get("role") != "shared_experts"]
+        assert [(n["experts"], n["top_k"]) for n in routed] == [
+            (t["dspark_n_routed_experts"], t["dspark_num_experts_per_tok"])]
+    # The drafter materializes its own hc copies before its first layer
+    # (dspark.py:226), so that layer's attention-side mHC costs what the target's
+    # broadcast layer 0 costs, not a plain pre.
+    assert traffic_of(draft[0], "mhc_attn") == traffic_of(expanded_layers(g)[0], "mhc_attn")
+    # main_proj concatenates the three target layers' hidden states.
+    assert gemm_elements(draft[0], "dspark_main_proj") == (
+        t["hidden_size"] * t["hidden_size"] * len(t["dspark_target_layer_ids"]))
+
+
+@pytest.mark.parametrize("over, fragment", [
+    ({"compress_ratios": [0, 0, 4] + [4] * 37 + [0, 0, 0]}, "accepts 0, 1 and 2"),
+    ({"compress_ratios": [0, 0] + [2] * 4 + [1] * 2 + [2] * 12 + [1] * 20 + [0, 0, 0]},
+     "reads the compressed"),
+    ({"compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 2]}, "draft layer"),
+    ({"kv_source_layer_ids": [1, 2, 8, 14, 20]}, "no compressed stream"),
+    ({"head_dim": 576}, "head_dim 512"),
+    ({"engram_layer_ids": [0, 14]}, "never injected"),
+    ({"index_source_layer_ids": [2, 9, 14, 20]}, "builds no indexer"),
+    ({"index_source_layer_ids": [8, 14, 20]}, "no index source at or below"),
+])
+def test_deepseek_v41_refuses_layouts_vllm_would_not_serve(over, fragment):
+    """Each refusal is a layout that vLLM v0.31.0 either rejects or would read at a
+    width or ratio no node states, so pricing it would be a guess."""
+    with pytest.raises(deriver().DeriveError, match=fragment):
+        v41_derive(v41_config(**over))
+
+
+def test_deepseek_v41_refuses_every_source_layout_vllm_rejects():
+    """The negative property: perturb valid generated layouts into the two shapes vLLM
+    v0.31.0 raises on, and require every one to be refused rather than priced.
+
+      * a compressed layer with no index source at or below it (attention.py:326-338);
+      * an index source whose KV source builds no indexer, so its keys do not exist
+        (attention.py:437-449)."""
+    import random
+    rng = random.Random(4102)
+    seen = collections.Counter()
+    for _ in range(400):
+        v = random_v41_vectors(rng, rng.randint(6, 24))
+        kv, idx = v["kv_source_layer_ids"], v["index_source_layer_ids"]
+        first = next(j for j, r in enumerate(v["compress_ratios"]) if r)
+        borrowers = [j for j in idx if j not in kv]
+        if borrowers and rng.random() < 0.6:
+            j = rng.choice(borrowers)
+            src = max(s for s in kv if s <= j)
+            bad_idx = [s for s in idx if s != src]
+        else:
+            bad_idx = [s for s in idx if s > first]
+        if not bad_idx:
+            bad_idx = [v["num_hidden_layers"] - 1]
+        with pytest.raises(deriver().DeriveError,
+                           match="no index source at or below|builds no indexer") as exc:
+            v41_derive(v41_config(**dict(v, index_source_layer_ids=bad_idx)))
+        seen["builds no indexer" in str(exc.value)] += 1
+    assert seen[True] > 50 and seen[False] > 50, seen
+
+
+def v41_expected_traffic(t: dict, role: str, ratio: int) -> int | None:
+    """What each launch moves per token, restated from its kernel rather than from the
+    handler. None for an RMSNorm at hidden width, which states no traffic because a
+    consumer derives it from hidden_size."""
+    H, act, fp32, hc = t["hidden_size"], 2, 4, t["hc_mult"]
+    D, qlora, heads = t["head_dim"], t["q_lora_rank"], t["num_attention_heads"]
+    rec = 584                                   # SM90 record, attention.py:503-508
+    ih, idim = t["index_n_heads"], t["index_head_dim"]
+    irec = idim + idim // 128 * 4               # attention.py:89-97
+    bundle, mixes = hc * H * act, (hc + hc * hc) * fp32
+    post = H * act + 2 * bundle + mixes         # reads x, residual, mixes; writes residual
+    pre = bundle + mixes + H * act              # reads residual; writes mixes, layer input
+    rows = (t["engram_max_ngram_size"] - 1) * t["engram_n_heads"]
+    table = {
+        "mhc_attn_post_pre": post + pre, "mhc_ffn_post_pre": post + pre,
+        "mhc_attn_post": post, "mhc_final_post": post, "mhc_attn_pre": pre,
+        # broadcast: the expand reads hidden and writes the bundle, then a pre
+        "mhc_attn_broadcast_pre": H * act + bundle + pre,
+        "hc_collapse": bundle + hc * fp32 + H * act,
+        # fused_q_kv_rmsnorm reads and writes both latents at BF16
+        "qkv_a_layernorm": 2 * (qlora + D) * act,
+        # Q read + padded write, KV row read, one record written
+        "q_rope_kv_insert": 2 * heads * D * act + D * act + rec,
+        "o_inv_rope": 2 * heads * D * act,
+        "compressor_rope_quant_insert": (D * act + rec) // max(ratio, 1),
+        # BF16 q and weights in; FP8 q and FP32 weights out (no stored q scale)
+        "index_q_rope_quant": ih * idim * act + ih * act + ih * idim + ih * fp32,
+        "index_k_norm_rope_store": (idim * act + irec) // max(ratio, 1),
+        "engram_lookup": rows * t["engram_head_dim"] * act,
+        # reads the bundle, the hc keys and the value; writes the bundle
+        "engram_gate": 3 * bundle + H * act,
+        "dspark_context_kv_norm": 2 * D * act,
+        "dspark_context_kv_rope_insert": D * act + rec,
+        "dspark_main_norm": None, "dspark_final_norm": None, "final_norm": None,
+    }
+    if role == "compressor_pool_norm":
+        row = (2 * D if ratio > 1 else D) * fp32
+        # decode: every ratio-2 token reads its raw row and writes it to the ring;
+        # a closing token also reads the ring row and its raw row and writes a latent
+        return 2 * row + (2 * row + D * act) // ratio if ratio > 1 else row + D * act
+    return table[role]
+
+
+def test_deepseek_v41_charges_each_launch_the_traffic_its_kernel_moves():
+    """Every Elementwise launch in the target stack, the head and the draft stack moves
+    the bytes its kernel reads and writes, at the stored widths. The only nodes stating
+    no traffic are the hidden-width RMSNorms, which a consumer derives from hidden_size.
+
+    Checked per layer, so a ratio applied to the wrong layer, a launch priced twice or
+    an unamortized per-entry write each show up where they happen."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    checked = 0
+    layers = expanded_layers(g) + expanded_layers(g, g["speculator"]["stack"]) + [g["head"]]
+    ratios = t["compress_ratios"][:t["num_hidden_layers"]] + [0] * (len(layers) - 40)
+    for i, nodes in enumerate(layers):
+        for n in nodes:
+            if n["op"] != "Elementwise":
+                continue
+            want = v41_expected_traffic(t, n["role"], ratios[i])
+            assert n.get("bytes_per_token") == want, (i, n["role"], n.get("bytes_per_token"), want)
+            checked += 1
+    # 40 target layers, 3 draft layers and the head, about six launches each.
+    assert checked > 200, checked
+
+
+V41_CHECKPOINT_DRAFT = {
+    # mtp.{0,1,2} at the pinned revision: the base attention set, the hc tensors, a
+    # 128-expert gate and 128 routed experts, and the shared expert.
+    "every_layer": [m for m in V41_CHECKPOINT["every_layer"] if m != (384, 5120, "bf16")]
+                   + [(128, 5120, "bf16")],
+    "main_proj": [(5120, 15360, "fp8")],                 # mtp.0.main_proj
+    "markov_head": [(129280, 256, "bf16")],              # mtp.2.markov_head.head
+}
+# Draft nodes that price compute on weights another node already holds: each draft
+# layer's context projection is its own fused_wqa_wkv (dspark.py:192), and the draft
+# lm_head is the target's (dspark.py:279-282). blis-schemas#51 asks for a way to mark
+# them; until then they are counted here, explicitly, on top of the checkpoint.
+V41_DRAFT_ALIASES = {
+    "every_layer": [(1280, 5120, "fp8"), (512, 5120, "fp8")],   # wq_a + wkv again
+    "last_layer": [(129280, 5120, "bf16")],                      # the target's head
+}
+
+
+def test_deepseek_v41_draft_layers_charge_the_mtp_weights_at_their_resident_width():
+    """The DSpark layers price the checkpoint's mtp.* tensors, element for element and
+    byte for byte at vLLM's resident widths, plus only the aliased weights named above."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    draft = expanded_layers(g, g["speculator"]["stack"])
+    for d, nodes in enumerate(draft):
+        want = list(V41_CHECKPOINT_DRAFT["every_layer"])
+        want += V41_CHECKPOINT["routed_expert"] * t["dspark_n_routed_experts"]
+        want += V41_DRAFT_ALIASES["every_layer"]
+        if d == 0:
+            want += V41_CHECKPOINT_DRAFT["main_proj"]
+        if d == len(draft) - 1:
+            want += V41_CHECKPOINT_DRAFT["markov_head"] + V41_DRAFT_ALIASES["last_layer"]
+        priced = [weight_cost(n, g["global"]["weight_dtype"]) for n in nodes]
+        assert sum(e for e, _ in priced) == sum(n * k for n, k, _ in want), d
+        assert sum(b for _, b in priced) == sum(
+            n * k * WIDTH[V41_RESIDENT_OVERRIDES.get((n, k), dt)] for n, k, dt in want), d
