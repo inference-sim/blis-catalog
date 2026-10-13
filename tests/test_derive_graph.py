@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1533,7 +1534,26 @@ def node_cost(n: dict) -> tuple:
         # Omitted here, the signature read GLM-5.3-Flash's mHC mixing as two plain
         # norms.
         n.get("bytes_per_token"),
+        # What blis-schemas#55 prices beyond the shape: how a node splits over tensor
+        # parallelism, the caches a read holds and their records, a launch that writes a
+        # cache record only every per_tokens tokens, work proportional to the context, a
+        # gather's table and where it lives, and a node that reuses another's weights.
+        # Each changes a step time or a residency, so a signature blind to them would
+        # call a FlashMLA read over a 584 B record and one over a 528 B record the same.
+        n.get("tp"), frozen(n.get("caches")), n.get("per_tokens"), n.get("writes_cache"),
+        frozen(n.get("context")), n.get("rows"), n.get("row_bytes"),
+        n.get("rows_per_token"), n.get("out_bytes_per_token"), n.get("residency"),
+        n.get("shard"), n.get("aliases"), frozen(n.get("weight_scale")),
     )
+
+
+def frozen(v):
+    """A hashable, order-preserving copy of a node's nested field."""
+    if isinstance(v, dict):
+        return tuple(sorted((k, frozen(x)) for k, x in v.items()))
+    if isinstance(v, list):
+        return tuple(frozen(x) for x in v)
+    return v
 
 
 def test_distinct_architectures_cost_differently():
@@ -2529,6 +2549,12 @@ def test_nemotron_h_parses_the_character_form_of_the_layer_vector():
 # dense-vs-MoE distinction the behavioural signature deliberately cannot see.
 
 
+# Architectures whose model code decides sequence parallelism itself rather than reading
+# the engine-wide use_sequence_parallel_moe. Named here rather than read from the deriver,
+# so the test does not move with the table it checks.
+OWN_SEQUENCE_PARALLELISM = {"DeepseekV41ForCausalLM"}
+
+
 def test_collectives_land_where_the_parallelism_needs_them():
     """Every layer reduces its MLP output; only a routed layer dispatches to experts.
 
@@ -2539,7 +2565,22 @@ def test_collectives_land_where_the_parallelism_needs_them():
     checked_dense = checked_moe = 0
     for d in model_dirs():
         g = graph_of(d)
+        # A family that decides sequence parallelism itself names its architecture, and
+        # its MoE reduction stands down under that rule rather than the engine-wide one
+        # (DeepSeek-V4.1: nvidia/model.py:239-247, 324-327; blis-schemas#55).
+        own_sp = g["global"].get("architecture") in OWN_SEQUENCE_PARALLELISM
+        mlp_reduction = ("tensor_parallel_unless_sequence_parallel" if own_sp
+                         else "tensor_parallel_unless_sp_moe")
+        # Context-stack kinds run once over the target's tokens, outside any decoder
+        # layer, and launch no collective of their own.
+        context_only = set()
+        if g.get("speculator", {}).get("context_stack"):
+            context_only = (set(layer_sequence(g["speculator"]["context_stack"]))
+                            - set(layer_sequence(g["stack"]))
+                            - set(layer_sequence(g["speculator"]["stack"])))
         for kind in g["layer_kinds"]:
+            if kind["id"] in context_only:
+                continue
             ops = [n for n in kind["nodes"] if n["op"] in ("AllReduce", "All2All")]
             all2all = [n for n in ops if n["op"] == "All2All"]
             allreduce = [n for n in ops if n["op"] == "AllReduce"]
@@ -2547,9 +2588,17 @@ def test_collectives_land_where_the_parallelism_needs_them():
             where = f"{d.name}/{kind['id']}"
 
             assert allreduce, f"{where}: a layer that reduces nothing"
-            assert any(n["emit"] in ("tensor_parallel", "tensor_parallel_unless_sp_moe")
+            assert any(n["emit"] in ("tensor_parallel", mlp_reduction)
                        for n in allreduce), (
                 f"{where}: no AllReduce conditioned on tensor parallelism")
+            if own_sp:
+                # Under the model's own sequence parallelism the attention reduction is
+                # replaced, not dropped: a reduce-scatter takes its place.
+                assert any(n["op"] == "ReduceScatter"
+                           and n.get("emit") == "sequence_parallel"
+                           for n in kind["nodes"]), (
+                    f"{where}: attention reduces under TP but nothing replaces it under "
+                    f"the model's own sequence parallelism")
 
             if has_experts:
                 assert len(all2all) == 1, (
@@ -2558,10 +2607,9 @@ def test_collectives_land_where_the_parallelism_needs_them():
                 assert all2all[0]["emit"] == "expert_parallel", (
                     f"{where}: All2All emits on {all2all[0]['emit']!r}, but expert "
                     f"dispatch is what expert parallelism conditions")
-                assert any(n["emit"] == "tensor_parallel_unless_sp_moe"
-                           for n in allreduce), (
+                assert any(n["emit"] == mlp_reduction for n in allreduce), (
                     f"{where}: a routed layer's MLP reduction must stand down under "
-                    f"sequence-parallel MoE, which is what the _unless_sp_moe form says")
+                    f"sequence parallelism, which is what {mlp_reduction!r} says")
                 checked_moe += 1
             else:
                 assert not all2all, (
@@ -2576,19 +2624,26 @@ def test_collectives_land_where_the_parallelism_needs_them():
 def test_every_emit_condition_is_one_a_resolver_knows():
     """The closed set is the point: a graph cannot state a condition nothing evaluates.
 
-    The deriver's three EMIT_ constants are the whole vocabulary, so a committed graph
-    naming anything else would reach a resolver with no branch for it."""
+    The deriver's EMIT_ constants are the whole vocabulary, so a committed graph naming
+    anything else would reach a resolver with no branch for it. The two conditions the
+    model's own sequence parallelism decides need the graph to name its architecture,
+    since that is what a rules pack decides them by (blis-schemas#55)."""
     dg = _dg()
     known = {dg.EMIT_TENSOR_PARALLEL, dg.EMIT_EXPERT_PARALLEL,
              dg.EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE}
+    own = {dg.EMIT_SEQUENCE_PARALLEL, dg.EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL}
     for d in model_dirs():
-        for kind in graph_of(d)["layer_kinds"]:
-            for n in kind["nodes"]:
-                if "emit" not in n:
-                    continue
-                assert n["emit"] in known, (
-                    f"{d.name}/{kind['id']}: emit {n['emit']!r} is not in the closed set "
-                    f"{sorted(known)}")
+        g = graph_of(d)
+        allowed = known | (own if g["global"].get("architecture") else set())
+        nodes = [(kind["id"], n) for kind in g["layer_kinds"] for n in kind["nodes"]]
+        nodes += [("head", n) for n in g["head"]]
+        nodes += [("embedding", n) for n in g.get("embedding", [])]
+        for where, n in nodes:
+            if "emit" not in n:
+                continue
+            assert n["emit"] in allowed, (
+                f"{d.name}/{where}: emit {n['emit']!r} is not in the closed set "
+                f"{sorted(allowed)}")
 
 
 def test_a_recurrent_layer_reduces_its_mixer_output():
@@ -3513,7 +3568,10 @@ def expanded_layers(g: dict, stack: dict | None = None) -> list[list[dict]]:
 
 
 def weight_cost(n: dict, global_dtype: str) -> tuple[float, float]:
-    """(stored elements, resident bytes) a weight-bearing node charges."""
+    """(stored elements, resident bytes) a weight-bearing node charges. A node that
+    aliases another's weights runs compute on them but holds none of its own."""
+    if n.get("aliases"):
+        return 0, 0
     w = WIDTH[n.get("weight_dtype") or global_dtype]
     if n["op"] == "GEMM":
         return n["n"] * n["k"], n["n"] * n["k"] * w
@@ -3523,8 +3581,24 @@ def weight_cost(n: dict, global_dtype: str) -> tuple[float, float]:
     return 0, 0
 
 
-def traffic_of(nodes: list[dict], role_prefix: str) -> int:
-    return sum(n.get("bytes_per_token", 0) for n in nodes
+def caches_of(nodes: list[dict]) -> dict[str, dict]:
+    """The caches a layer's reads state, by name. A reader states its owner's record, so
+    the name is enough to find the record a launch writes."""
+    return {c["name"]: c for n in nodes for c in n.get("caches", [])}
+
+
+def per_token(n: dict, caches: dict[str, dict]) -> float:
+    """What a launch moves per token: its own traffic plus, when it writes a cache, one
+    record, the two together once every per_tokens tokens."""
+    moved = n.get("bytes_per_token") or 0
+    if "writes_cache" in n:
+        moved += caches[n["writes_cache"]]["bytes_per_entry"]
+    return moved / n.get("per_tokens", 1)
+
+
+def traffic_of(nodes: list[dict], role_prefix: str) -> float:
+    caches = caches_of(nodes)
+    return sum(per_token(n, caches) for n in nodes
                if n["op"] == "Elementwise" and n.get("role", "").startswith(role_prefix))
 
 
@@ -3634,19 +3708,177 @@ def test_deepseek_v41_head_is_priced_at_the_unquantized_width():
     assert sum(b for _, b in head) == t["vocab_size"] * t["hidden_size"] * 2
 
 
+def v41_kv_bytes_per_context_token(g: dict) -> float:
+    """What every context token adds to the owned, unbounded caches of one sequence:
+    each owner's record divided by the tokens one entry covers. Readers hold nothing,
+    and the window and state caches are bounded per request, not per token."""
+    total = 0.0
+    for nodes in expanded_layers(g):
+        for n in nodes:
+            for c in n.get("caches", []):
+                if c["owned"] and c["kind"] in ("kv", "index"):
+                    total += c["bytes_per_entry"] / c.get("tokens_per_entry", 1)
+    return total
+
+
+def test_deepseek_v41_owned_caches_hold_what_vllm_allocates_per_context_token():
+    """KV residency, from the cache records the graph states rather than from a
+    restatement in this test.
+
+    Per context token a sequence holds one 584 B record (attention.py:503-508) per
+    compressed-stream owner, divided by its ratio, and one 132 B indexer key record
+    (index_head_dim FP8 plus one FP32 scale per 128, attention.py:89-97) per key owner,
+    divided by its ratio. At the published layout that is 3 x 584/2 + 584 + 3 x 132/2 +
+    132 = 1,790 B. Each ratio-2 owner also holds an FP32 state ring of 8 rows of kv and
+    score at head_dim (compressor.py:146-163, 230-238), and every target and draft layer
+    its own 128-position window."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    assert v41_kv_bytes_per_context_token(g) == 1_790
+    kv, ratios = t["kv_source_layer_ids"], t["compress_ratios"]
+    want = sum(584 / ratios[i] for i in kv) + sum(
+        132 / ratios[i] for i in kv if i in t["index_source_layer_ids"])
+    assert v41_kv_bytes_per_context_token(g) == want
+    rings = [c for nodes in expanded_layers(g) for n in nodes for c in n.get("caches", [])
+             if c["kind"] == "state"]
+    assert [(c["entries"], c["bytes_per_entry"]) for c in rings] == [
+        (8, 2 * t["head_dim"] * 4)] * sum(1 for i in kv if ratios[i] == 2)
+    windows = [c for nodes in expanded_layers(g) + expanded_layers(
+                   g, g["speculator"]["stack"])
+               for n in nodes for c in n.get("caches", []) if c["kind"] == "window"]
+    assert len(windows) == t["num_hidden_layers"] + t["num_nextn_predict_layers"]
+    assert {(c["window"], c["bytes_per_entry"], c["owned"]) for c in windows} == {
+        (t["sliding_window"], 584, True)}
+
+
+def test_deepseek_v41_every_reader_states_the_record_of_the_cache_it_reads():
+    """A reader holds nothing, but it prices its read at the record it reads. So each
+    unowned cache must state exactly the record of the nearest earlier owner of that
+    name, and every unowned cache must have one: a reader whose owner is missing, or
+    whose record drifted from it, would read a cache no layer allocates."""
+    g = v41_graph()
+    owners: dict[str, dict] = {}
+    readers = 0
+    for i, nodes in enumerate(expanded_layers(g)):
+        for n in nodes:
+            for c in n.get("caches", []):
+                if c["owned"]:
+                    owners[c["name"]] = c
+                    continue
+                readers += 1
+                assert c["name"] in owners, (i, c["name"])
+                own = owners[c["name"]]
+                for key in ("kind", "bytes_per_entry", "tokens_per_entry"):
+                    assert c.get(key) == own.get(key), (i, c["name"], key)
+    assert readers > 30, readers
+
+
+def apply_capability_overlay(g: dict, family: int) -> dict:
+    """The graph a family-`family` chip runs, built from arch_overrides the way the
+    schema's ForCapability does: matching roles and cache names take the overlay's
+    fields. Restated here so a check on the overlay does not run the code it checks."""
+    import copy
+    out = copy.deepcopy(g)
+    over = next(o for o in g["arch_overrides"] if o["capability_family"] == family)
+    nodes_by_role = {o["role"]: o for o in over.get("nodes", [])}
+    caches_by_name = {o["name"]: o for o in over.get("caches", [])}
+    for kind in out["layer_kinds"]:
+        for n in kind["nodes"]:
+            for key, v in nodes_by_role.get(n.get("role"), {}).items():
+                if key != "role":
+                    n[key] = v
+            for c in n.get("caches", []):
+                for key, v in caches_by_name.get(c["name"], {}).items():
+                    if key != "name":
+                        c[key] = v
+    return out
+
+
+def test_deepseek_v41_blackwell_overlay_runs_wo_a_natively_and_stores_the_mxfp8_record():
+    """On SM100 the MXFP8 BMM runs natively, so wo_a stays FP8 (kernels/linear/
+    __init__.py:895-900), and the latent record is 528 B with 512 B page alignment
+    rather than SM90's 584 B and 576 (attention.py:503-508). The compressed cache adds
+    a 288 B NVFP4 record under nvfp4_ds_mla. Only those change: the per-token residency
+    follows the record, and every weight but wo_a's keeps its SM90 width."""
+    g = v41_graph()
+    assert g["base_capability_families"] == [9]
+    sm100 = apply_capability_overlay(g, 10)
+    glob = g["global"]["weight_dtype"]
+    for base, over in zip(expanded_layers(g), expanded_layers(sm100)):
+        for a, b in zip(base, over):
+            if a.get("role") == "wo_a":
+                assert (a["weight_dtype"], b["weight_dtype"]) == ("bf16", "fp8")
+            else:
+                assert weight_cost(a, glob) == weight_cost(b, glob), a.get("role")
+    # 3 x 528/2 + 528 for the stream, and the indexer keys unchanged at 330.
+    assert v41_kv_bytes_per_context_token(sm100) == 1_650
+    compressed = {(c["bytes_per_entry"], c.get("page_alignment"),
+                   frozen(c.get("bytes_by_cache_dtype")))
+                  for nodes in expanded_layers(sm100) for n in nodes
+                  for c in n.get("caches", []) if c["name"] == "compressed" and c["owned"]}
+    assert compressed == {(528, 512, frozen({"nvfp4_ds_mla": 288}))}
+
+
+def test_deepseek_v41_engram_tables_live_in_host_memory_at_their_stored_width():
+    """Each engram layer gathers 24 rows a token -- (engram_max_ngram_size - 1) n-grams
+    for each of engram_n_heads heads (common/engram.py:740-760) -- from its own table of
+    engram_num_embeddings rows. A row is engram_head_dim FP8 values and one E8M0 scale
+    per 32, and the gathered rows reach the GPU as BF16. vLLM v0.31.0 keeps the tables
+    in host memory by default (cpu_offload=True), which is why the node states host
+    residency: priced on the device, the two tables alone are about 189 GiB."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    layers = expanded_layers(g)
+    hd = t["engram_head_dim"]
+    rows_per_token = (t["engram_max_ngram_size"] - 1) * t["engram_n_heads"]
+    gathered = []
+    for i, nodes in enumerate(layers):
+        for n in nodes:
+            if n["op"] == "Gather":
+                assert i in t["engram_layer_ids"], i
+                gathered.append(n)
+                assert (n["row_bytes"], n["rows_per_token"], n["out_bytes_per_token"],
+                        n["residency"], n["shard"]) == (
+                    hd + hd // 32, rows_per_token, rows_per_token * hd * 2, "host", "heads")
+    assert [n["rows"] for n in gathered] == t["engram_num_embeddings"]
+    assert 188 < sum(n["rows"] * n["row_bytes"] for n in gathered) / 2**30 < 190
+
+
+def test_deepseek_v41_embedding_is_a_bf16_gather_over_the_vocabulary():
+    """The token embedding is a row gather from a vocab x hidden BF16 table (the quant
+    config has no method for it), split by rows across tensor parallelism and summed
+    back. The draft reuses it rather than holding its own."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    (embed,) = [n for n in g["embedding"] if n["op"] == "Gather"]
+    assert (embed["rows"], embed["row_bytes"], embed["rows_per_token"],
+            embed["shard"]) == (t["vocab_size"], t["hidden_size"] * 2, 1, "rows")
+    assert [n["emit"] for n in g["embedding"] if n["op"] == "AllReduce"] == [
+        "tensor_parallel"]
+    draft = [n for nodes in expanded_layers(g, g["speculator"]["stack"]) for n in nodes
+             if n["op"] == "Gather"]
+    assert [n.get("aliases") for n in draft] == ["embedding.embed_tokens"]
+
+
 def v41_layer_facts(nodes: list[dict]) -> dict:
-    """What a layer pays for, read from its costs rather than its labels."""
+    """What a layer pays for and holds, read from its costs and caches rather than its
+    labels."""
     read = compressed_read(nodes)
     scans = scoring_scans(nodes)
+    held = {c["name"]: c["owned"] for c in read.get("caches", [])}
+    roles = {n.get("role") for n in nodes}
     return {
         "owns_stream": traffic_of(nodes, "compressor") > 0,
+        "holds_stream": held.get("compressed"),
+        "holds_ring": held.get("compressor_ring"),
         "scores": len(scans),
         "scan_ratio": scans[0].get("compress_ratio") if scans else None,
         "owns_keys": traffic_of(nodes, "index_k") > 0,
-        "engram": traffic_of(nodes, "engram") > 0,
+        "holds_keys": scans[0]["caches"][0]["owned"] if scans else None,
+        "selects": "candidate_select" in roles,
+        "masks": "candidate_mask" in roles,
+        "engram_rows": [n["rows"] for n in nodes if n["op"] == "Gather"],
         "read_ratio": read.get("compress_ratio"),
         "read_topk": read.get("index_topk"),
         "read_window": read.get("window"),
+        "prefill_dequant": "prefill_dequant_gather" in roles,
     }
 
 
@@ -3654,29 +3886,42 @@ def v41_expected(t: dict, i: int) -> dict:
     r = t["compress_ratios"][i]
     kv, idx = t["kv_source_layer_ids"], t["index_source_layer_ids"]
     src = max((s for s in kv if s <= i), default=None) if r else None
+    cand = t.get("candidate_source_layer_id", -1)
     return {
         "owns_stream": i in kv,
+        "holds_stream": (i in kv) if r else None,
+        "holds_ring": True if i in kv and r > 1 else None,
         "scores": int(i in idx),
         "scan_ratio": t["compress_ratios"][src] if i in idx else None,
         "owns_keys": i in kv and i in idx,
-        "engram": i in t["engram_layer_ids"],
-        # The read is the window plus at most index_topk positions whatever the ratio
-        # (nvidia/flashmla.py:230-246); the ratio bounds only the scorer's scan.
-        "read_ratio": None,
+        "holds_keys": (i in kv) if i in idx else None,
+        "selects": i == cand,
+        "masks": i in idx and cand >= 0 and i > cand,
+        "engram_rows": [dict(zip(t["engram_layer_ids"], t["engram_num_embeddings"]))[i]]
+                       if i in t["engram_layer_ids"] else [],
+        # The read is the window plus at most index_topk positions of the source's
+        # stream (nvidia/flashmla.py:230-246); the ratio names that stream, whose cache
+        # the read holds or borrows.
+        "read_ratio": r or None,
         "read_topk": t["index_topk"] if r else None,
         "read_window": t["sliding_window"],
+        "prefill_dequant": bool(r),
     }
 
 
 def test_deepseek_v41_each_layer_pays_for_what_its_source_vectors_assign():
-    """Layer by layer, the committed graph charges exactly the work vLLM builds there.
+    """Layer by layer, the committed graph charges exactly the work vLLM builds there
+    and holds exactly the caches it allocates.
 
-    Only the KV sources pay for a compressor and its cache insert (attention.py:565-575,
-    1105-1106); only the index sources pay for a scoring scan, and only those that are
-    also KV sources pay for the key path (:421-449, 1288-1298); the engram layers pay
-    for the lookup. Every compressed layer reads its window plus at most a top-k of its
-    source's stream, whatever that stream's ratio; a ratio-0 layer reads its window
-    alone."""
+    Only the KV sources pay for a compressor and its cache insert and own the stream
+    (attention.py:565-575, 1105-1106), and only ratio-2 sources hold a state ring; only
+    the index sources pay for a scoring scan, and only those that are also KV sources
+    pay for the key path and own the keys (:421-449, 1288-1298). The candidate source
+    selects blocks and the later index sources mask to them (kernels/attention/dsa/
+    candidate_blocks.py). Each engram layer gathers from its own table
+    (common/engram.py:167-202). Every compressed layer reads its
+    window plus at most a top-k of its source's stream; a ratio-0 layer reads its
+    window alone."""
     g, t = v41_graph(), text_config(config_of(V41))
     layers = expanded_layers(g)
     assert len(layers) == t["num_hidden_layers"]
@@ -3697,7 +3942,8 @@ def v41_derive(t: dict) -> dict:
     raw = dict(config_of(V41), text_config=t)
     kinds, stack, extras = dg.handler_deepseek_v41(t, raw, "synthetic")
     return {"layer_kinds": kinds, "stack": stack, "speculator": extras["speculator"],
-            "global": {"weight_dtype": "fp8"}}
+            "global": {"weight_dtype": "fp8"}, "head": extras["head"],
+            "embedding": extras["embedding"]}
 
 
 def random_v41_vectors(rng, layers: int) -> dict:
@@ -3723,29 +3969,43 @@ def random_v41_vectors(rng, layers: int) -> dict:
             idx.add(max(s for s in kv if s <= j))
     idx = sorted(idx)
     engram = sorted(rng.sample(range(1, layers), rng.randint(0, 2)))
+    # Distinct table sizes, so a layer gathering from another layer's table shows.
+    tables = rng.sample(range(1_000, 400_000_000), len(engram))
     targets = sorted(rng.sample(range(layers), rng.randint(1, min(3, layers))))
+    # The candidate source is an index source, or disabled.
     return {"num_hidden_layers": layers, "compress_ratios": ratios + [0, 0, 0],
             "kv_source_layer_ids": kv, "index_source_layer_ids": idx,
-            "engram_layer_ids": engram, "dspark_target_layer_ids": targets}
+            "candidate_source_layer_id": rng.choice(idx + [-1]),
+            "engram_layer_ids": engram, "engram_num_embeddings": tables,
+            "dspark_target_layer_ids": targets}
 
 
 def test_deepseek_v41_layer_rules_hold_for_any_valid_source_vectors():
     """The same per-layer rule, as a property over generated configs.
 
     The committed config exercises one arrangement. 300 seeded draws vary the depth,
-    the number and placement of KV sources, which compressed layers index and where the
-    engram layers fall, and each graph must charge every layer what v41_expected says.
-    The draws include index sources that are not KV sources at ratio 2, which the
-    published config never has."""
+    the number and placement of KV sources, which compressed layers index, which of
+    those selects candidates and where the engram layers fall, and each graph must
+    charge and hold at every layer what v41_expected says. The draws include index
+    sources that are not KV sources at ratio 2, which the published config never has.
+    Every draw's readers must also find an owner with their record."""
     import random
     rng = random.Random(4101)
     for draw in range(300):
         t = v41_config(**random_v41_vectors(rng, rng.randint(4, 24)))
-        layers = expanded_layers(v41_derive(t))
+        g = v41_derive(t)
+        layers = expanded_layers(g)
         assert len(layers) == t["num_hidden_layers"], draw
         for i, nodes in enumerate(layers):
             assert v41_layer_facts(nodes) == v41_expected(t, i), (
                 draw, i, t["compress_ratios"], t["kv_source_layer_ids"])
+        owners: dict[str, dict] = {}
+        for nodes in layers:
+            for c in (c for n in nodes for c in n.get("caches", [])):
+                if c["owned"]:
+                    owners[c["name"]] = c
+                else:
+                    assert c["bytes_per_entry"] == owners[c["name"]]["bytes_per_entry"]
 
 
 def work_by_layer(g: dict) -> list[collections.Counter]:
@@ -3755,33 +4015,37 @@ def work_by_layer(g: dict) -> list[collections.Counter]:
 
 def test_deepseek_v41_adding_a_kv_source_moves_exactly_one_compressor():
     """Metamorphic: declaring one more KV source inside a compressed span adds exactly
-    one compressor's work to that layer and changes no other layer's price.
+    one compressor's work to that layer, makes it own the stream, and changes no other
+    layer's price.
 
     The new source owns the stream from there on, but every reader still reads the same
-    window and top-k of a stream at the same ratio, so nothing a reader pays changes --
-    which is the property that makes a per-layer KV-ownership field necessary rather
-    than derivable from the reads."""
+    window and top-k of a stream at the same ratio and record, so nothing a reader pays
+    changes -- which is the property that makes a per-layer KV-ownership field necessary
+    rather than derivable from the reads. Residency is where it shows: one more ratio-2
+    stream (292 B per context token) and one more state ring."""
     base = v41_config()
     added = v41_config(kv_source_layer_ids=sorted(base["kv_source_layer_ids"] + [5]))
-    before, after = work_by_layer(v41_derive(base)), work_by_layer(v41_derive(added))
+    gb, ga = v41_derive(base), v41_derive(added)
+    before, after = work_by_layer(gb), work_by_layer(ga)
     for i, (b, a) in enumerate(zip(before, after)):
         if i != 5:
             assert a == b, f"layer {i} changed price when layer 5 became a KV source"
-    gained = after[5] - before[5]
-    lost = before[5] - after[5]
-    assert not lost
-    roles = {n.get("role") for n in expanded_layers(v41_derive(added))[5]
-             if node_cost(n) in gained}
+    lb, la = expanded_layers(gb)[5], expanded_layers(ga)[5]
+    assert ({node_cost(n) for n in lb if n["op"] != "Attention"}
+            <= {node_cost(n) for n in la})
+    roles = {n.get("role") for n in la} - {n.get("role") for n in lb}
     assert roles == {"compressor_fused_wkv_wgate", "compressor_pool_norm",
                      "compressor_rope_quant_insert"}, roles
+    assert v41_kv_bytes_per_context_token(ga) - v41_kv_bytes_per_context_token(gb) == 292
+    assert v41_layer_facts(la)["holds_ring"] and not v41_layer_facts(lb)["holds_ring"]
 
 
 def test_deepseek_v41_halving_the_pool_doubles_the_scan_and_the_insert_traffic():
     """Metamorphic: at ratio 1 a compressed stream holds one entry per token where
     ratio 2 holds one per pair. So the scorer scans twice the positions (its ratio
-    halves, 2 -> 1), the per-token cache-insert traffic doubles, and the main read is
-    unchanged, because top-k and window are counts of positions, not fractions of the
-    context."""
+    halves, 2 -> 1), the per-token cache-insert traffic doubles, an owned stream holds
+    twice the bytes per context token, and the main read's top-k and window are
+    unchanged, because they are counts of positions, not fractions of the context."""
     two = v41_config()
     one = v41_config(compress_ratios=[r if r != 2 else 1 for r in two["compress_ratios"]])
     l2, l1 = expanded_layers(v41_derive(two))[2], expanded_layers(v41_derive(one))[2]
@@ -3791,6 +4055,15 @@ def test_deepseek_v41_halving_the_pool_doubles_the_scan_and_the_insert_traffic()
         assert traffic_of(l1, role) == 2 * traffic_of(l2, role), role
     for field in ("index_topk", "window"):
         assert compressed_read(l1)[field] == compressed_read(l2)[field]
+    held = [{c["name"]: c["bytes_per_entry"] / c.get("tokens_per_entry", 1)
+             for c in compressed_read(nodes)["caches"] if c["kind"] == "kv"}
+            for nodes in (l1, l2)]
+    assert held[0]["compressed"] == 2 * held[1]["compressed"]
+    # The scorer's logits row covers one position per entry, so it doubles too.
+    def logits(nodes):
+        (c,) = [n["context"] for n in nodes if n.get("role") == "index_logits_topk"]
+        return c["bytes_per_entry"] / c.get("tokens_per_entry", 1)
+    assert logits(l1) == 2 * logits(l2)
     # And the compressor drops its gate: wkv and wgate merged at ratio 2, wkv alone at 1
     # (compressor.py:216-227), so the projection halves.
     assert (2 * gemm_elements(l1, "compressor_fused_wkv_wgate")
@@ -3821,7 +4094,8 @@ def test_deepseek_v41_mhc_runs_once_per_sublayer_at_fp32():
 
     Summed over the stack, the FP32 projection weights are 2 x layers x mix_hc x
     hc_mult x hidden x 4 bytes, less layer 0's attention side, which projects the
-    broadcast embedding at hidden width."""
+    broadcast embedding at hidden width. The launches that state no per-token traffic
+    are the ones whose work is proportional to the context instead."""
     g, t = v41_graph(), text_config(config_of(V41))
     hc, hidden, layers = t["hc_mult"], t["hidden_size"], t["num_hidden_layers"]
     mix = (2 + hc) * hc
@@ -3830,28 +4104,30 @@ def test_deepseek_v41_mhc_runs_once_per_sublayer_at_fp32():
     assert fp32 == (2 * layers - 1) * mix * hc * hidden * 4 + mix * hidden * 4
     for nodes in expanded_layers(g):
         plain_norms = [n for n in nodes if n["op"] == "Elementwise"
-                       and "bytes_per_token" not in n]
+                       and "bytes_per_token" not in n and "context" not in n]
         assert not plain_norms, [n.get("role") for n in plain_norms]
 
 
 def test_deepseek_v41_draft_module_drafts_a_block_through_its_own_experts():
     """The DSpark draft: dspark_block_size tokens per step (config/speculative.py:
-    1475-1482), through num_nextn_predict_layers layers that read only their window
-    (their compress_ratios entries are 0, attention.py:300-305), route over
-    dspark_n_routed_experts at
-    dspark_num_experts_per_tok, and run no engram and no indexer."""
+    1475-1482), drafted as one parallel block through num_nextn_predict_layers layers
+    that read only their window (their compress_ratios entries are 0, attention.py:
+    300-305) plus the block itself, non-causally -- 128 + 5 = 133 positions -- route over
+    dspark_n_routed_experts at dspark_num_experts_per_tok, and run no engram and no
+    indexer. Each draft layer still caches a 128-position window."""
     g, t = v41_graph(), text_config(config_of(V41))
     spec = g["speculator"]
-    assert spec["method"] == "dspark"
+    assert (spec["method"], spec["drafting"]) == ("dspark", "parallel_block")
     assert spec["num_spec_tokens"] == t["dspark_block_size"]
     draft = expanded_layers(g, spec["stack"])
     assert len(draft) == t["num_nextn_predict_layers"]
     for nodes in draft:
         read = compressed_read(nodes)
         assert not read.get("compress_ratio") and not read.get("index_topk")
-        assert read["window"] == t["sliding_window"]
+        assert read["window"] == t["sliding_window"] + t["dspark_block_size"]
+        assert [c["window"] for c in read["caches"]] == [t["sliding_window"]]
         assert not scoring_scans(nodes)
-        assert traffic_of(nodes, "engram") == 0
+        assert not [n for n in nodes if n.get("residency") == "host"]
         routed = [n for n in nodes if n["op"] == "GroupedGEMM"
                   and n.get("role") != "shared_experts"]
         assert [(n["experts"], n["top_k"]) for n in routed] == [
@@ -3860,9 +4136,34 @@ def test_deepseek_v41_draft_module_drafts_a_block_through_its_own_experts():
     # (dspark.py:226), so that layer's attention-side mHC costs what the target's
     # broadcast layer 0 costs, not a plain pre.
     assert traffic_of(draft[0], "mhc_attn") == traffic_of(expanded_layers(g)[0], "mhc_attn")
-    # main_proj concatenates the three target layers' hidden states.
-    assert gemm_elements(draft[0], "dspark_main_proj") == (
+    # main_proj concatenates the three target layers' hidden states, once per target
+    # token, so it runs in the context stack, not per drafted token.
+    context = expanded_layers(g, spec["context_stack"])
+    assert gemm_elements([n for nodes in context for n in nodes], "dspark_main_proj") == (
         t["hidden_size"] * t["hidden_size"] * len(t["dspark_target_layer_ids"]))
+    assert not gemm_elements([n for nodes in draft for n in nodes], "dspark_main_proj")
+
+
+def test_deepseek_v41_draft_context_projects_each_layer_through_its_own_weights():
+    """Each draft layer's context KV comes from that layer's own fused_wqa_wkv
+    (dspark.py:192), run over the target's tokens. So the context stack has one
+    projection per draft layer, each aliasing a distinct draft layer's weights and
+    matching their shape, and holds no weight of its own besides main_proj."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    spec = g["speculator"]
+    kinds = {k["id"]: k["nodes"] for k in g["layer_kinds"]}
+    context = [n for nodes in expanded_layers(g, spec["context_stack"]) for n in nodes]
+    aliased = [n for n in context if n.get("aliases")]
+    assert len(aliased) == t["num_nextn_predict_layers"]
+    targets = set()
+    for n in aliased:
+        kind, role = n["aliases"].split(".")
+        (orig,) = [m for m in kinds[kind] if m.get("role") == role]
+        assert (orig["n"], orig["k"]) == (n["n"], n["k"])
+        targets.add(kind)
+    assert targets == set(layer_sequence(spec["stack"]))
+    held = [n.get("role") for n in context if weight_cost(n, "fp8")[0]]
+    assert held == ["dspark_main_proj"]
 
 
 @pytest.mark.parametrize("over, fragment", [
@@ -3934,10 +4235,11 @@ def test_deepseek_v41_refuses_every_source_layout_vllm_rejects():
     assert seen[True] > 50 and seen[False] > 50, seen
 
 
-def v41_expected_traffic(t: dict, role: str, ratio: int) -> int | None:
+def v41_expected_traffic(t: dict, role: str, ratio: int) -> float | None:
     """What each launch moves per token, restated from its kernel rather than from the
-    handler. None for an RMSNorm at hidden width, which states no traffic because a
-    consumer derives it from hidden_size."""
+    handler, cache records and the once-per-entry cadence included. None for an RMSNorm
+    at hidden width, which states no traffic because a consumer derives it from
+    hidden_size, and for a launch whose work is proportional to the context."""
     H, act, fp32, hc = t["hidden_size"], 2, 4, t["hc_mult"]
     D, qlora, heads = t["head_dim"], t["q_lora_rank"], t["num_attention_heads"]
     rec = 584                                   # SM90 record, attention.py:503-508
@@ -3946,7 +4248,7 @@ def v41_expected_traffic(t: dict, role: str, ratio: int) -> int | None:
     bundle, mixes = hc * H * act, (hc + hc * hc) * fp32
     post = H * act + 2 * bundle + mixes         # reads x, residual, mixes; writes residual
     pre = bundle + mixes + H * act              # reads residual; writes mixes, layer input
-    rows = (t["engram_max_ngram_size"] - 1) * t["engram_n_heads"]
+    role = re.sub(r"_\d+$", "", role)           # dspark_context_*_{d}: one per draft layer
     table = {
         "mhc_attn_post_pre": post + pre, "mhc_ffn_post_pre": post + pre,
         "mhc_attn_post": post, "mhc_final_post": post, "mhc_attn_pre": pre,
@@ -3958,48 +4260,84 @@ def v41_expected_traffic(t: dict, role: str, ratio: int) -> int | None:
         # Q read + padded write, KV row read, one record written
         "q_rope_kv_insert": 2 * heads * D * act + D * act + rec,
         "o_inv_rope": 2 * heads * D * act,
-        "compressor_rope_quant_insert": (D * act + rec) // max(ratio, 1),
+        "compressor_rope_quant_insert": (D * act + rec) / max(ratio, 1),
         # BF16 q and weights in; FP8 q and FP32 weights out (no stored q scale)
         "index_q_rope_quant": ih * idim * act + ih * act + ih * idim + ih * fp32,
-        "index_k_norm_rope_store": (idim * act + irec) // max(ratio, 1),
-        "engram_lookup": rows * t["engram_head_dim"] * act,
+        "index_k_norm_rope_store": (idim * act + irec) / max(ratio, 1),
         # reads the bundle, the hc keys and the value; writes the bundle
         "engram_gate": 3 * bundle + H * act,
         "dspark_context_kv_norm": 2 * D * act,
         "dspark_context_kv_rope_insert": D * act + rec,
         "dspark_main_norm": None, "dspark_final_norm": None, "final_norm": None,
+        "index_logits_topk": None, "candidate_select": None, "candidate_mask": None,
+        "prefill_dequant_gather": None,
     }
     if role == "compressor_pool_norm":
         row = (2 * D if ratio > 1 else D) * fp32
         # decode: every ratio-2 token reads its raw row and writes it to the ring;
         # a closing token also reads the ring row and its raw row and writes a latent
-        return 2 * row + (2 * row + D * act) // ratio if ratio > 1 else row + D * act
+        return 2 * row + (2 * row + D * act) / ratio if ratio > 1 else row + D * act
     return table[role]
 
 
+def v41_expected_context(t: dict, role: str, ratio: int) -> dict | None:
+    """The context-proportional work a launch states, restated from its kernel: bytes
+    per context position (per entry of a cache it reads), and whether it runs per query
+    token or once per request."""
+    fp32, D, act = 4, t["head_dim"], 2
+    scan = {"tokens_per_entry": ratio} if ratio > 1 else {}
+    return {
+        # an FP32 score per scanned entry, written by the scan and read by the top-k
+        # (sparse_attn_indexer.py:583-626, 726-785)
+        "index_logits_topk": {"bytes_per_entry": 2 * fp32, **scan, "per": "query_token"},
+        # block scores read from the logits row (candidate_blocks.py:20-58, 392-445)
+        "candidate_select": {"bytes_per_entry": fp32, **scan, "per": "query_token"},
+        # -inf stores across the whole row, max_model_len wide in decode
+        # (candidate_blocks.py:114-145, 448-480)
+        "candidate_mask": {"bytes_per_entry": fp32, **scan, "per": "query_token",
+                           "decode_extent": "max_model_len"},
+        # prefill dequantizes the whole stream into a BF16 workspace once per step,
+        # writing head_dim BF16 values per entry
+        "prefill_dequant_gather": {"reads_cache": "compressed", "bytes_per_entry": D * act,
+                                   "per": "request", "phase": "prefill"},
+    }.get(role)
+
+
+def v41_all_launch_sites(g: dict, t: dict) -> list[tuple[str, int, list[dict], int]]:
+    """(where, index, nodes, compress ratio) for every target layer, draft layer, the
+    draft's context stack, the head and the draft head."""
+    spec = g["speculator"]
+    ratios = t["compress_ratios"]
+    return ([("target", i, n, ratios[i]) for i, n in enumerate(expanded_layers(g))]
+            + [("draft", i, n, 0) for i, n in enumerate(expanded_layers(g, spec["stack"]))]
+            + [("context", 0, n, 0) for n in expanded_layers(g, spec["context_stack"])]
+            + [("head", 0, g["head"], 0), ("draft_head", 0, spec["head"], 0)])
+
+
 def test_deepseek_v41_charges_each_launch_the_traffic_its_kernel_moves():
-    """Every Elementwise launch in the target stack, the head and the draft stack moves
-    the bytes its kernel reads and writes, at the stored widths. The only nodes stating
-    no traffic are the hidden-width RMSNorms, which a consumer derives from hidden_size.
+    """Every Elementwise launch in the target stack, the draft's stacks and both heads
+    moves the bytes its kernel reads and writes, at the stored widths, its cache record
+    included and amortized over the tokens one entry covers. A launch whose work grows
+    with the context states that instead, at the width its kernel reads and writes.
 
     Checked per layer, so a ratio applied to the wrong layer, a launch priced twice or
     an unamortized per-entry write each show up where they happen."""
     g, t = v41_graph(), text_config(config_of(V41))
     checked = 0
-    layers = (expanded_layers(g) + expanded_layers(g, g["speculator"]["stack"])
-              + [g["head"]])
-    depth = t["num_hidden_layers"]
-    ratios = t["compress_ratios"][:depth] + [0] * (len(layers) - depth)
-    for i, nodes in enumerate(layers):
+    for where, i, nodes, ratio in v41_all_launch_sites(g, t):
+        caches = caches_of(nodes)
         for n in nodes:
             if n["op"] != "Elementwise":
                 continue
-            want = v41_expected_traffic(t, n["role"], ratios[i])
-            assert n.get("bytes_per_token") == want, (
-                i, n["role"], n.get("bytes_per_token"), want)
+            want = v41_expected_traffic(t, n["role"], ratio)
+            got = per_token(n, caches) if ("bytes_per_token" in n
+                                           or "writes_cache" in n) else None
+            assert got == want, (where, i, n["role"], got, want)
+            assert n.get("context") == v41_expected_context(t, n["role"], ratio), (
+                where, i, n["role"])
             checked += 1
-    # 40 target layers, 3 draft layers and the head, about six launches each.
-    assert checked > 200, checked
+    # 40 target layers, 3 draft layers, the context stack and two heads.
+    assert checked > 250, checked
 
 
 V41_CHECKPOINT_DRAFT = {
@@ -4010,83 +4348,94 @@ V41_CHECKPOINT_DRAFT = {
     "main_proj": [(5120, 15360, "fp8")],                 # mtp.0.main_proj
     "markov_head": [(129280, 256, "bf16")],              # mtp.2.markov_head.head
 }
-# Draft nodes that price compute on weights another node already holds: each draft
-# layer's context projection is its own fused_wqa_wkv (dspark.py:192), and the draft
-# lm_head is the target's (dspark.py:279-282). blis-schemas#51 asks for a way to mark
-# them; until then they are counted here, explicitly, on top of the checkpoint.
-V41_DRAFT_ALIASES = {
-    "every_layer": [(1280, 5120, "fp8"), (512, 5120, "fp8")],   # wq_a + wkv again
-    "last_layer": [(129280, 5120, "bf16")],                      # the target's head
-}
 
 
 def test_deepseek_v41_draft_layers_charge_the_mtp_weights_at_their_resident_width():
-    """The DSpark layers price every matrix of the checkpoint's mtp.* tensors that they
-    multiply by, at vLLM's resident widths, plus only the aliased weights named above.
-    The Markov head's embed half is a gather (qwen3_dspark.py:48-93) and the confidence
-    head runs only under adaptive verification, so neither is a GEMM here."""
+    """The DSpark module prices every matrix of the checkpoint's mtp.* tensors it
+    multiplies by, at vLLM's resident widths, each exactly once: the layers their own
+    attention and experts, the context stack main_proj, and the sequential head the
+    Markov projection. The context projections and the draft lm_head reuse weights
+    another node holds (dspark.py:192, 279-282) and so hold none; the Markov head's
+    embed half is a gather (qwen3_dspark.py:48-93), and the confidence head runs only
+    under adaptive verification."""
     g, t = v41_graph(), text_config(config_of(V41))
-    draft = expanded_layers(g, g["speculator"]["stack"])
-    for d, nodes in enumerate(draft):
-        want = list(V41_CHECKPOINT_DRAFT["every_layer"])
-        want += V41_CHECKPOINT["routed_expert"] * t["dspark_n_routed_experts"]
-        want += V41_DRAFT_ALIASES["every_layer"]
-        if d == 0:
-            want += V41_CHECKPOINT_DRAFT["main_proj"]
-        if d == len(draft) - 1:
-            want += V41_CHECKPOINT_DRAFT["markov_head"] + V41_DRAFT_ALIASES["last_layer"]
-        priced = [weight_cost(n, g["global"]["weight_dtype"]) for n in nodes]
-        assert sum(e for e, _ in priced) == sum(n * k for n, k, _ in want), d
+    spec, glob = g["speculator"], g["global"]["weight_dtype"]
+
+    def check(nodes, want, where):
+        priced = [weight_cost(n, glob) for n in nodes]
+        assert sum(e for e, _ in priced) == sum(n * k for n, k, _ in want), where
         assert sum(b for _, b in priced) == sum(
-            n * k * WIDTH[V41_RESIDENT_OVERRIDES.get((n, k), dt)] for n, k, dt in want), d
+            n * k * WIDTH[V41_RESIDENT_OVERRIDES.get((n, k), dt)]
+            for n, k, dt in want), where
+
+    for d, nodes in enumerate(expanded_layers(g, spec["stack"])):
+        check(nodes, V41_CHECKPOINT_DRAFT["every_layer"]
+              + V41_CHECKPOINT["routed_expert"] * t["dspark_n_routed_experts"], d)
+    check([n for nodes in expanded_layers(g, spec["context_stack"]) for n in nodes],
+          V41_CHECKPOINT_DRAFT["main_proj"], "context")
+    check(spec["head"], [], "draft head")
+    check(spec["sequential_head"], V41_CHECKPOINT_DRAFT["markov_head"], "markov head")
+    # The Markov head's embed half: one rank-wide BF16 row per previous token.
+    (w1,) = [n for n in spec["sequential_head"] if n["op"] == "Gather"]
+    assert (w1["rows"], w1["row_bytes"]) == (t["vocab_size"], t["dspark_markov_rank"] * 2)
+    (lm,) = [n for n in spec["head"] if n["op"] == "GEMM"]
+    assert lm["aliases"] == "head.lm_head"
 
 
 def v41_required_launches(t: dict, where: str, i: int) -> list[str]:
     """The Elementwise launches vLLM v0.31.0 runs on SM90 for one target layer, draft
-    layer or the head, from the config's vectors alone (no graph is read)."""
+    layer, the draft's context stack or a head, from the config's vectors alone (no
+    graph is read)."""
     kv, idx = t["kv_source_layer_ids"], t["index_source_layer_ids"]
+    cand = t.get("candidate_source_layer_id", -1)
     attn = ["qkv_a_layernorm", "q_rope_kv_insert"]
     if where == "head":
         return ["mhc_final_post", "hc_collapse", "final_norm"]
+    if where == "draft_head":
+        return ["mhc_final_post", "hc_collapse", "dspark_final_norm"]
+    if where == "context":
+        return ["dspark_main_norm"] + [
+            f"dspark_context_{s}_{d}" for d in range(t["num_nextn_predict_layers"])
+            for s in ("kv_norm", "kv_rope_insert")]
     if where == "draft":
-        last = i == t["num_nextn_predict_layers"] - 1
-        return (["dspark_context_kv_norm", "dspark_context_kv_rope_insert"]
-                + (["dspark_main_norm", "mhc_attn_broadcast_pre"] if i == 0
-                   else ["mhc_attn_post_pre"])
-                + attn + ["o_inv_rope", "mhc_ffn_post_pre"]
-                + (["mhc_final_post", "hc_collapse", "dspark_final_norm"] if last else []))
+        return ((["mhc_attn_broadcast_pre"] if i == 0 else ["mhc_attn_post_pre"])
+                + attn + ["o_inv_rope", "mhc_ffn_post_pre"])
     if i == 0:
         boundary = ["mhc_attn_broadcast_pre"]
     elif i in t["engram_layer_ids"]:
-        boundary = ["mhc_attn_post", "engram_lookup", "engram_gate", "mhc_attn_pre"]
+        boundary = ["mhc_attn_post", "engram_gate", "mhc_attn_pre"]
     else:
         boundary = ["mhc_attn_post_pre"]
     work = boundary + attn
     if i in kv:
         work += ["compressor_pool_norm", "compressor_rope_quant_insert"]
     if i in idx:
-        work += ["index_q_rope_quant"] + (["index_k_norm_rope_store"] if i in kv else [])
+        work += (["index_q_rope_quant"] + (["index_k_norm_rope_store"] if i in kv else [])
+                 + ["index_logits_topk"])
+        if i == cand:
+            work.append("candidate_select")
+        elif cand >= 0 and i > cand:
+            work.append("candidate_mask")
+    if t["compress_ratios"][i]:
+        work.append("prefill_dequant_gather")
     return work + ["o_inv_rope", "mhc_ffn_post_pre"]
 
 
 def test_deepseek_v41_every_layer_launches_exactly_the_work_vllm_runs():
     """Each layer's Elementwise launch count and total traffic equal what the config
     assigns it, so a launch the handler forgets (an engram gate, a norm, the inverse
-    RoPE, a head mixer) is missing from the sum rather than invisible. Comparing totals
-    lets a handler regroup launches that move the same bytes."""
+    RoPE, a head mixer, a candidate mask) is missing from the sum rather than invisible.
+    Comparing totals lets a handler regroup launches that move the same bytes."""
     g, t = v41_graph(), text_config(config_of(V41))
-    ratios = t["compress_ratios"]
-    stacks = ([("target", i, n) for i, n in enumerate(expanded_layers(g))]
-              + [("draft", i, n) for i, n in enumerate(
-                  expanded_layers(g, g["speculator"]["stack"]))]
-              + [("head", 0, g["head"])])
-    for where, i, nodes in stacks:
+    for where, i, nodes, ratio in v41_all_launch_sites(g, t):
         launches = [n for n in nodes if n["op"] == "Elementwise"]
         want = v41_required_launches(t, where, i)
-        ratio = ratios[i] if where == "target" else 0
+        caches = caches_of(nodes)
         assert len(launches) == len(want), (where, i, [n["role"] for n in launches], want)
-        assert sum(n.get("bytes_per_token") or 0 for n in launches) == sum(
+        assert sum(per_token(n, caches) for n in launches) == sum(
             v41_expected_traffic(t, r, ratio) or 0 for r in want), (where, i)
+        assert sum(1 for n in launches if "context" in n) == sum(
+            1 for r in want if v41_expected_context(t, r, ratio)), (where, i)
 
 
 def test_deepseek_v41_largest_launches_move_the_bytes_their_kernels_state():
@@ -4095,8 +4444,9 @@ def test_deepseek_v41_largest_launches_move_the_bytes_their_kernels_state():
     breaks a literal rather than moving both sides together."""
     g = v41_graph()
     layers = expanded_layers(g)
-    by_role = {n["role"]: n["bytes_per_token"] for n in layers[2]
-               if n["op"] == "Elementwise" and "bytes_per_token" in n}
+    caches = caches_of(layers[2])
+    by_role = {n["role"]: per_token(n, caches) for n in layers[2]
+               if n["op"] == "Elementwise" and "context" not in n}
     # residual 4 x 5120 BF16 = 40,960 per pass; post 10,240 + 2 x 40,960 + 80, pre
     # 40,960 + 80 + 10,240 (kernels/mhc/tilelang.py:296-358)
     assert by_role["mhc_attn_post_pre"] == 143_520
@@ -4107,6 +4457,8 @@ def test_deepseek_v41_largest_launches_move_the_bytes_their_kernels_state():
     # decode at ratio 2: 2 x 4,096 + (2 x 4,096 + 1,024) / 2
     # (fused_compress_quant_cache.py:118-221)
     assert by_role["compressor_pool_norm"] == 12_800
+    # one 1,024 B latent read and one 584 B record written per pair of tokens
+    assert by_role["compressor_rope_quant_insert"] == 804
     engram = {n["role"]: n["bytes_per_token"] for n in layers[1]
               if n["op"] == "Elementwise" and "bytes_per_token" in n}
     # bundle, keys and the shared value read, bundle written (common/engram.py:755-843)
@@ -4115,35 +4467,130 @@ def test_deepseek_v41_largest_launches_move_the_bytes_their_kernels_state():
 
 def test_deepseek_v41_main_read_is_the_latent_record_every_layer_caches():
     """Every target and draft layer reads a one-head latent cache of head_dim, RoPE
-    included, with qk_rope_head_dim of it rotated. head_dim is inclusive of the RoPE
-    width (compressor.py:209-210), and the width is what a consumer multiplies by the
-    selected positions to price a decode read."""
+    included, with qk_rope_head_dim of it rotated, stored as a 584 B record on SM90.
+    head_dim is inclusive of the RoPE width (compressor.py:209-210), and the record is
+    what a consumer multiplies by the selected positions to price a decode read."""
     g, t = v41_graph(), text_config(config_of(V41))
     for nodes in expanded_layers(g) + expanded_layers(g, g["speculator"]["stack"]):
         read = compressed_read(nodes)
         assert (read["n_kv"], read["d_h"], read["qk_rope_head_dim"], read["n_q"]) == (
             1, t["head_dim"], t["qk_rope_head_dim"], t["num_attention_heads"])
+        assert {c["bytes_per_entry"] for c in read["caches"] if c["kind"] != "state"} == {
+            584}
         for scan in scoring_scans(nodes):
-            assert (scan["n_q"], scan["n_kv"], scan["d_h"]) == (
-                t["index_n_heads"], 1, t["index_head_dim"])
+            assert (scan["n_q"], scan["n_kv"], scan["d_h"], scan["tp"]) == (
+                t["index_n_heads"], 1, t["index_head_dim"], "replicated")
+            assert [c["bytes_per_entry"] for c in scan["caches"]] == [
+                t["index_head_dim"] + t["index_head_dim"] // 128 * 4]
+
+
+def test_deepseek_v41_splits_across_tensor_parallel_ranks_where_vllm_does():
+    """Each node's tensor-parallel layout, which sets what one rank computes and holds.
+
+    Split by heads: wq_b (column), the grouped wo_a (column, by group) and wo_b (row);
+    the inverse RoPE over each rank's own heads (deepseek_v4/nvidia/ops/o_proj.py:61-77);
+    the engram wkv (column, common/engram.py:928-937); the lm_head (ParallelLMHead).
+    Everything else in attention is replicated: the merged wq_a/wkv (`disable_tp=True`,
+    attention.py:354-370), its norm, the compressor, the indexer, and the Q RoPE + insert,
+    whose Q write FlashMLA pads to 64 heads per rank (nvidia/flashmla.py:66-74). The
+    experts state no tp, being split by expert parallelism instead."""
+    g = v41_graph()
+    split = {"wq_b": "column", "wo_a": "column", "wo_b": "row", "o_inv_rope": "sharded",
+             "engram_wkv": "column", "lm_head": "column", "dspark_lm_head": "column"}
+    spec = g["speculator"]
+    nodes = [n for layers in (expanded_layers(g), expanded_layers(g, spec["stack"]),
+                              expanded_layers(g, spec["context_stack"]),
+                              [g["head"], spec["head"], spec["sequential_head"]])
+             for ns in layers for n in ns]
+    seen = set()
+    for n in nodes:
+        if n["op"] in ("AllReduce", "AllGather", "ReduceScatter", "All2All", "Gather"):
+            continue
+        role = n.get("role")
+        if n["op"] == "GroupedGEMM":
+            assert "tp" not in n, role
+        elif n["op"] == "Elementwise" and "tp" not in n:
+            # a hidden-width RMSNorm, sized from hidden_size by the consumer
+            assert role.endswith("norm"), role
+        elif n["op"] == "Attention" and not role:
+            # The main read's per-rank heads are FlashMLA's padding to 64, a property of
+            # the backend and the TP width, so its layout is left to the consumer
+            # (inference-sim/blis-latency-kernel#39).
+            assert "tp" not in n
+        else:
+            assert n["tp"] == split.get(role, "replicated"), (role, n["tp"])
+            seen.add(role)
+    assert set(split) <= seen
+
+
+def v41_collectives(nodes: list[dict], sequence_parallel: bool) -> collections.Counter:
+    """The collectives a layer launches under V4.1's own sequence parallelism or
+    without it, at tensor and expert parallelism both above one."""
+    live = {"tensor_parallel", "expert_parallel"} | (
+        {"sequence_parallel"} if sequence_parallel
+        else {"tensor_parallel_unless_sequence_parallel"})
+    return collections.Counter((n["op"], n.get("role")) for n in nodes
+                               if n.get("emit") in live
+                               and n["op"] in ("AllReduce", "AllGather", "ReduceScatter",
+                                               "All2All"))
 
 
 def test_deepseek_v41_each_layer_reduces_and_gathers_what_vllm_does():
-    """Per layer: one tensor-parallel all-reduce after wo_b and one for the MoE output
-    (nvidia/model.py:318-329), the expert-parallel dispatch, and, on engram layers
-    only, the two tensor-parallel all-gathers of the rows and the wkv output
-    (common/engram.py:928-937, 996)."""
+    """Per layer, in both of V4.1's tensor-parallel modes (nvidia/model.py
+    _use_sequence_parallel: EP on, TP > 1, and mega-MoE or DP > 1).
+
+    Without sequence parallelism the residual stream is replicated: attention's output
+    is all-reduced after wo_b, the MoE output all-reduced, and an engram layer
+    all-gathers its rows and its wkv output across heads (common/engram.py:928-937,
+    996). With it the stream is sharded by token: attention's input is all-gathered and
+    its output reduce-scattered, the MoE runs on the local tokens with no reduction, and
+    the engram rows are gathered along tokens. Either way the experts dispatch over
+    EP, and the hidden state is gathered before the head only under sequence
+    parallelism. Each mode must move the residual stream back to the layout it started
+    in, so every layer gathers once for each reduce-scatter."""
     g, t = v41_graph(), text_config(config_of(V41))
-    def of(nodes, op, emit):
-        return sum(1 for n in nodes if n["op"] == op and n.get("emit") == emit)
-    for i, nodes in enumerate(expanded_layers(g)):
-        assert of(nodes, "AllReduce", "tensor_parallel") == 1, i
-        assert of(nodes, "AllReduce", "tensor_parallel_unless_sp_moe") == 1, i
-        assert of(nodes, "All2All", "expert_parallel") == 1, i
-        assert of(nodes, "AllGather", "tensor_parallel") == (
-            2 if i in t["engram_layer_ids"] else 0), i
-    for nodes in expanded_layers(g, g["speculator"]["stack"]):
-        assert of(nodes, "AllGather", "tensor_parallel") == 0
+    sites = ([(i, n, i in t["engram_layer_ids"]) for i, n in enumerate(expanded_layers(g))]
+             + [(-1 - d, n, False)
+                for d, n in enumerate(expanded_layers(g, g["speculator"]["stack"]))])
+    for i, nodes, engram in sites:
+        replicated, sharded = v41_collectives(nodes, False), v41_collectives(nodes, True)
+        want_rep = collections.Counter({("AllReduce", "attn_out"): 1,
+                                        ("AllReduce", "mlp_out"): 1,
+                                        ("All2All", "moe_dispatch_combine"): 1})
+        want_sp = collections.Counter({("AllGather", "attn_in"): 1,
+                                       ("ReduceScatter", "attn_out"): 1,
+                                       ("All2All", "moe_dispatch_combine"): 1})
+        if engram:
+            want_rep += {("AllGather", "engram_rows"): 1, ("AllGather", "engram_wkv_out"): 1}
+            want_sp += {("AllGather", "engram_rows_by_token"): 1}
+        if i == -1:
+            # The draft looks up the target's embedding by row and sums it.
+            want_rep += {("AllReduce", "dspark_embed_out"): 1}
+            want_sp += {("AllReduce", "dspark_embed_out"): 1}
+        assert replicated == want_rep, (i, replicated)
+        assert sharded == want_sp, (i, sharded)
+    for head in (g["head"], g["speculator"]["head"]):
+        assert not v41_collectives(head, False)
+        assert sum(v41_collectives(head, True).values()) == 1
+        assert [n["op"] for n in head if n.get("emit")] == ["AllGather"]
+
+
+def test_deepseek_v41_engram_gathers_move_the_rows_and_the_projection_they_feed():
+    """The engram collectives move what the lookup and wkv produce for every token: the
+    24 gathered rows at BF16 head_dim, and wkv's BF16 output for every column of the
+    column-split projection. The two modes gather the same rows, along heads or along
+    tokens."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    for i in t["engram_layer_ids"]:
+        nodes = expanded_layers(g)[i]
+        (lookup,) = [n for n in nodes if n["op"] == "Gather"]
+        (wkv,) = [n for n in nodes if n.get("role") == "engram_wkv"]
+        moved = {n["role"]: n["bytes_per_token"] for n in nodes if n["op"] == "AllGather"
+                 and n.get("bytes_per_token")}
+        assert moved["engram_rows"] == moved["engram_rows_by_token"] == (
+            lookup["out_bytes_per_token"])
+        assert moved["engram_wkv_out"] == wkv["n"] * 2
+        assert wkv["tp"] == "column"
 
 
 def v41_derive_from_file(tmp_path, raw: dict) -> dict:
@@ -4156,9 +4603,12 @@ def v41_derive_from_file(tmp_path, raw: dict) -> dict:
 def test_deepseek_v41_derive_applies_the_head_and_the_speculator_the_handler_states(
         tmp_path):
     """Through derive() itself: the head runs the mHC post and collapse before the final
-    norm and prices lm_head at BF16, and the speculator is the handler's DSpark stack
-    rather than derive()'s generic MTP fallback. A checkpoint with no draft layers gets
-    no speculator, although num_nextn_predict_layers is the field the fallback reads."""
+    norm and prices lm_head at BF16; the global block carries the architecture, the
+    resident scale and the 1M-token context window; and the speculator is the
+    handler's DSpark module -- parallel block, context stack, aliased head, sequential
+    Markov head -- rather than derive()'s generic MTP fallback. A checkpoint with no
+    draft layers gets no speculator, although num_nextn_predict_layers is the field the
+    fallback reads."""
     raw = config_of(V41)
     g = v41_derive_from_file(tmp_path, raw)
     t = text_config(raw)
@@ -4168,8 +4618,15 @@ def test_deepseek_v41_derive_applies_the_head_and_the_speculator_the_handler_sta
     lm = [n for n in g["head"] if n["op"] == "GEMM"]
     assert [(n["n"], n["k"], n["weight_dtype"]) for n in lm] == [
         (t["vocab_size"], t["hidden_size"], "bf16")]
-    assert g["speculator"]["method"] == "dspark"
-    assert g["speculator"]["num_spec_tokens"] == t["dspark_block_size"]
+    assert (g["global"]["architecture"], g["global"]["context_window"],
+            g["global"]["weight_scale"]) == (
+        "DeepseekV41ForCausalLM", t["max_position_embeddings"],
+        {"elements": 32, "bytes": 1})
+    spec = g["speculator"]
+    assert (spec["method"], spec["num_spec_tokens"], spec["drafting"]) == (
+        "dspark", t["dspark_block_size"], "parallel_block")
+    assert spec["context_stack"] and spec["head"] and spec["sequential_head"]
+    assert g["embedding"] and g["arch_overrides"]
 
     bare = dict(raw, text_config=dict(t, num_nextn_predict_layers=0,
                                       compress_ratios=t["compress_ratios"][:40]))
@@ -4188,14 +4645,17 @@ def test_deepseek_v41_omitted_draft_ratios_price_like_stated_zeros():
 
 def test_deepseek_v41_main_proj_reads_one_hidden_state_per_target_layer():
     """Metamorphic: dropping a DSpark target layer narrows main_proj's input by one
-    hidden width (dspark.py:100-108) and changes nothing else in the draft."""
+    hidden width (dspark.py:100-108) and changes nothing the draft layers pay."""
     full = v41_derive(v41_config())
     two = v41_derive(v41_config(dspark_target_layer_ids=[38, 39]))
     hidden = text_config(config_of(V41))["hidden_size"]
     def main_proj(g):
-        return [n["k"] for n in expanded_layers(g, g["speculator"]["stack"])[0]
-                if n.get("role") == "dspark_main_proj"]
+        return [n["k"] for nodes in expanded_layers(g, g["speculator"]["context_stack"])
+                for n in nodes if n.get("role") == "dspark_main_proj"]
     assert main_proj(full) == [3 * hidden] and main_proj(two) == [2 * hidden]
+    draft = [expanded_layers(g, g["speculator"]["stack"]) for g in (full, two)]
+    assert [[node_cost(n) for n in nodes] for nodes in draft[0]] == [
+        [node_cost(n) for n in nodes] for nodes in draft[1]]
 
 
 def test_a_deriver_crash_is_reported_against_its_model(tmp_path):
@@ -4258,11 +4718,15 @@ def test_derive_refuses_a_handler_result_of_the_wrong_length(tmp_path, monkeypat
 
 def test_derive_refuses_a_head_width_that_contradicts_the_exclusion_list(
         tmp_path, monkeypatch):
-    """Two sources for one width must agree; the later must not silently win."""
-    monkeypatch.setitem(deriver().HEAD_UNQUANTIZED, "StubForCausalLM",
-                        {"lm_head": "lm_head"})
-    with pytest.raises(deriver().DeriveError, match="exclusion list gives lm_head bf16"):
+    """Two sources for one width must agree; the later must not silently win. A
+    handler's head that prices lm_head at FP32 contradicts a quant config that excludes
+    lm_head, and so leaves it BF16."""
+    dg = deriver()
+    monkeypatch.setitem(dg.HEAD_UNQUANTIZED, "StubForCausalLM", {"lm_head": "lm_head"})
+    head = [dg.norm("final_norm"),
+            {"op": "GEMM", "role": "lm_head", "n": 128, "k": 64, "weight_dtype": "fp32"}]
+    with pytest.raises(dg.DeriveError, match="exclusion list gives lm_head bf16"):
         derive_through_stub(
-            tmp_path, monkeypatch, ({"lm_head_dtype": "fp32"},),
+            tmp_path, monkeypatch, ({"head": head},),
             quantization_config={"quant_method": "fp8",
                                  "modules_to_not_convert": ["lm_head"]})
