@@ -1957,7 +1957,19 @@ def handler_deepseek_v41(cfg, raw, model):
         speculation (inference-sim/blis-schemas#51);
       * small per-token launches below any node's resolution: the decode top-k index
         translation (nvidia/flashmla.py:181-193) and the engram n-gram hash
-        (nvidia/model.py:842-879).
+        (nvidia/model.py:842-879);
+      * V4.1's own sequence parallelism. It is decided by `_use_sequence_parallel`
+        (nvidia/model.py:239-247: PP 1, EP on, TP > 1, and a mega-MoE backend or
+        DP > 1), never by the engine-wide use_sequence_parallel_moe this schema's
+        conditions name (config/parallel.py:719-736). Under it `wo_b` stops reducing
+        and attention is all-gathered and reduce-scattered (nvidia/model.py:318-319,
+        579-586), FusedMoE skips its final all-reduce (fused_moe/runner/
+        moe_runner.py:506-512), and the engram wkv is replicated (common/engram.py:936),
+        while the residual stream and mHC run on token shards. The draft layers take
+        the same flag (dspark.py:85). So the collectives below follow the engine-wide
+        rule and are wrong wherever the two disagree -- e.g. TP 4, DP 1, EP with a
+        mega-MoE backend -- until inference-sim/blis-schemas#55's
+        `sequence_parallel` conditions can state it.
 
     The main read states window and index_topk and NOT compress_ratio. A compressed
     layer reads its window plus at most index_topk positions of its source's stream
