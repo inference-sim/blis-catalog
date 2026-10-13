@@ -30,8 +30,11 @@ jobs:
         # blis-schemas; this step runs that owner's binary against the checkout and
         # fails naming the file when an entry is malformed. Nothing here re-implements
         # a rule — pinned by version so the gate is reproducible and bumping it is a
-        # one-line change.
-        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.2.0 .
+        # one-line change. Pinned to blis-schemas#55's head until it is released: the
+        # DeepSeek-V4.1 graph, the chips' ComputeCapability and the caches, gathers and
+        # sequence-parallel conditions are #55's fields, which v0.2.0 rejects. Move to
+        # the release tag that ships #55.
+        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@983dc23502b4067c5494c373c11dbe9fd01afad9 .
 
   derive-graph:
     name: check derived graphs
