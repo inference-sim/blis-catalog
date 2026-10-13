@@ -3845,16 +3845,24 @@ def test_deepseek_v41_engram_tables_live_in_host_memory_at_their_stored_width():
 def test_deepseek_v41_embedding_is_a_bf16_gather_over_the_vocabulary():
     """The token embedding is a row gather from a vocab x hidden BF16 table (the quant
     config has no method for it), split by rows across tensor parallelism and summed
-    back. The draft reuses it rather than holding its own."""
+    back. The draft reuses it rather than holding its own: its lookup is the
+    speculator's embedding, outside every layer, because its reduction runs before the
+    stream is sharded and so in both sequence-parallel modes (dspark.py:93-98,
+    205-215)."""
     g, t = v41_graph(), text_config(config_of(V41))
     (embed,) = [n for n in g["embedding"] if n["op"] == "Gather"]
     assert (embed["rows"], embed["row_bytes"], embed["rows_per_token"],
             embed["shard"]) == (t["vocab_size"], t["hidden_size"] * 2, 1, "rows")
     assert [n["emit"] for n in g["embedding"] if n["op"] == "AllReduce"] == [
         "tensor_parallel"]
-    draft = [n for nodes in expanded_layers(g, g["speculator"]["stack"]) for n in nodes
-             if n["op"] == "Gather"]
-    assert [n.get("aliases") for n in draft] == ["embedding.embed_tokens"]
+    spec = g["speculator"]
+    assert not [n for nodes in expanded_layers(g, spec["stack"]) for n in nodes
+                if n["op"] == "Gather"]
+    assert [(n["op"], n.get("aliases"), n.get("emit")) for n in spec["embedding"]] == [
+        ("Gather", "embedding.embed_tokens", None), ("AllReduce", None, "tensor_parallel")]
+    (draft,) = [n for n in spec["embedding"] if n["op"] == "Gather"]
+    assert {k: v for k, v in draft.items() if k not in ("role", "aliases")} == {
+        k: v for k, v in embed.items() if k != "role"}
 
 
 def v41_layer_facts(nodes: list[dict]) -> dict:
@@ -3942,7 +3950,8 @@ def v41_derive(t: dict) -> dict:
     raw = dict(config_of(V41), text_config=t)
     kinds, stack, extras = dg.handler_deepseek_v41(t, raw, "synthetic")
     return {"layer_kinds": kinds, "stack": stack, "speculator": extras["speculator"],
-            "global": {"weight_dtype": "fp8"}, "head": extras["head"],
+            "global": {"weight_dtype": "fp8", "architecture": "DeepseekV41ForCausalLM"},
+            "head": extras["head"],
             "embedding": extras["embedding"]}
 
 
@@ -4523,6 +4532,48 @@ def test_deepseek_v41_splits_across_tensor_parallel_ranks_where_vllm_does():
     assert set(split) <= seen
 
 
+def test_deepseek_v41_residual_stream_work_runs_on_the_token_shard_under_its_sp():
+    """Under V4.1's own sequence parallelism the residual stream is sharded by token
+    (sp_shard, nvidia/model.py:898-905), and only attention runs on the gathered rows,
+    between its all-gather and its reduce-scatter (:579-586). So exactly the work on the
+    stream is token-sharded: every mHC launch and projection, the engram injection's
+    wkv and gate (common/engram.py:999-1016), the router and the experts, and the head's
+    post, collapse and final norm before it gathers (:976-990; dspark.py:229-248).
+
+    Attention's own work, the compressor and the indexer are not: they run on every
+    token. Nor is the engram lookup, which covers every token before the shard
+    (nvidia/model.py:890-895), nor anything in the draft's context stack, which reads the
+    gathered target states, nor any collective. Stated anywhere else, a node is priced
+    at 1/tp of the rows it runs on, or tp times the rows it does."""
+    g = v41_graph()
+    spec = g["speculator"]
+    stream = re.compile(r"mhc_|hc_|engram_gate$|engram_wkv$|router$|experts$|"
+                        r"shared_experts$|final_norm$")
+    def check(nodes, where, expect_head_norm=True):
+        for n in nodes:
+            sharded = n.get("under_sequence_parallel") == "token_sharded"
+            role = n.get("role") or ""
+            if n["op"] in ("AllReduce", "AllGather", "ReduceScatter", "All2All"):
+                assert not sharded, (where, role)
+            elif role == "dspark_final_norm":
+                # applied by compute_logits, after the drafter gathers
+                assert not sharded, where
+            else:
+                assert sharded == bool(stream.match(role)), (where, role, sharded)
+    for i, nodes in enumerate(expanded_layers(g)):
+        check(nodes, i)
+        assert sum(n.get("under_sequence_parallel") == "token_sharded"
+                   for n in nodes if n["op"] == "GroupedGEMM") == 2, i
+    for d, nodes in enumerate(expanded_layers(g, spec["stack"])):
+        check(nodes, f"draft {d}")
+    check(g["head"], "head")
+    check(spec["head"], "draft head")
+    for nodes in expanded_layers(g, spec["context_stack"]):
+        assert not [n for n in nodes if n.get("under_sequence_parallel")]
+    for n in g["embedding"] + spec["embedding"] + spec["sequential_head"]:
+        assert "under_sequence_parallel" not in n, n.get("role")
+
+
 def v41_collectives(nodes: list[dict], sequence_parallel: bool) -> collections.Counter:
     """The collectives a layer launches under V4.1's own sequence parallelism or
     without it, at tensor and expert parallelism both above one."""
@@ -4563,12 +4614,12 @@ def test_deepseek_v41_each_layer_reduces_and_gathers_what_vllm_does():
         if engram:
             want_rep += {("AllGather", "engram_rows"): 1, ("AllGather", "engram_wkv_out"): 1}
             want_sp += {("AllGather", "engram_rows_by_token"): 1}
-        if i == -1:
-            # The draft looks up the target's embedding by row and sums it.
-            want_rep += {("AllReduce", "dspark_embed_out"): 1}
-            want_sp += {("AllReduce", "dspark_embed_out"): 1}
         assert replicated == want_rep, (i, replicated)
         assert sharded == want_sp, (i, sharded)
+    # The lookups reduce before the stream is sharded, so in both modes.
+    for embedding in (g["embedding"], g["speculator"]["embedding"]):
+        for sp in (False, True):
+            assert [op for op, _ in v41_collectives(embedding, sp)] == ["AllReduce"]
     for head in (g["head"], g["speculator"]["head"]):
         assert not v41_collectives(head, False)
         assert sum(v41_collectives(head, True).values()) == 1

@@ -22,12 +22,14 @@ layer_kinds:
     role: mhc_attn_broadcast_pre
     bytes_per_token: 102480
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn_broadcast
     n: 24
     k: 5120
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -93,18 +95,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -112,12 +117,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -169,6 +176,7 @@ layer_kinds:
     role: mhc_attn_post
     bytes_per_token: 92240
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: Gather
     role: engram_lookup
     rows: 384006168
@@ -191,6 +199,7 @@ layer_kinds:
     n: 25600
     k: 6144
     tp: column
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: engram_wkv_out
     emit: tensor_parallel_unless_sequence_parallel
@@ -199,16 +208,19 @@ layer_kinds:
     role: engram_gate
     bytes_per_token: 133120
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: Elementwise
     role: mhc_attn_pre
     bytes_per_token: 51280
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -274,18 +286,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -293,12 +308,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -364,12 +381,14 @@ layer_kinds:
     role: mhc_attn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -521,18 +540,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -540,12 +562,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -619,12 +643,14 @@ layer_kinds:
     role: mhc_attn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -705,18 +731,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -724,12 +753,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -783,6 +814,7 @@ layer_kinds:
     role: mhc_attn_post
     bytes_per_token: 92240
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: Gather
     role: engram_lookup
     rows: 384016682
@@ -805,6 +837,7 @@ layer_kinds:
     n: 25600
     k: 6144
     tp: column
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: engram_wkv_out
     emit: tensor_parallel_unless_sequence_parallel
@@ -813,16 +846,19 @@ layer_kinds:
     role: engram_gate
     bytes_per_token: 133120
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: Elementwise
     role: mhc_attn_pre
     bytes_per_token: 51280
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -974,18 +1010,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -993,12 +1032,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -1086,12 +1127,14 @@ layer_kinds:
     role: mhc_attn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -1239,18 +1282,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -1258,12 +1304,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -1339,12 +1387,14 @@ layer_kinds:
     role: mhc_attn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -1424,18 +1474,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -1443,12 +1496,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -1502,12 +1557,14 @@ layer_kinds:
     role: mhc_attn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -1628,18 +1685,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 384
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -1647,12 +1707,14 @@ layer_kinds:
     experts: 384
     top_k: 6
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -1714,27 +1776,18 @@ layer_kinds:
     - 26
 - id: dspark_0
   nodes:
-  - op: Gather
-    role: dspark_embed_tokens
-    rows: 129280
-    row_bytes: 10240
-    rows_per_token: 1
-    out_bytes_per_token: 10240
-    shard: rows
-    aliases: embedding.embed_tokens
-  - op: AllReduce
-    role: dspark_embed_out
-    emit: tensor_parallel
   - op: Elementwise
     role: mhc_attn_broadcast_pre
     bytes_per_token: 102480
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -1800,18 +1853,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 128
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -1819,12 +1875,14 @@ layer_kinds:
     experts: 128
     top_k: 3
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -1870,22 +1928,20 @@ layer_kinds:
     - 18
   - - 18
     - 19
-  - - 19
-    - 20
-  - - 20
-    - 21
 - id: dspark_1
   nodes:
   - op: Elementwise
     role: mhc_attn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -1951,18 +2007,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 128
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -1970,12 +2029,14 @@ layer_kinds:
     experts: 128
     top_k: 3
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -2027,12 +2088,14 @@ layer_kinds:
     role: mhc_attn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_attn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: attn_in
     emit: sequence_parallel
@@ -2098,18 +2161,21 @@ layer_kinds:
     role: mhc_ffn_post_pre
     bytes_per_token: 143520
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: hc_ffn_fn
     n: 24
     k: 20480
     weight_dtype: fp32
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GEMM
     role: router
     n: 128
     k: 5120
     weight_dtype: bf16
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: experts
     n: 2304
@@ -2117,12 +2183,14 @@ layer_kinds:
     experts: 128
     top_k: 3
     weight_dtype: mxfp4
+    under_sequence_parallel: token_sharded
   - op: GroupedGEMM
     role: shared_experts
     n: 2304
     k: 5120
     experts: 1
     top_k: 1
+    under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
     emit: expert_parallel
@@ -2291,12 +2359,15 @@ head:
   role: mhc_final_post
   bytes_per_token: 92240
   tp: replicated
+  under_sequence_parallel: token_sharded
 - op: Elementwise
   role: hc_collapse
   bytes_per_token: 51216
   tp: replicated
+  under_sequence_parallel: token_sharded
 - op: Elementwise
   role: final_norm
+  under_sequence_parallel: token_sharded
 - op: AllGather
   role: head_in
   emit: sequence_parallel
@@ -2328,6 +2399,18 @@ speculator:
   method: dspark
   num_spec_tokens: 5
   drafting: parallel_block
+  embedding:
+  - op: Gather
+    role: dspark_embed_tokens
+    rows: 129280
+    row_bytes: 10240
+    rows_per_token: 1
+    out_bytes_per_token: 10240
+    shard: rows
+    aliases: embedding.embed_tokens
+  - op: AllReduce
+    role: dspark_embed_out
+    emit: tensor_parallel
   stack:
     pattern:
     - dspark_0
@@ -2343,10 +2426,12 @@ speculator:
     role: mhc_final_post
     bytes_per_token: 92240
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: Elementwise
     role: hc_collapse
     bytes_per_token: 51216
     tp: replicated
+    under_sequence_parallel: token_sharded
   - op: AllGather
     role: dspark_head_in
     emit: sequence_parallel
