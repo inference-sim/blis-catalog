@@ -12,3 +12,5 @@ _comment_sm: "SMCount is the count of ENABLED Streaming Multiprocessors per GPU,
 SMCount: 148
 GPUsPerNode: 4
 GPUsPerRack: 72
+_comment_cc: "ComputeCapability is the CUDA compute capability NVIDIA lists for this part (https://developer.nvidia.com/cuda-gpus). A model graph that differs by GPU generation resolves its architecture overlay by the major version, so a chip that states none cannot run such a graph."
+ComputeCapability: "10.0"
