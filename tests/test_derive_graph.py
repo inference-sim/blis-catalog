@@ -4788,7 +4788,9 @@ def v4_checkpoint_layer(t: dict, i: int) -> list[tuple[int, int, str]]:
         mats += V4_CHECKPOINT["indexer"]
     if i == 0:
         # The broadcast pre projects the embedding with hc_attn_fn summed over its
-        # hc_mult copies (nvidia/model.py:1821-1834): (24, 7168) in place of (24, 28672).
+        # hc_mult copies (nvidia/model.py:1821-1834): it multiplies by (24, 7168), not
+        # (24, 28672). The (24, 28672) tensor stays resident, unmultiplied, which the
+        # handler's docstring records rather than prices.
         mats.remove((24, 28672, "fp32"))
         mats.append((24, 7168, "fp32"))
     return mats

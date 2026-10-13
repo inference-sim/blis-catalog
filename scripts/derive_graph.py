@@ -1739,6 +1739,11 @@ def handler_deepseek_v4(cfg, raw, model):
         DeepGEMM path (quantization/utils/fp8_utils.py:1085-1108), at most 0.025% of
         their bytes, and unverified on the FlashInfer path, so weight_scale is not
         stated;
+      * resident tensors no GEMM or Gather prices: layer 0 keeps its (24, 28672)
+        hc_attn_fn beside the summed broadcast matrix it multiplies by
+        (nvidia/model.py:1229-1236, 1333-1348, 1821-1834), 2.75 MB, and the norms,
+        biases, attention sinks, compressor ape tables and mHC scales, about 11 MB --
+        some 0.002% of the weights together;
       * work the target runs only with MTP enabled: the copy of the whole hc stream
         into the drafter's buffer (nvidia/model.py:1637-1639)
         (inference-sim/blis-schemas#51);
@@ -2338,6 +2343,8 @@ def handler_deepseek_v41(cfg, raw, model):
         parallelism, the head's gather of the whole hc stream and its pre-mix ahead of
         the collapse and norm, in place of the collapsed state after them (:976-990).
         No emit condition names speculation (inference-sim/blis-schemas#51);
+      * layer 0's (24, 20480) hc_attn_fn, which stays resident beside the summed
+        broadcast matrix it multiplies by (nvidia/model.py:402-409, 1178-1191), 1.9 MB;
       * small per-token launches below any node's resolution: the decode top-k index
         translation (nvidia/flashmla.py:181-193), the top-k buffer clear
         (sparse_attn_indexer.py:479-480) and the engram n-gram hash (nvidia/model.py:
