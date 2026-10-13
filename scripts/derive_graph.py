@@ -1677,9 +1677,14 @@ def handler_minimax_m2(cfg, raw, model):
 # dims and eight bytes of UE8M0 scales, one per 64 NoPE dims plus a pad
 # (deepseek_v4/attention.py:876-878; compressor.py:299-301). vLLM forces the cache
 # dtype to fp8_ds_mla (attention.py:106-122), whose pages pad to FlashMLA's 576 B stride
-# (attention.py:869; v1/attention/backends/mla/sparse_swa.py:83).
+# (attention.py:873; v1/attention/backends/mla/sparse_swa.py:84).
 DSV4_KV_RECORD_BYTES = 584
 DSV4_PAGE_ALIGNMENT = 576
+# The compressed and indexer caches take 256-token pages: FlashMLA and the V4 indexer
+# accept exactly that (sparse_mla.py:60-61; v1/attention/backends/mla/indexer.py:
+# 260-262), and the engine sizes its block from the backends' common size
+# (platforms/interface.py:616-697), so a page holds 64 entries at ratio 4 and 2 at 128.
+DSV4_SPARSE_BLOCK_TOKENS = 256
 
 
 def handler_deepseek_v4(cfg, raw, model):
@@ -1718,11 +1723,14 @@ def handler_deepseek_v4(cfg, raw, model):
       * FlashMLA pads each rank's heads to 64, or 128 above 64 (nvidia/flashmla.py:
         77-85): 16 heads per rank at TP 8 run as 64. The main read states no tp and
         the consumer applies it (inference-sim/blis-latency-kernel#39). The Q RoPE +
-        insert reads each rank's heads and writes the padded set; it is stated
-        sharded, which is exact at TP 1 and 2 and nearer than replicated above;
-      * the indexer's short-context bypass: while every request in the batch has at
-        most index_topk compressed entries, vLLM skips the indexer's wq_b, its query
-        quantization and the scoring, and selects every entry (attention.py:1085-1107);
+        insert reads each rank's heads and writes the padded set, and every rank reads
+        the whole KV row and writes the whole record. It is stated sharded, which is
+        exact at TP 1, exact for the Q half at TP 2, and nearer than replicated above;
+      * the indexer's short-context bypass: on a step that is not captured in a CUDA
+        graph, while every request in the batch has at most index_topk compressed
+        entries, vLLM skips the indexer's wq_b, its query quantization and the scoring
+        and selects every entry (attention.py:1085-1107). Captured decode always runs
+        the full path, which is what the graph prices;
       * the compressor state caches are sliding windows of coff x ratio tokens, which
         the schema's window kind cannot state on a node whose own window differs, so
         each is stated as the fixed rows a decoding request holds: cdiv(window - 1 +
@@ -1744,6 +1752,13 @@ def handler_deepseek_v4(cfg, raw, model):
         (nvidia/model.py:1229-1236, 1333-1348, 1821-1834), 2.75 MB, and the norms,
         biases, attention sinks, compressor ape tables and mHC scales, about 11 MB --
         some 0.002% of the weights together;
+      * that the MTP layer's first pass each step runs over every token the target
+        scheduled, not one row per request (v1/worker/gpu/spec_decode/autoregressive/
+        speculator.py:311-327, 453-493): an autoregressive stack states only that it
+        runs once per drafted token (inference-sim/blis-schemas#60);
+      * wo_a's input read: the grouped einsum reads all o_groups x 4,096 FP8 values a
+        token (nvidia/ops/o_proj.py:89-95), where one GEMM node of k 4,096 states one
+        group's; the FLOPs and weight bytes are exact;
       * work the target runs only with MTP enabled: the copy of the whole hc stream
         into the drafter's buffer (nvidia/model.py:1637-1639)
         (inference-sim/blis-schemas#51);
@@ -1770,7 +1785,7 @@ def handler_deepseek_v4(cfg, raw, model):
     base = base_dtype(cfg, raw, model)
     if base != "bf16":
         # The unquantized tensors are BF16 in this checkpoint, and the mHC kernels
-        # assert BF16 residual streams (kernels/mhc/tilelang.py:856-857).
+        # assert BF16 residual streams (kernels/mhc/tilelang.py:855).
         raise DeriveError(f"{model}: V4's unquantized tensors and mHC residual are "
                           f"BF16; this config declares {base}")
     act = DTYPE_WIDTHS[base]
@@ -1798,7 +1813,7 @@ def handler_deepseek_v4(cfg, raw, model):
         # layout rather than a value to price.
         raise DeriveError(
             f"{model}: compress_ratios names {unknown}; V4's compressor accepts 4 and "
-            f"128 (compressor.py:157)")
+            f"128 (compressor.py:158)")
     hash_layers = whole(require_key(cfg, "num_hash_layers", model), "num_hash_layers")
     if not 0 <= hash_layers <= layers:
         raise DeriveError(f"{model}: num_hash_layers {hash_layers} is outside "
@@ -1989,7 +2004,9 @@ def handler_deepseek_v4(cfg, raw, model):
                  # (compressor.py:157-173)
                  "entries": state_rows(coff * ratio, 4 if ratio == 4 else 8)}
         # Each closing token gathers coff x ratio state rows, kv and score at head_dim
-        # each (fused_compress_quant_cache.py:205-247), softmax-pools them, and on CUDA
+        # each -- read from the Triton reference (fused_compress_quant_cache.py:
+        # 205-247); CUDA runs the CuTeDSL kernels, which pool the same rows -- softmax-
+        # pools them, and on CUDA
         # norms, ropes, quantizes and stores one record in one CuTeDSL launch at ratio 4
         # and two at ratio 128, through a head_dim FP32 latent
         # (nvidia/ops/sparse_attn_compress_cutedsl.py:2398-2485, 1425-1450).
@@ -2042,6 +2059,7 @@ def handler_deepseek_v4(cfg, raw, model):
              "tp": "replicated",
              "caches": [{"name": "index", "kind": "index", "owned": True,
                          "bytes_per_entry": index_record, "tokens_per_entry": 4,
+                         "block_size": DSV4_SPARSE_BLOCK_TOKENS,
                          "page_alignment": DSV4_PAGE_ALIGNMENT}, state]},
             # The logits land as an FP32 row per query token over the scanned entries,
             # read back by the top-k (sparse_attn_indexer.py:583-626, 726-785).
@@ -2065,6 +2083,7 @@ def handler_deepseek_v4(cfg, raw, model):
         if ratio > 1:
             node["caches"].append({"name": "compressed", "kind": "kv", "owned": True,
                                    "bytes_per_entry": record, "tokens_per_entry": ratio,
+                                   "block_size": DSV4_SPARSE_BLOCK_TOKENS,
                                    "page_alignment": DSV4_PAGE_ALIGNMENT})
         node["caches"] += extra_caches
         return node
@@ -2103,12 +2122,19 @@ def handler_deepseek_v4(cfg, raw, model):
                             "n": positive("moe_ffn_size", concept=True), "k": hidden,
                             "experts": experts, "top_k": top_k,
                             "weight_dtype": expert_width},
-                           # The shared expert is FP8, TP-split normally and replicated
-                           # over the token shard under V4's sequence parallelism
-                           # (nvidia/model.py:132-175, 900-914).
-                           {"op": "GroupedGEMM", "role": "shared_experts",
-                            "n": positive("moe_ffn_size", concept=True) * shared,
-                            "k": hidden, "experts": 1, "top_k": 1}),
+                           # The shared expert is a dense FP8 MLP, DeepseekV4MLP: a
+                           # merged gate/up column-parallel linear and a row-parallel
+                           # down, TP-split normally and whole on every rank over the
+                           # token shard under V4's sequence parallelism
+                           # (nvidia/model.py:132-175, 900-914). Expert parallelism
+                           # does not place it; its output joins the routed experts'
+                           # all-reduce (reduce_results False, :911).
+                           with_tp(gemm("shared_gate_up",
+                                        2 * positive("moe_ffn_size", concept=True) * shared,
+                                        hidden), "column"),
+                           with_tp(gemm("shared_down", hidden,
+                                        positive("moe_ffn_size", concept=True) * shared),
+                                   "row")),
             collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
             # FusedMoE all-reduces shared + routed once unless sequence parallelism is
             # on (fused_moe/runner/moe_runner.py:506-512); V4 passes its own flag and
@@ -2196,8 +2222,10 @@ def handler_deepseek_v4(cfg, raw, model):
         # DeepSeekV4MTP (nvidia/mtp.py:83-302): the target's embedding and lm_head
         # (shared, v1/worker/gpu/spec_decode/eagle/utils.py:15-18, 38-118), separate FP8
         # e_proj and h_proj, its own hc_head, and one DeepseekV4DecoderLayer at
-        # ratio 1 with a learned gate. It runs once per drafted token
-        # (spec_decode/autoregressive/speculator.py:453-515).
+        # ratio 1 with a learned gate. Its first pass each step runs over every token
+        # the target scheduled -- two per request in pure decode at one draft token --
+        # and only its logits over one row per request
+        # (spec_decode/autoregressive/speculator.py:277-278, 311-327, 453-493).
         draft = [
             # mask, enorm over the embedding and hnorm over the hc streams, before the
             # shard (nvidia/mtp.py:168-184; common/ops/fused_mtp_input_rmsnorm.py)
@@ -2253,6 +2281,11 @@ DSV41_SM90_KV_RECORD_BYTES = 584
 # Every packed V4.1 page is padded to the SM90 decode kernel's 576 B TMA stride
 # (attention.py:512, 1174-1176); SM100's 512 is the architecture overlay's.
 DSV41_SM90_PAGE_ALIGNMENT = 576
+# The compressed and indexer caches take the engine's block, which V4.1's backends fix:
+# its sparse MLA and indexer backends accept only 64-token pages on SM90 and 128 on
+# SM100 (deepseek_v41/sparse_mla.py:89-90; v1/attention/backends/mla/indexer.py:277-278),
+# and the engine picks the size every backend accepts (platforms/interface.py:616-697).
+DSV41_SM90_SPARSE_BLOCK_TOKENS = 64
 # MXFP8 weights' resident scale: the checkpoint's 32 x 32 UE8M0 blocks repeated to one
 # byte per 32 elements of a row at load (model_executor/layers/quantization/modelopt.py:
 # 2200-2248).
@@ -2332,6 +2365,9 @@ def handler_deepseek_v41(cfg, raw, model):
         n_q / tp gives 8. That depends on the backend and the TP width rather than on
         the model, so the main read states no tp and the consumer applies it
         (inference-sim/blis-latency-kernel#39);
+      * the SM100 page size of the compressed and indexer caches, 128 tokens where
+        SM90's is 64: an architecture overlay restates a cache's record and alignment
+        but not its block_size (inference-sim/blis-schemas#62);
       * the SM100 mega-attention launches (above), and the draft context's window
         insert, which writes a draft layer's cache from another kind and so states the
         SM90 record in its traffic rather than following the overlay;
@@ -2421,6 +2457,11 @@ def handler_deepseek_v41(cfg, raw, model):
     # it (nvidia/model.py:485-522), so vLLM would silently never run an engram there;
     # and no draft layer is given an engram layout (dspark.py:122-132).
     engram_layers = set(layer_ids("engram_layer_ids", 1, layers))
+    # vLLM finds a layer's table by its position in the config's own list,
+    # engram_layout.layer_ids.index(layer_id) over tuple(config.engram_layer_ids)
+    # (nvidia/model.py:296-305; common/engram.py:176-178), which need not be sorted.
+    engram_order = [whole(i, "an entry of engram_layer_ids")
+                    for i in require_key(cfg, "engram_layer_ids", model)]
 
     def kv_source_of(i):
         return max((s for s in kv_sources if s <= i), default=None)
@@ -2483,15 +2524,20 @@ def handler_deepseek_v41(cfg, raw, model):
 
     # The candidate source publishes the blocks later indexers mask to
     # (nvidia/model.py:662-675, attention.py:450-471); it must be an index source.
+    # vLLM reads both fields with getattr defaults of -1 and 0 and turns candidate
+    # selection off unless the source is a layer and the block count is positive
+    # (nvidia/model.py:666-668).
     candidate_source = cfg.get("candidate_source_layer_id")
     if candidate_source is not None:
         candidate_source = whole(candidate_source, "candidate_source_layer_id")
-        if candidate_source < 0 or positive("candidate_topk_blocks") < 1:
+        blocks = whole(cfg.get("candidate_topk_blocks", 0), "candidate_topk_blocks")
+        if candidate_source < 0 or blocks <= 0:
             candidate_source = None
         elif candidate_source not in index_sources:
             raise DeriveError(f"{model}: candidate_source_layer_id {candidate_source} "
                               f"is not an index source")
-    # One Engram table per engram layer, in layer order (common/engram.py:167-202).
+    # One Engram table per engram layer, in the order engram_layer_ids lists them
+    # (common/engram.py:167-202).
     engram_tables = []
     if engram_layers:
         n_cols = (positive("engram_max_ngram_size", least=2) - 1) * positive(
@@ -2590,6 +2636,7 @@ def handler_deepseek_v41(cfg, raw, model):
         if ratio > 1:
             cache["tokens_per_entry"] = ratio
         if owned:
+            cache["block_size"] = DSV41_SM90_SPARSE_BLOCK_TOKENS
             cache["page_alignment"] = DSV41_SM90_PAGE_ALIGNMENT
         return cache
 
@@ -2599,6 +2646,7 @@ def handler_deepseek_v41(cfg, raw, model):
         if ratio > 1:
             cache["tokens_per_entry"] = ratio
         if owned:
+            cache["block_size"] = DSV41_SM90_SPARSE_BLOCK_TOKENS
             cache["page_alignment"] = DSV41_SM90_PAGE_ALIGNMENT
         return cache
 
@@ -2657,7 +2705,7 @@ def handler_deepseek_v41(cfg, raw, model):
                     tp="replicated"),
             with_tp(fp32_gemm(fn_role, mix_hc, fn_width), "replicated"))
 
-    engram_rows = dict(zip(sorted(engram_layers), engram_tables))
+    engram_rows = dict(zip(engram_order, engram_tables))
 
     def engram_block(i):
         # Engram replaces the fused boundary before its attention with a separate post,
@@ -2880,12 +2928,15 @@ def handler_deepseek_v41(cfg, raw, model):
             # The shared expert is MXFP8, the routed ones MXFP4
             # (deepseek_v4/nvidia/model.py:900-914 under
             # deepseek_v41/quant_config.py:188-210), so it is its own node at the global
-            # width rather than a field of the routed one. It is TP-split normally and
-            # replicated over the token shard under V4.1's sequence parallelism
-            # (`disable_tp=is_sequence_parallel`, :164, :173).
-            *token_sharded({"op": "GroupedGEMM", "role": "shared_experts",
-                            "n": routed_node["n"], "k": hidden, "experts": shared,
-                            "top_k": shared}),
+            # width rather than a field of the routed one. It is a dense MLP, a merged
+            # gate/up column-parallel linear and a row-parallel down, TP-split normally
+            # and whole on every rank over the token shard under V4.1's sequence
+            # parallelism (`disable_tp=is_sequence_parallel`, :164, :173); expert
+            # parallelism does not place it.
+            *token_sharded(
+                with_tp(gemm("shared_gate_up", 2 * routed_node["n"] * shared, hidden),
+                        "column"),
+                with_tp(gemm("shared_down", hidden, routed_node["n"] * shared), "row")),
             collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
             # V4.1 passes its own sequence-parallel flag to the MoE (nvidia/model.py:
             # 324-327), and FusedMoE then skips its final reduction
@@ -4041,9 +4092,10 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
         mtp_vector = cfg.get("mtp_layers_block_type")
         if DRAFT_KIND_ID in defined:
             # A handler that priced the draft module itself, because the family gives it
-            # a structure no target layer shares. DeepSeek-V4 is the case in hand: its
-            # draft layer is uncompressed where every target layer is compressed, so
-            # mirroring any of them would price the wrong read.
+            # a structure no target layer shares. GLM-5.3-Flash is a case in hand
+            # (handler_glm5_next): its draft layer is sparse-MLA with its own
+            # embedding-mixing prefix, a copy of no target layer. DeepSeek-V4 and V4.1
+            # state their whole speculator in the handler's extras instead.
             pattern = [DRAFT_KIND_ID]
         elif mtp_vector:
             pattern = [n if n in defined else kinds[-1]["id"] for n in mtp_vector]

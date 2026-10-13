@@ -92,6 +92,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 584
       tokens_per_entry: 128
+      block_size: 256
       page_alignment: 576
     - name: compressor_state
       kind: state
@@ -160,12 +161,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 3072
+  - op: GEMM
+    role: shared_gate_up
+    n: 6144
     k: 7168
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 7168
+    k: 3072
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -224,6 +230,8 @@ layer_kinds:
     - 24
   - - 24
     - 25
+  - - 25
+    - 26
 - id: csa128_hash_moe
   nodes:
   - op: Elementwise
@@ -303,6 +311,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 584
       tokens_per_entry: 128
+      block_size: 256
       page_alignment: 576
     - name: compressor_state
       kind: state
@@ -371,12 +380,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 3072
+  - op: GEMM
+    role: shared_gate_up
+    n: 6144
     k: 7168
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 7168
+    k: 3072
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -435,6 +449,8 @@ layer_kinds:
     - 24
   - - 24
     - 25
+  - - 25
+    - 26
 - id: csa4_hash_moe
   nodes:
   - op: Elementwise
@@ -534,6 +550,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 132
       tokens_per_entry: 4
+      block_size: 256
       page_alignment: 576
     - name: index_compressor_state
       kind: state
@@ -569,6 +586,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 584
       tokens_per_entry: 4
+      block_size: 256
       page_alignment: 576
     - name: compressor_state
       kind: state
@@ -637,12 +655,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 3072
+  - op: GEMM
+    role: shared_gate_up
+    n: 6144
     k: 7168
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 7168
+    k: 3072
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -715,6 +738,8 @@ layer_kinds:
     - 31
   - - 31
     - 32
+  - - 32
+    - 33
 - id: csa128_moe
   nodes:
   - op: Elementwise
@@ -794,6 +819,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 584
       tokens_per_entry: 128
+      block_size: 256
       page_alignment: 576
     - name: compressor_state
       kind: state
@@ -855,12 +881,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 3072
+  - op: GEMM
+    role: shared_gate_up
+    n: 6144
     k: 7168
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 7168
+    k: 3072
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -917,6 +948,8 @@ layer_kinds:
     - 23
   - - 23
     - 24
+  - - 24
+    - 25
 - id: csa4_moe
   nodes:
   - op: Elementwise
@@ -1016,6 +1049,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 132
       tokens_per_entry: 4
+      block_size: 256
       page_alignment: 576
     - name: index_compressor_state
       kind: state
@@ -1051,6 +1085,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 584
       tokens_per_entry: 4
+      block_size: 256
       page_alignment: 576
     - name: compressor_state
       kind: state
@@ -1112,12 +1147,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 3072
+  - op: GEMM
+    role: shared_gate_up
+    n: 6144
     k: 7168
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 7168
+    k: 3072
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -1188,6 +1228,8 @@ layer_kinds:
     - 30
   - - 30
     - 31
+  - - 31
+    - 32
 - id: mtp
   nodes:
   - op: Elementwise
@@ -1307,12 +1349,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 3072
+  - op: GEMM
+    role: shared_gate_up
+    n: 6144
     k: 7168
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 7168
+    k: 3072
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -1380,6 +1427,8 @@ layer_kinds:
     - 24
   - - 24
     - 25
+  - - 25
+    - 26
 stack:
   prologue:
   - csa128_hash_first_moe

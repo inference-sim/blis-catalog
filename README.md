@@ -125,8 +125,10 @@ not here; the values the catalog uses today mean:
 
 - **`vendor_spec`** — a nominal figure taken from a vendor datasheet, including
   the datasheet's own unit normalisations (a bidirectional figure read per-GPU
-  per-direction, a dense/sparse selection). Every entry in the catalog today is
-  `vendor_spec`.
+  per-direction, a dense/sparse selection). Every chip and fabric file is labeled
+  `vendor_spec`, but a few of their figures are not datasheet figures; each file's
+  comments say which, and [declared facts](docs/concepts/declared-facts.md#where-the-catalog-falls-short-of-its-rule)
+  lists them.
 - **`derived`** — reserved for a figure *computed* by the catalog from spec(s) via
   an arithmetic step the datasheet does not itself state — still declared, still
   non-measured. No entry uses it yet; the open set lets it be adopted later
@@ -137,17 +139,22 @@ not here; the values the catalog uses today mean:
 let a file that mixes a stated figure (`TFlopsPeak`) with a computed one distinguish
 them, but per-field tagging is a strictly *additive* refinement that changes no
 value and would alter the single-key contract the strict hardware loader reads
-([inference-sim#1831](https://github.com/inference-sim/inference-sim/issues/1831));
-because every current figure is `vendor_spec`, a file-level tag loses nothing
-today, and the open enum is what lets per-field land later without a value change.
+([inference-sim#1831](https://github.com/inference-sim/inference-sim/issues/1831)).
+A file-level tag does lose that distinction today: a chip whose memory capacity or
+SM count is not a datasheet figure keeps its file's `vendor_spec` label and names
+the exception in its comments. The open enum is what lets per-field land later
+without a value change.
 
 - **PD KV-transfer** rides the fabric: its transfer bandwidth **is** that
   fabric's nominal `InterNodeBwGBps` (there is no separate figure), so different
   fabrics disaggregate at different cost. The fabric carries **no** PD
   base-latency field — the catalog states no inherent fabric base latency, and
-  the nominal figure would only ever be `0`; the `0.05 ms`
-  `--pd-transfer-base-latency` default is a modeling placeholder that belongs in
-  `blis-registry` ([blis-registry#10](https://github.com/inference-sim/blis-registry/issues/10)).
+  the nominal figure would only ever be `0`. The `0.05 ms`
+  `--pd-transfer-base-latency` default is a modeling placeholder: it is
+  inference-sim's flag default, and no catalog or registry file records it
+  (blis-registry PR #16 moved it in for
+  [blis-registry#10](https://github.com/inference-sim/blis-registry/issues/10), and
+  `3c9879d` removed it again; each `networks/*.yaml` says so).
   The `--pd-transfer-*` CLI flags remain overrides, so a run that resolves no
   fabric is byte-identical.
 

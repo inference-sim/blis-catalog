@@ -118,12 +118,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -170,6 +175,8 @@ layer_kinds:
     - 18
   - - 18
     - 19
+  - - 19
+    - 20
 - id: swa_engram1_moe
   nodes:
   - op: Elementwise
@@ -309,12 +316,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -375,6 +387,8 @@ layer_kinds:
     - 25
   - - 25
     - 26
+  - - 26
+    - 27
 - id: csa2_kvsrc_idx_moe
   nodes:
   - op: Elementwise
@@ -468,6 +482,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 132
       tokens_per_entry: 2
+      block_size: 64
       page_alignment: 576
   - op: Elementwise
     role: index_logits_topk
@@ -498,6 +513,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 584
       tokens_per_entry: 2
+      block_size: 64
       page_alignment: 576
     - name: compressor_ring
       kind: state
@@ -563,12 +579,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -637,6 +658,8 @@ layer_kinds:
     - 29
   - - 29
     - 30
+  - - 30
+    - 31
 - id: csa2_moe
   nodes:
   - op: Elementwise
@@ -754,12 +777,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -808,6 +836,8 @@ layer_kinds:
     - 19
   - - 19
     - 20
+  - - 20
+    - 21
 - id: csa2_kvsrc_idx_engram14_moe
   nodes:
   - op: Elementwise
@@ -938,6 +968,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 132
       tokens_per_entry: 2
+      block_size: 64
       page_alignment: 576
   - op: Elementwise
     role: index_logits_topk
@@ -968,6 +999,7 @@ layer_kinds:
       owned: true
       bytes_per_entry: 584
       tokens_per_entry: 2
+      block_size: 64
       page_alignment: 576
     - name: compressor_ring
       kind: state
@@ -1033,12 +1065,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -1121,6 +1158,8 @@ layer_kinds:
     - 36
   - - 36
     - 37
+  - - 37
+    - 38
 - id: csa1_kvsrc_idx_cand_moe
   nodes:
   - op: Elementwise
@@ -1211,6 +1250,7 @@ layer_kinds:
       kind: index
       owned: true
       bytes_per_entry: 132
+      block_size: 64
       page_alignment: 576
   - op: Elementwise
     role: index_logits_topk
@@ -1245,6 +1285,7 @@ layer_kinds:
       kind: kv
       owned: true
       bytes_per_entry: 584
+      block_size: 64
       page_alignment: 576
   - op: Elementwise
     role: prefill_dequant_gather
@@ -1305,12 +1346,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -1381,6 +1427,8 @@ layer_kinds:
     - 30
   - - 30
     - 31
+  - - 31
+    - 32
 - id: csa1_moe
   nodes:
   - op: Elementwise
@@ -1497,12 +1545,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -1551,6 +1604,8 @@ layer_kinds:
     - 19
   - - 19
     - 20
+  - - 20
+    - 21
 - id: csa1_idx_mask_moe
   nodes:
   - op: Elementwise
@@ -1708,12 +1763,17 @@ layer_kinds:
     top_k: 6
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -1774,6 +1834,8 @@ layer_kinds:
     - 25
   - - 25
     - 26
+  - - 26
+    - 27
 - id: dspark_0
   nodes:
   - op: Elementwise
@@ -1876,12 +1938,17 @@ layer_kinds:
     top_k: 3
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -1928,6 +1995,8 @@ layer_kinds:
     - 18
   - - 18
     - 19
+  - - 19
+    - 20
 - id: dspark_1
   nodes:
   - op: Elementwise
@@ -2030,12 +2099,17 @@ layer_kinds:
     top_k: 3
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -2082,6 +2156,8 @@ layer_kinds:
     - 18
   - - 18
     - 19
+  - - 19
+    - 20
 - id: dspark_2
   nodes:
   - op: Elementwise
@@ -2184,12 +2260,17 @@ layer_kinds:
     top_k: 3
     weight_dtype: mxfp4
     under_sequence_parallel: token_sharded
-  - op: GroupedGEMM
-    role: shared_experts
-    n: 2304
+  - op: GEMM
+    role: shared_gate_up
+    n: 4608
     k: 5120
-    experts: 1
-    top_k: 1
+    tp: column
+    under_sequence_parallel: token_sharded
+  - op: GEMM
+    role: shared_down
+    n: 5120
+    k: 2304
+    tp: row
     under_sequence_parallel: token_sharded
   - op: All2All
     role: moe_dispatch_combine
@@ -2236,6 +2317,8 @@ layer_kinds:
     - 18
   - - 18
     - 19
+  - - 19
+    - 20
 - id: dspark_context
   nodes:
   - op: GEMM

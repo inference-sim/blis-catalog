@@ -3528,12 +3528,13 @@ def test_v4_experts_are_priced_at_their_own_declared_width():
     experts = [n for k in g["layer_kinds"] for n in k["nodes"]
                if n["op"] == "GroupedGEMM" and n.get("role") != "shared_experts"]
     assert experts, "no expert node"
-    # The shared expert is not one of them: it is an FP8 DeepseekV4MLP
-    # (nvidia/model.py:900-914; checkpoint F8_E4M3 shared_experts.w1/w2/w3).
+    # The shared expert is not one of them: it is a dense FP8 DeepseekV4MLP
+    # (nvidia/model.py:900-914; checkpoint F8_E4M3 shared_experts.w1/w2/w3), stated as
+    # its gate/up and down GEMMs at the global width.
     shared = [n for k in g["layer_kinds"] for n in k["nodes"]
-              if n.get("role") == "shared_experts"]
-    assert shared and all(n.get("weight_dtype", g["global"]["weight_dtype"]) == "fp8"
-                          for n in shared)
+              if n.get("role") in ("shared_gate_up", "shared_down")]
+    assert shared and all(n["op"] == "GEMM" and "weight_dtype" not in n
+                          and g["global"]["weight_dtype"] == "fp8" for n in shared)
     for n in experts:
         assert n.get("weight_dtype") == "mxfp4", (
             f"expert node carries weight_dtype {n.get('weight_dtype')!r}; vLLM "
@@ -3927,7 +3928,11 @@ def v41_expected(t: dict, i: int) -> dict:
     r = t["compress_ratios"][i]
     kv, idx = t["kv_source_layer_ids"], t["index_source_layer_ids"]
     src = max((s for s in kv if s <= i), default=None) if r else None
+    # vLLM's own defaults: no source, or no blocks, means no candidate selection
+    # (nvidia/model.py:666-668).
     cand = t.get("candidate_source_layer_id", -1)
+    if t.get("candidate_topk_blocks", 0) <= 0:
+        cand = -1
     return {
         "owns_stream": i in kv,
         "holds_stream": (i in kv) if r else None,
@@ -4010,7 +4015,8 @@ def random_v41_vectors(rng, layers: int) -> dict:
         if j not in kv:
             idx.add(max(s for s in kv if s <= j))
     idx = sorted(idx)
-    engram = sorted(rng.sample(range(1, layers), rng.randint(0, 2)))
+    # Unsorted as often as not: vLLM pairs each table with its layer by list position.
+    engram = rng.sample(range(1, layers), rng.randint(0, 2))
     # Distinct table sizes, so a layer gathering from another layer's table shows.
     tables = rng.sample(range(1_000, 400_000_000), len(engram))
     targets = sorted(rng.sample(range(layers), rng.randint(1, min(3, layers))))
@@ -4018,6 +4024,7 @@ def random_v41_vectors(rng, layers: int) -> dict:
     return {"num_hidden_layers": layers, "compress_ratios": ratios + [0, 0, 0],
             "kv_source_layer_ids": kv, "index_source_layer_ids": idx,
             "candidate_source_layer_id": rng.choice(idx + [-1]),
+            "candidate_topk_blocks": rng.choice((0, 8, 16)),
             "engram_layer_ids": engram, "engram_num_embeddings": tables,
             "dspark_target_layer_ids": targets}
 
@@ -4538,7 +4545,9 @@ def test_deepseek_v41_splits_across_tensor_parallel_ranks_where_vllm_does():
     experts state no tp, being split by expert parallelism instead."""
     g = v41_graph()
     split = {"wq_b": "column", "wo_a": "column", "wo_b": "row", "o_inv_rope": "sharded",
-             "engram_wkv": "column", "lm_head": "column", "dspark_lm_head": "column"}
+             "engram_wkv": "column", "lm_head": "column", "dspark_lm_head": "column",
+             # the shared expert, a dense MLP (nvidia/model.py:159-175)
+             "shared_gate_up": "column", "shared_down": "row"}
     spec = g["speculator"]
     nodes = [n for layers in (expanded_layers(g), expanded_layers(g, spec["stack"]),
                               expanded_layers(g, spec["context_stack"]),
@@ -4581,7 +4590,7 @@ def test_deepseek_v41_residual_stream_work_runs_on_the_token_shard_under_its_sp(
     g = v41_graph()
     spec = g["speculator"]
     stream = re.compile(r"mhc_|hc_|engram_gate$|engram_wkv$|router$|experts$|"
-                        r"shared_experts$|final_norm$")
+                        r"shared_gate_up$|shared_down$|final_norm$")
     def check(nodes, where, expect_head_norm=True):
         for n in nodes:
             sharded = n.get("under_sequence_parallel") == "token_sharded"
@@ -4596,7 +4605,7 @@ def test_deepseek_v41_residual_stream_work_runs_on_the_token_shard_under_its_sp(
     for i, nodes in enumerate(expanded_layers(g)):
         check(nodes, i)
         assert sum(n.get("under_sequence_parallel") == "token_sharded"
-                   for n in nodes if n["op"] == "GroupedGEMM") == 2, i
+                   for n in nodes if n["op"] == "GroupedGEMM") == 1, i
     for d, nodes in enumerate(expanded_layers(g, spec["stack"])):
         check(nodes, f"draft {d}")
     check(g["head"], "head")
@@ -5117,8 +5126,8 @@ def test_deepseek_v4_residual_stream_work_runs_on_the_token_shard():
     g = v4_graph()
     spec = g["speculator"]
     stream = re.compile(r"mhc_|hc_attn_fn|hc_ffn_fn|router$|hash_route$|experts$|"
-                        r"shared_experts$|mtp_e_proj$|mtp_h_proj$|mtp_input_add$|"
-                        r"mtp_mhc_post$")
+                        r"shared_gate_up$|shared_down$|mtp_e_proj$|mtp_h_proj$|"
+                        r"mtp_input_add$|mtp_mhc_post$")
     for where, nodes in ([(i, n) for i, n in enumerate(expanded_layers(g))]
                          + [("mtp", n) for n in expanded_layers(g, spec["stack"])]
                          + [("head", g["head"]), ("mtp head", spec["head"])]):
@@ -5141,7 +5150,9 @@ def test_deepseek_v4_splits_across_tensor_parallel_ranks_where_vllm_does():
     spec = g["speculator"]
     split = {"wq_b": "column", "wo_a": "column", "wo_b": "row", "lm_head": "column",
              "mtp_lm_head": "column", "q_rope_kv_insert": "sharded",
-             "o_inv_rope_quant": "sharded"}
+             "o_inv_rope_quant": "sharded",
+             # the shared expert, a dense MLP (nvidia/model.py:159-175)
+             "shared_gate_up": "column", "shared_down": "row"}
     for nodes in (expanded_layers(g) + expanded_layers(g, spec["stack"])
                   + [g["head"], spec["head"]]):
         for n in nodes:
