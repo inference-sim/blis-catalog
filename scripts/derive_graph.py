@@ -1860,8 +1860,10 @@ def handler_deepseek_v4(cfg, raw, model):
 # DeepSeek-V4.1's SM90 KV record, in bytes per cached entry: 448 FP8 NoPE dims, 64 BF16
 # RoPE dims, seven UE8M0 scales (one per 64 NoPE dims) and a pad byte
 # (deepseek_v41/common/ops/fused_compress_quant_cache.py:303-351). attention.py:503-508
-# sizes both the sliding-window and the compressed record at 584 on every part but the
-# SM100 family, where _use_v41_mxfp8_kv_record() (:119-126) switches to the MXFP8 record.
+# sizes both the sliding-window and the compressed record at 584 by default on every
+# part but the SM100 family, where _use_v41_mxfp8_kv_record() (:119-126) switches to the
+# MXFP8 record; an explicit nvfp4_ds_mla cache makes the compressed record 288 B
+# (:506-508), and FlashMLA serves that only on SM100 (:513-517).
 DSV41_SM90_KV_RECORD_BYTES = 584
 # The indexer K cache entry is index_head_dim FP8 values plus one FP32 scale per 128
 # of them: `index_head_dim + index_head_dim // 128 * 4` (attention.py:89-97). The
@@ -1882,11 +1884,12 @@ def handler_deepseek_v41(cfg, raw, model):
     graph has no per-architecture variant (inference-sim/blis-schemas#53), so this is a
     choice stated here rather than a default:
 
-      * wo_a is MXFP8 in the checkpoint and BF16 resident on SM90: it is a batched
-        matmul, whose only kernels are DeepGemmMxfp8Bmm (Blackwell-only,
-        model_executor/kernels/linear/mxfp8/deep_gemm.py:34-35) and the emulation
-        kernel, which dequantizes at load (mxfp8/emulation.py:31-50, with
-        VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD defaulting True). On SM100 it stays FP8.
+      * wo_a is MXFP8 in the checkpoint and BF16 resident on SM90. It is a batched
+        matmul, whose only kernels are DeepGemmMxfp8BmmLinearKernel and the emulation
+        kernel (model_executor/kernels/linear/__init__.py:895-900). The first is
+        Blackwell-only (mxfp8/deep_gemm.py:34-35); the second dequantizes at load
+        (mxfp8/emulation.py:31-50, with VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD defaulting
+        True). On SM100 it stays FP8.
       * the KV record is 584 B on SM90 (DSV41_SM90_KV_RECORD_BYTES). SM100 writes a
         528 B MXFP8 window record and, by default under mega attention, a 288 B
         NVFP4 compressed record (attention.py:500-508; nvidia/flash_mla_mega_attn.py:
@@ -1909,7 +1912,7 @@ def handler_deepseek_v41(cfg, raw, model):
         tensors exist on layers 2, 8, 14 and 20 only.
       * index_source_layer_ids name the layers that build an indexer (attention.py:
         421-472). Those that are also KV sources own an indexer K cache and its wk /
-        k_norm; the rest score their own queries against the nearest source's keys
+        k_norm; the rest score their own queries against the nearest KV source's keys
         (attention.py:437-449), which the checkpoint confirms by carrying wk and k_norm
         on 2, 8, 14 and 20 alone. Every other compressed layer reads the top-k the last
         indexer wrote into the shared buffer (attention.py:1208-1213).
@@ -1923,9 +1926,10 @@ def handler_deepseek_v41(cfg, raw, model):
       * that the replicated projections and every mHC launch run unsharded on each
         tensor-parallel rank (inference-sim/blis-schemas#49), and the engram
         all-gathers' payloads (#50);
-      * work at compressed-entry cadence (the compressor pool, its cache insert, the
-        index key path), priced here per token and divided by the ratio where it is
-        traffic (inference-sim/blis-schemas#52);
+      * work at compressed-entry cadence (the latent write, the compressed-cache
+        insert, the index key store), priced here per token and divided by the ratio;
+        the pool's per-token ring traffic and the wk GEMM are per token and are not
+        divided (inference-sim/blis-schemas#52);
       * the SM100 variant of this graph (inference-sim/blis-schemas#53) and scale bytes
         (#54);
       * the scoring pass is more than its Attention node: the logits kernel writes an
@@ -1935,7 +1939,8 @@ def handler_deepseek_v41(cfg, raw, model):
         (model_executor/kernels/attention/dsa/candidate_blocks.py). All of it scales
         with context, so none of it is a bytes_per_token (inference-sim/blis-schemas#52).
         On SM90 the candidate filter masks the scan's output and does not shorten it;
-        the shortened scan needs the SM100 MXFP4 indexer cache (attention.py:1301-1325);
+        the shortened scan is opt-in (indexer_sparse_logits) and needs the SM100 MXFP4
+        indexer cache (attention.py:1301-1325);
       * prefill's dequantizing gather of the whole compressed stream into a BF16
         workspace (nvidia/flashmla.py:305-315), also context-proportional (#52);
       * FlashMLA pads each rank's query heads to 64 (nvidia/flashmla.py:66-74). When TP
@@ -1961,25 +1966,60 @@ def handler_deepseek_v41(cfg, raw, model):
     does not "shrink the read" as the schema defines the field. It belongs on the
     scorer, which does scan ctx / ratio positions.
     """
-    hidden = int(require(cfg, "hidden_size", model))
-    layers = int(require(cfg, "num_layers", model))
+    # Every count below is read as a whole number and checked against what it counts.
+    # The config is the only source for these shapes, so a float, a bool, a zero or an
+    # id outside the stack is a misread config rather than a value to round or drop.
+    def whole(value, what):
+        if type(value) is not int:
+            raise DeriveError(f"{model}: {what} is {value!r}, not a whole number")
+        return value
+
+    def positive(key, *, concept=False, least=1):
+        value = whole(require(cfg, key, model) if concept else require_key(cfg, key, model),
+                      key)
+        if value < least:
+            raise DeriveError(f"{model}: {key} is {value}; this architecture needs at "
+                              f"least {least}")
+        return value
+
+    def layer_ids(key, lo, hi, *, nonempty=False):
+        ids = [whole(i, f"an entry of {key}") for i in require_key(cfg, key, model)]
+        if len(set(ids)) != len(ids):
+            raise DeriveError(f"{model}: {key} repeats a layer: {ids}")
+        if any(not lo <= i < hi for i in ids):
+            raise DeriveError(f"{model}: {key} names a layer outside [{lo}, {hi}): {ids}")
+        if nonempty and not ids:
+            raise DeriveError(f"{model}: {key} is empty")
+        return sorted(ids)
+
+    hidden = positive("hidden_size", concept=True)
+    layers = positive("num_layers", concept=True)
     base = base_dtype(cfg, raw, model)
-    act = DTYPE_WIDTHS.get(base)
-    if act is None:
-        raise DeriveError(f"{model}: base dtype {base!r} has no activation width")
+    if base != "bf16":
+        # The tensors vLLM keeps unquantized are BF16 in this checkpoint, and the mHC
+        # kernels assert BF16 residual streams (kernels/mhc/tilelang.py:342-358), so a
+        # different declared dtype is a different model rather than a different width.
+        raise DeriveError(f"{model}: V4.1's unquantized tensors and mHC residual are "
+                          f"BF16; this config declares {base}")
+    act = DTYPE_WIDTHS[base]
     fp32 = DTYPE_WIDTHS["fp32"]
 
-    ratios = list(require_key(cfg, "compress_ratios", model))
-    spec_layers = int(require(cfg, "num_spec_tokens", model))
+    ratios = [whole(r, "a compress_ratios entry")
+              for r in require_key(cfg, "compress_ratios", model)]
+    # Zero draft layers is a checkpoint without DSpark: no speculator, and no dspark_*
+    # field is read.
+    spec_layers = whole(require(cfg, "num_spec_tokens", model), "num_nextn_predict_layers")
+    if spec_layers < 0:
+        raise DeriveError(f"{model}: num_nextn_predict_layers is {spec_layers}")
     if len(ratios) not in (layers, layers + spec_layers):
         raise DeriveError(
             f"{model}: compress_ratios has {len(ratios)} entries for {layers} layers and "
             f"{spec_layers} draft layers")
     # vLLM indexes the vector by layer id and gives any id past its end ratio 0
     # (attention.py:300-305), so the draft layers 40-42 read their own entries here.
-    draft_ratios = [int(ratios[layers + i]) if layers + i < len(ratios) else 0
+    draft_ratios = [ratios[layers + i] if layers + i < len(ratios) else 0
                     for i in range(spec_layers)]
-    ratios = [int(r) for r in ratios[:layers]]
+    ratios = ratios[:layers]
     unknown = sorted(set(ratios + draft_ratios) - {0, 1, 2})
     if unknown:
         raise DeriveError(
@@ -1991,21 +2031,20 @@ def handler_deepseek_v41(cfg, raw, model):
             f"never a KV or index source (attention.py:322-324), so it has no stream to "
             f"read")
 
-    kv_sources = sorted(int(i) for i in require_key(cfg, "kv_source_layer_ids", model))
-    index_sources = sorted(
-        int(i) for i in require_key(cfg, "index_source_layer_ids", model))
-    engram_layers = set(int(i) for i in (cfg.get("engram_layer_ids") or ()))
-    if 0 in engram_layers:
-        # Layer 0 takes the broadcast branch, and the engram injection is the elif
-        # after it (nvidia/model.py:485-522), so vLLM would silently never run it.
-        raise DeriveError(
-            f"{model}: engram on layer 0 is never injected by vLLM, which runs the "
-            f"broadcast mHC pre there instead")
+    kv_sources = layer_ids("kv_source_layer_ids", 0, layers)
+    index_sources = layer_ids("index_source_layer_ids", 0, layers)
+    # Layer 0 takes the broadcast branch, and the engram injection is the elif after
+    # it (nvidia/model.py:485-522), so vLLM would silently never run an engram there;
+    # and no draft layer is given an engram layout (dspark.py:122-132).
+    engram_layers = set(layer_ids("engram_layer_ids", 1, layers))
 
     def kv_source_of(i):
-        below = [s for s in kv_sources if s <= i]
-        return below[-1] if below else None
+        return max((s for s in kv_sources if s <= i), default=None)
 
+    for s in kv_sources + index_sources:
+        if ratios[s] == 0:
+            raise DeriveError(
+                f"{model}: source layer {s} has no compressed stream to own or index")
     for i, r in enumerate(ratios):
         if r == 0:
             continue
@@ -2016,13 +2055,9 @@ def handler_deepseek_v41(cfg, raw, model):
             raise DeriveError(
                 f"{model}: layer {i} (ratio {r}) reads the compressed cache of layer "
                 f"{src}, which declares ratio {None if src is None else ratios[src]}")
-    for s in kv_sources + index_sources:
-        if not 0 <= s < layers or ratios[s] == 0:
-            raise DeriveError(
-                f"{model}: source layer {s} has no compressed stream to own or index")
     for i, r in enumerate(ratios):
-        # vLLM takes max() over the index sources at or below every compressed layer
-        # and raises when there is none (attention.py:326-338).
+        # vLLM takes max() over the index sources at or below every compressed layer,
+        # and max() over an empty set raises (attention.py:333-338).
         if r and not any(s <= i for s in index_sources):
             raise DeriveError(
                 f"{model}: compressed layer {i} has no index source at or below it, "
@@ -2036,17 +2071,17 @@ def handler_deepseek_v41(cfg, raw, model):
                 f"{model}: index source {s} needs the keys of layer {kv_source_of(s)}, "
                 f"which builds no indexer")
 
-    q_heads = int(require(cfg, "num_q_heads", model))
-    total_dim = int(require(cfg, "head_dim", model))
-    rope = int(require(cfg, "qk_rope_head_dim", model))
-    q_lora = int(require_key(cfg, "q_lora_rank", model))
-    o_lora = int(require_key(cfg, "o_lora_rank", model))
-    o_groups = int(require_key(cfg, "o_groups", model))
-    window = int(require(cfg, "sliding_window", model))
-    topk = int(require_key(cfg, "index_topk", model))
-    index_heads = int(require_key(cfg, "index_n_heads", model))
-    index_dim = int(require_key(cfg, "index_head_dim", model))
-    hc_mult = int(require_key(cfg, "hc_mult", model))
+    q_heads = positive("num_q_heads", concept=True)
+    total_dim = positive("head_dim", concept=True)
+    rope = positive("qk_rope_head_dim", concept=True)
+    q_lora = positive("q_lora_rank")
+    o_lora = positive("o_lora_rank")
+    o_groups = positive("o_groups")
+    window = positive("sliding_window", concept=True)
+    topk = positive("index_topk")
+    index_heads = positive("index_n_heads")
+    index_dim = positive("index_head_dim")
+    hc_mult = positive("hc_mult")
     if (q_heads * total_dim) % o_groups:
         raise DeriveError(
             f"{model}: o_groups {o_groups} does not divide {q_heads * total_dim}")
@@ -2056,6 +2091,11 @@ def handler_deepseek_v41(cfg, raw, model):
         raise DeriveError(
             f"{model}: V4.1's compressor and KV record assume head_dim 512 with rope "
             f"64; this config states {total_dim} and {rope}")
+    if index_dim % 128:
+        # The FP8 indexer cache carries one FP32 scale per 128 values (attention.py:
+        # 89-97); another width would leave a partial group no record describes.
+        raise DeriveError(
+            f"{model}: index_head_dim {index_dim} is not a multiple of 128")
 
     record = DSV41_SM90_KV_RECORD_BYTES
     index_record = dsv41_index_k_record_bytes(index_dim)
@@ -2074,13 +2114,19 @@ def handler_deepseek_v41(cfg, raw, model):
         return node
 
     def traffic(role, bytes_per_token):
+        # Amortized figures divide by the pool ratio; a remainder would be a fraction of
+        # a byte the schema's integer field cannot hold, so it raises rather than rounds.
+        if bytes_per_token != int(bytes_per_token):
+            raise DeriveError(f"{model}: {role} moves {bytes_per_token} B/token, which "
+                              f"is not a whole number of bytes")
         node = norm(role)
         node["bytes_per_token"] = int(bytes_per_token)
         return node
 
     # mHC. The parameters are FP32 (nvidia/model.py:400-444; the checkpoint agrees, F32
     # [24, 20480]) and on SM90 every boundary is TileLang's delayed fused post + pre
-    # (nvidia/ops/mhc.py:305-322: the overlap stream and Mega-mHC are SM100-only). The
+    # (nvidia/ops/mhc.py:305-322), because the overlap stream and Mega-mHC are
+    # SM100-only (nvidia/ops/mhc.py:44-56, nvidia/ops/mega_mhc.py:17-28). The
     # sublayer's RMSNorm is fused into the epilogue -- norm_weight is passed in
     # (nvidia/model.py:503-604) -- so no attn_norm / ffn_norm node exists. Traffic is
     # mhc_mixing_bytes(): the post and the pre each as one pass, read against the
@@ -2097,6 +2143,12 @@ def handler_deepseek_v41(cfg, raw, model):
     def mhc_boundary(side):
         return [traffic(f"mhc_{side}_post_pre", fused_mhc),
                 fp32_gemm(f"hc_{side}_fn", mix_hc, hc_mult * hidden)]
+
+    def final_mhc():
+        # The final mHC post and the hc collapse run before the final norm
+        # (nvidia/model.py:947-987); V4.1 has no learned hc_head (:982-986).
+        return [traffic("mhc_final_post", mhc_post_bytes),
+                traffic("hc_collapse", bundle + hc_mult * fp32 + hidden * act)]
 
     def first_mhc_boundary():
         # Layer 0: the embedding is broadcast to hc_mult copies by a materializing
@@ -2119,9 +2171,11 @@ def handler_deepseek_v41(cfg, raw, model):
         # F8_E4M3 [25600, 6144]). The fused gate then reads the bundle, the hc_mult keys
         # and the value, and writes the bundle (:755-843). Under TP each rank holds its
         # heads' rows, so the rows and the wkv output are all-gathered (:996, :932).
-        n_cols = (int(require_key(cfg, "engram_max_ngram_size", model)) - 1) * int(
-            require_key(cfg, "engram_n_heads", model))
-        row_dim = int(require_key(cfg, "engram_head_dim", model))
+        # n-gram orders 2..max, one hash column per order and head (common/engram.py:
+        # 167-202), so a max order below 2 hashes nothing.
+        n_cols = (positive("engram_max_ngram_size", least=2) - 1) * positive(
+            "engram_n_heads")
+        row_dim = positive("engram_head_dim")
         return [
             traffic("mhc_attn_post", mhc_post_bytes),
             traffic("engram_lookup", n_cols * row_dim * act),
@@ -2204,7 +2258,7 @@ def handler_deepseek_v41(cfg, raw, model):
             # RoPE and FP8 quantization of the index query. The FP8 path stores no q
             # scale: it is folded into the FP32 head weights it writes
             # (attention.py:1398-1407; deepseek_v4/common/ops/fused_indexer_q.py:
-            # 563-575). Reads the BF16 query and weights, writes FP8 q and FP32 weights.
+            # 567-576). Reads the BF16 query and weights, writes FP8 q and FP32 weights.
             traffic("index_q_rope_quant",
                     index_heads * index_dim * act + index_heads * act
                     + index_heads * index_dim + index_heads * fp32),
@@ -2212,8 +2266,10 @@ def handler_deepseek_v41(cfg, raw, model):
         if owns_k:
             # The key comes from the compressor's latent, not from hidden: a BF16
             # (index_head_dim, head_dim) GEMM, then one launch for k_norm, RoPE, FP8
-            # quantization and the paged store (attention.py:1288-1298, 1370;
-            # common/ops/indexer_k_store.py). Both run per compressed entry.
+            # quantization and the paged store (attention.py:1288-1298;
+            # common/ops/indexer_k_store.py). The GEMM runs over every token's latent
+            # row; only the store keeps the group-boundary rows (attention.py:
+            # 1365-1372), so only its traffic is divided by the ratio.
             nodes += [
                 base_gemm("index_wk", index_dim, total_dim),
                 traffic("index_k_norm_rope_store",
@@ -2234,10 +2290,10 @@ def handler_deepseek_v41(cfg, raw, model):
         return nodes
 
     def main_attention(ratio):
-        # Every layer reads its own 128-token window. A compressed layer adds at most
-        # index_topk positions of its source's compressed stream (nvidia/flashmla.py:
-        # 181-246); a ratio-0 layer passes no extra cache and reads the window alone
-        # (:242). No compress_ratio here: see the docstring.
+        # Every layer reads its own last sliding_window positions. A compressed layer
+        # adds at most index_topk positions of its source's compressed stream
+        # (nvidia/flashmla.py:181-246); a ratio-0 layer passes no extra cache and reads
+        # the window alone (:242). No compress_ratio here: see the docstring.
         return attention(
             cfg, model,
             kind="sparse_mla" if ratio else "mla",
@@ -2256,30 +2312,33 @@ def handler_deepseek_v41(cfg, raw, model):
         # Mxfp4MoEMethod (deepseek_v41/quant_config.py:211-228); gate and up fused, so
         # the node's N is the inner width and the consumer prices three matrices.
         return {"op": "GroupedGEMM", "role": "experts",
-                "n": int(require(cfg, "moe_ffn_size", model)), "k": hidden,
-                "experts": int(experts), "top_k": int(top_k),
+                "n": positive("moe_ffn_size", concept=True), "k": hidden,
+                "experts": experts, "top_k": top_k,
                 "weight_dtype": mapped}
 
     def ffn(experts, top_k):
-        shared = int(require(cfg, "num_shared_experts", model))
+        shared = positive("num_shared_experts", concept=True)
+        routed_node = routed_experts(experts, top_k)
         return [
             *mhc_boundary("ffn"),
             # The router is an unquantized GateLinear with FP32 logits
             # (deepseek_v4/nvidia/model.py:850-856; checkpoint BF16 [384, 5120]).
-            base_gemm("router", int(experts), hidden),
-            routed_experts(experts, top_k),
+            base_gemm("router", experts, hidden),
+            routed_node,
             # The shared expert is MXFP8, the routed ones MXFP4
-            # (deepseek_v4/nvidia/model.py:900-914 under quant_config.py:188-210), so it
-            # is its own node at the global width rather than a field of the routed one.
+            # (deepseek_v4/nvidia/model.py:900-914 under
+            # deepseek_v41/quant_config.py:188-210), so it is its own node at the global
+            # width rather than a field of the routed one.
             {"op": "GroupedGEMM", "role": "shared_experts",
-             "n": int(require(cfg, "moe_ffn_size", model)), "k": hidden,
-             "experts": shared, "top_k": shared},
+             "n": routed_node["n"], "k": hidden, "experts": shared, "top_k": shared},
             collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
             collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
         ]
 
-    routed = int(require(cfg, "num_experts", model))
-    routed_top_k = int(require(cfg, "top_k", model))
+    routed = positive("num_experts", concept=True)
+    routed_top_k = positive("top_k", concept=True)
+    if routed_top_k > routed:
+        raise DeriveError(f"{model}: top_k {routed_top_k} exceeds {routed} experts")
 
     def layer_nodes(i):
         ratio = ratios[i]
@@ -2348,13 +2407,21 @@ def handler_deepseek_v41(cfg, raw, model):
     # weight is read num_spec_tokens times a step where one node in a once-per-step stack
     # reads it once, and the loop's embed gathers and vocab-wide bias passes are not
     # priced (#51). The confidence head is built but consulted only under adaptive
-    # verification, which is off by default (speculator.py:100-113).
-    targets = list(require_key(cfg, "dspark_target_layer_ids", model))
-    draft_experts = int(require_key(cfg, "dspark_n_routed_experts", model))
-    draft_top_k = int(require_key(cfg, "dspark_num_experts_per_tok", model))
-    markov = int(require_key(cfg, "dspark_markov_rank", model))
-    vocab = int(require(cfg, "vocab_size", model))
+    # verification (speculator.py:106-113), which is off by default
+    # (config/speculative.py:552).
+    vocab = positive("vocab_size", concept=True)
     draft_kinds = []
+    if spec_layers:
+        # main_proj's input is one hidden-wide state per target layer, so the ids are
+        # checked as layers of this stack, not just counted.
+        targets = layer_ids("dspark_target_layer_ids", 0, layers, nonempty=True)
+        draft_experts = positive("dspark_n_routed_experts")
+        draft_top_k = positive("dspark_num_experts_per_tok")
+        if draft_top_k > draft_experts:
+            raise DeriveError(f"{model}: dspark_num_experts_per_tok {draft_top_k} "
+                              f"exceeds {draft_experts} draft experts")
+        markov = positive("dspark_markov_rank")
+        block = positive("dspark_block_size")
     for d in range(spec_layers):
         nodes = []
         if d == 0:
@@ -2382,8 +2449,7 @@ def handler_deepseek_v41(cfg, raw, model):
         nodes += ffn(draft_experts, draft_top_k)
         if d == spec_layers - 1:
             nodes += [
-                traffic("mhc_final_post", mhc_post_bytes),
-                traffic("hc_collapse", bundle + hc_mult * fp32 + hidden * act),
+                *final_mhc(),
                 norm("dspark_final_norm"),
                 base_gemm("dspark_lm_head", vocab, hidden),
                 base_gemm("dspark_markov_head", vocab, markov),
@@ -2391,26 +2457,24 @@ def handler_deepseek_v41(cfg, raw, model):
         draft_kinds.append({"id": f"dspark_{d}", "nodes": nodes, "edges": chain(nodes)})
     kinds += draft_kinds
 
-    extras = {
-        # The final mHC post and the hc collapse run before the final norm
-        # (nvidia/model.py:947-987); V4.1 has no learned hc_head (:982-986).
-        "head_prefix": [
-            traffic("mhc_final_post", mhc_post_bytes),
-            traffic("hc_collapse", bundle + hc_mult * fp32 + hidden * act),
-        ],
+    extras: dict[str, Any] = {
+        "head_prefix": final_mhc(),
         # ParallelLMHead is built with no quant_config (nvidia/model.py:1338-1342;
         # checkpoint head.weight BF16), so it is not the global FP8.
         "lm_head_dtype": base,
-        "speculator": {
+    }
+    if spec_layers:
+        extras["speculator"] = {
             # vLLM v0.31.0 names this method "dspark" and rejects "mtp" for deepseek_v41
             # (config/speculative.py:1358-1369). Its default draft length is
             # dspark_block_size, not num_nextn_predict_layers, which counts draft LAYERS
             # (:1475-1482; nvidia/dspark.py:87-91).
             "method": "dspark",
-            "num_spec_tokens": int(require_key(cfg, "dspark_block_size", model)),
+            "num_spec_tokens": block,
             "stack": {"pattern": [k["id"] for k in draft_kinds], "repeat": 1},
-        },
-    }
+        }
+    # With no draft layers there is no speculator to state: derive()'s fallback reads
+    # the same num_nextn_predict_layers and emits none at zero.
     return kinds, compress(sequence), extras
 
 
@@ -3188,6 +3252,9 @@ HANDLERS = {
 
 # --- Driver ---------------------------------------------------------------------
 
+# What a handler's optional third result may carry; see derive().
+EXTRAS_KEYS = frozenset({"head_prefix", "lm_head_dtype", "speculator"})
+
 
 def derive(config_path: Path, model: str) -> dict[str, Any]:
     """Derive one graph from one vendor config."""
@@ -3211,8 +3278,16 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
     # final norm, a head width that is not the global one, or a speculator whose
     # structure no fallback below reproduces.
     result = handler(cfg, raw, model)
+    if len(result) not in (2, 3):
+        raise DeriveError(f"{model}: handler returned {len(result)} results, not 2 or 3")
     kinds, stack = result[0], result[1]
-    extras = result[2] if len(result) > 2 else {}
+    extras = result[2] if len(result) == 3 else {}
+    # A misspelled key would be ignored and the default it exists to replace would
+    # stand, which is the mispricing the key was added to prevent.
+    unknown = set(extras) - EXTRAS_KEYS
+    if unknown:
+        raise DeriveError(f"{model}: handler extras name {sorted(unknown)}, which "
+                          f"derive() does not read")
 
     graph: dict[str, Any] = {
         "kind": "ModelGraph",
@@ -3253,6 +3328,10 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
     if head_widths.get("lm_head"):
         lm_head["weight_dtype"] = head_widths["lm_head"]
     if extras.get("lm_head_dtype"):
+        if head_widths.get("lm_head") not in (None, extras["lm_head_dtype"]):
+            raise DeriveError(
+                f"{model}: the fp8 exclusion list gives lm_head {head_widths['lm_head']} "
+                f"and the handler {extras['lm_head_dtype']}")
         lm_head["weight_dtype"] = extras["lm_head_dtype"]
     graph["head"] = [
         *extras.get("head_prefix", ()),
@@ -3261,7 +3340,18 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
     ]
 
     if "speculator" in extras:
-        graph["speculator"] = extras["speculator"]
+        # The handler priced the draft module itself, so the fallbacks below do not
+        # apply. It must still describe one: tokens to draft, through layer kinds the
+        # handler defined.
+        spec_extra = extras["speculator"]
+        defined = {k["id"] for k in kinds}
+        pattern = spec_extra["stack"].get("pattern") or []
+        if (int(spec_extra["num_spec_tokens"]) < 1 or not pattern
+                or not set(pattern) <= defined):
+            raise DeriveError(
+                f"{model}: handler speculator drafts {spec_extra['num_spec_tokens']} "
+                f"tokens through {pattern}, which is not a draft module")
+        graph["speculator"] = spec_extra
         return graph
 
     spec = pick(cfg, "num_spec_tokens")
@@ -3413,9 +3503,17 @@ def main() -> int:
         try:
             graph = derive(cfg, entry.name)
         except DeriveError as exc:
-            failed.append(str(exc))
+            why = str(exc)
+            # Every message in this file starts with the model name; one that does not
+            # still gets it, so no failure line is ever anonymous.
+            failed.append(why if why.startswith(f"{entry.name}:")
+                          else f"{entry.name}: {why}")
             continue
-        except (KeyError, ValueError, TypeError) as exc:
+        except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
+            # Any other exception is a deriver bug or a config it did not anticipate.
+            # It is recorded against this model like any failure, so one bad entry
+            # neither hides the failures already collected nor goes unattributed; the
+            # run still exits non-zero.
             failed.append(f"{entry.name}: {type(exc).__name__}: {exc}")
             continue
 

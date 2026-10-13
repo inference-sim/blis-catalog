@@ -87,7 +87,8 @@ def test_a_failure_names_its_model_once(tmp_path):
     and its message has to stand alone there; main() prefixed it again, printing
     `qwen9-1t: qwen9-1t: no handler ...`. Both failure classes are covered: a
     DeriveError, which must not gain a prefix, and a missing config.json, which has no
-    other source for the name and must keep it."""
+    other source for the name and must keep it. The third class, an exception the
+    deriver does not raise itself, is test_a_deriver_crash_is_reported_against_its_model."""
     models = tmp_path / "models"
     (models / "qwen9-1t").mkdir(parents=True)
     (models / "qwen9-1t" / "config.json").write_text(
@@ -576,13 +577,12 @@ def test_the_folded_index_norm_width_is_paired_with_the_layer_running_the_indexe
         t = text_config(config_of(d))
         if not (t.get("index_topk") and t.get("index_n_heads")):
             continue
-        # The folded width is fused_norm_rope's, over the q and kv LoRA latents. A
-        # family that states no kv_lora_rank does not run that kernel: DeepSeek-V4.1
-        # norms its latents with fused_q_kv_rmsnorm on every layer alike and gives the
-        # index key its own k_norm launch (deepseek_v41/attention.py:757-763, 1288-1298),
-        # which test_deepseek_v41_charges_each_launch_the_traffic_its_kernel_moves
-        # pins.
-        if not t.get("kv_lora_rank"):
+        # The folded width is fused_norm_rope's, over the q and kv LoRA latents.
+        # DeepSeek-V4.1 does not run that kernel: on SM90 it norms its latents with
+        # fused_q_kv_rmsnorm on every layer alike and gives the index key its own
+        # k_norm launch (deepseek_v41/attention.py:757-763, 1288-1298), which
+        # test_deepseek_v41_charges_each_launch_the_traffic_its_kernel_moves pins.
+        if t.get("kv_source_layer_ids"):
             continue
         g = graph_of(d)
         kinds = {k["id"]: k for k in g["layer_kinds"]}
@@ -967,10 +967,10 @@ def test_an_unpooled_indexer_prices_no_pooled_compression():
             continue
         # A family whose cache is itself compressed scans that compressed stream, so
         # its scorer is bounded by the layer's own compress_ratios entry rather than by
-        # a pooling the indexer adds. DeepSeek-V4.1 is the case; its scorer's ratio is
-        # pinned against its KV source in test_deepseek_v41_each_layer_pays_for_what_its_source_vectors_assign.
-        if t.get("compress_ratios") and t.get("kv_source_layer_ids"):
-            continue
+        # a pooling the indexer adds. DeepSeek-V4.1 is the case: it still must price no
+        # k-pool work, but its scorer's ratio is pinned against its KV source by
+        # test_deepseek_v41_each_layer_pays_for_what_its_source_vectors_assign.
+        stream_compressed = bool(t.get("compress_ratios") and t.get("kv_source_layer_ids"))
         g = graph_of(path)
         for kind in g["layer_kinds"]:
             roles = {n.get("role") for n in kind["nodes"]}
@@ -983,6 +983,8 @@ def test_an_unpooled_indexer_prices_no_pooled_compression():
             assert "index_kpool_compress" not in roles, (
                 f"{path.name}/{kind['id']}: declares no index_kpool yet prices the "
                 f"pooling pass")
+            if stream_compressed:
+                continue
             scorer = next(n for n in kind["nodes"]
                           if n.get("role") == "block_index_scores")
             assert not scorer.get("compress_ratio"), (
@@ -1392,7 +1394,7 @@ def test_expert_shape_matches_config(d: Path):
     # (deepseek_v41/nvidia/model.py:118-145), so kinds only the speculator uses are
     # checked against those fields where the config states them.
     target_kinds = set(layer_sequence(g["stack"]))
-    draft_only = ({k for k in layer_sequence(g["speculator"]["stack"])} - target_kinds
+    draft_only = (set(layer_sequence(g["speculator"]["stack"])) - target_kinds
                   if g.get("speculator") else set())
     if draft_only and t.get("dspark_n_routed_experts"):
         for k in g["layer_kinds"]:
@@ -3500,8 +3502,8 @@ WIDTH = {"fp32": 4, "bf16": 2, "fp8": 1, "mxfp4": 0.5}
 
 
 def v41_graph() -> dict:
-    if not V41.is_dir():
-        pytest.skip("deepseek-v4.1-flash not in the catalog")
+    # Committed, so its absence is a failure rather than a reason to skip the suite.
+    assert V41.is_dir(), "models/deepseek-v4.1-flash is missing"
     return graph_of(V41)
 
 
@@ -3568,8 +3570,10 @@ V41_CHECKPOINT = {
     "engram": [(25600, 6144, "fp8")],                                # engram.wkv
 }
 # What vLLM v0.31.0 holds resident at another width than the checkpoint stores, on SM90.
-# wo_a is a batched MXFP8 matmul whose only SM90 kernel dequantizes it to BF16 at load
-# (mxfp8/emulation.py:31-50). Nothing else is converted.
+# wo_a is a batched MXFP8 matmul. Its kernels are DeepGemmMxfp8BmmLinearKernel and the
+# emulation kernel (model_executor/kernels/linear/__init__.py:895-900); the first is
+# Blackwell-only, and the second dequantizes it to BF16 at load (mxfp8/emulation.py:
+# 31-50). Nothing else is converted.
 V41_RESIDENT_OVERRIDES = {(8192, 4096): "bf16"}
 
 
@@ -3597,8 +3601,9 @@ def v41_checkpoint_layer(t: dict, i: int) -> list[tuple[int, int, str]]:
 
 
 def test_deepseek_v41_charges_the_weights_the_checkpoint_stores_at_their_resident_width():
-    """Every target layer's priced weights equal its checkpoint tensors, element for
-    element and byte for byte at the width vLLM holds them in.
+    """Every matrix a target layer multiplies by is priced at the checkpoint's element
+    count and at the width vLLM holds it in. Vectors (norms, attn_sink, gate biases) and
+    gathered tables (the engram rows) are not GEMM weights and are not counted.
 
     The two sums are compared per layer, so a missing projection, a fused node that
     double-counts a stage, a node at the wrong width or a layer that pays for a module it
@@ -3642,7 +3647,6 @@ def v41_layer_facts(nodes: list[dict]) -> dict:
         "read_ratio": read.get("compress_ratio"),
         "read_topk": read.get("index_topk"),
         "read_window": read.get("window"),
-        "mhc_bytes": traffic_of(nodes, "mhc"),
     }
 
 
@@ -3677,9 +3681,7 @@ def test_deepseek_v41_each_layer_pays_for_what_its_source_vectors_assign():
     layers = expanded_layers(g)
     assert len(layers) == t["num_hidden_layers"]
     for i, nodes in enumerate(layers):
-        got = v41_layer_facts(nodes)
-        got.pop("mhc_bytes")
-        assert got == v41_expected(t, i), f"layer {i}"
+        assert v41_layer_facts(nodes) == v41_expected(t, i), f"layer {i}"
 
 
 def v41_config(**over) -> dict:
@@ -3721,9 +3723,10 @@ def random_v41_vectors(rng, layers: int) -> dict:
             idx.add(max(s for s in kv if s <= j))
     idx = sorted(idx)
     engram = sorted(rng.sample(range(1, layers), rng.randint(0, 2)))
+    targets = sorted(rng.sample(range(layers), rng.randint(1, min(3, layers))))
     return {"num_hidden_layers": layers, "compress_ratios": ratios + [0, 0, 0],
             "kv_source_layer_ids": kv, "index_source_layer_ids": idx,
-            "engram_layer_ids": engram}
+            "engram_layer_ids": engram, "dspark_target_layer_ids": targets}
 
 
 def test_deepseek_v41_layer_rules_hold_for_any_valid_source_vectors():
@@ -3741,14 +3744,13 @@ def test_deepseek_v41_layer_rules_hold_for_any_valid_source_vectors():
         layers = expanded_layers(v41_derive(t))
         assert len(layers) == t["num_hidden_layers"], draw
         for i, nodes in enumerate(layers):
-            got = v41_layer_facts(nodes)
-            got.pop("mhc_bytes")
-            assert got == v41_expected(t, i), (draw, i, t["compress_ratios"],
-                                               t["kv_source_layer_ids"])
+            assert v41_layer_facts(nodes) == v41_expected(t, i), (
+                draw, i, t["compress_ratios"], t["kv_source_layer_ids"])
 
 
 def work_by_layer(g: dict) -> list[collections.Counter]:
-    return [collections.Counter(node_cost(n) for n in nodes) for nodes in expanded_layers(g)]
+    return [collections.Counter(node_cost(n) for n in nodes)
+            for nodes in expanded_layers(g)]
 
 
 def test_deepseek_v41_adding_a_kv_source_moves_exactly_one_compressor():
@@ -3783,24 +3785,32 @@ def test_deepseek_v41_halving_the_pool_doubles_the_scan_and_the_insert_traffic()
     two = v41_config()
     one = v41_config(compress_ratios=[r if r != 2 else 1 for r in two["compress_ratios"]])
     l2, l1 = expanded_layers(v41_derive(two))[2], expanded_layers(v41_derive(one))[2]
-    assert scoring_scans(l1)[0]["compress_ratio"] * 2 == scoring_scans(l2)[0]["compress_ratio"]
+    assert (scoring_scans(l1)[0]["compress_ratio"] * 2
+            == scoring_scans(l2)[0]["compress_ratio"])
     for role in ("compressor_rope_quant_insert", "index_k_norm_rope_store"):
         assert traffic_of(l1, role) == 2 * traffic_of(l2, role), role
     for field in ("index_topk", "window"):
         assert compressed_read(l1)[field] == compressed_read(l2)[field]
+    # And the compressor drops its gate: wkv and wgate merged at ratio 2, wkv alone at 1
+    # (compressor.py:216-227), so the projection halves.
+    assert (2 * gemm_elements(l1, "compressor_fused_wkv_wgate")
+            == gemm_elements(l2, "compressor_fused_wkv_wgate"))
 
 
 def test_deepseek_v41_engram_splits_the_mhc_boundary_without_changing_its_traffic():
     """Conservation: an engram layer runs the mHC post and pre as two launches around
     the injection (nvidia/model.py:522-552), where every other layer runs them fused.
     The split moves no bytes: post + pre on the engram layer equals the fused boundary
-    on its neighbour, and the engram adds only its own lookup and gate."""
+    on a plain layer (layer 3)."""
     g = v41_graph()
     layers = expanded_layers(g)
     t = text_config(config_of(V41))
+    assert t["engram_layer_ids"], "the config declares no engram layer to check"
     plain = layers[3]
+    assert 3 not in t["engram_layer_ids"] and traffic_of(plain, "engram") == 0
     for i in t["engram_layer_ids"]:
-        assert (traffic_of(layers[i], "mhc_attn_post") + traffic_of(layers[i], "mhc_attn_pre")
+        assert (traffic_of(layers[i], "mhc_attn_post")
+                + traffic_of(layers[i], "mhc_attn_pre")
                 == traffic_of(plain, "mhc_attn_post_pre"))
         assert traffic_of(layers[i], "mhc") == traffic_of(plain, "mhc"), i
 
@@ -3827,7 +3837,8 @@ def test_deepseek_v41_mhc_runs_once_per_sublayer_at_fp32():
 def test_deepseek_v41_draft_module_drafts_a_block_through_its_own_experts():
     """The DSpark draft: dspark_block_size tokens per step (config/speculative.py:
     1475-1482), through num_nextn_predict_layers layers that read only their window
-    (attention.py:322-324), route over dspark_n_routed_experts at
+    (their compress_ratios entries are 0, attention.py:300-305), route over
+    dspark_n_routed_experts at
     dspark_num_experts_per_tok, and run no engram and no indexer."""
     g, t = v41_graph(), text_config(config_of(V41))
     spec = g["speculator"]
@@ -3861,7 +3872,28 @@ def test_deepseek_v41_draft_module_drafts_a_block_through_its_own_experts():
     ({"compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 2]}, "draft layer"),
     ({"kv_source_layer_ids": [1, 2, 8, 14, 20]}, "no compressed stream"),
     ({"head_dim": 576}, "head_dim 512"),
-    ({"engram_layer_ids": [0, 14]}, "never injected"),
+    ({"engram_layer_ids": [0, 14]}, "engram_layer_ids names a layer outside"),
+    ({"engram_layer_ids": [1, 40]}, "engram_layer_ids names a layer outside"),
+    ({"engram_layer_ids": [14, 14]}, "engram_layer_ids repeats"),
+    ({"kv_source_layer_ids": [-1, 2, 8, 14, 20]}, "kv_source_layer_ids names a layer"),
+    ({"index_source_layer_ids": [2, 8, 14, 20, 40]}, "index_source_layer_ids names"),
+    ({"kv_source_layer_ids": [2.9, 8, 14, 20]}, "not a whole number"),
+    ({"compress_ratios": [0, 0] + [2.5] * 18 + [1] * 20 + [0, 0, 0]}, "not a whole"),
+    ({"compress_ratios": [0, 0] + [True] * 18 + [1] * 20 + [0, 0, 0]}, "not a whole"),
+    ({"compress_ratios": [0, 2] + [2] * 18 + [1] * 20 + [0, 0, 0]},
+     "reads the compressed cache of layer None"),
+    ({"compress_ratios": [0, 0] + [2] * 18 + [1] * 21}, "compress_ratios has 41"),
+    ({"sliding_window": 0}, "sliding_window is 0"),
+    ({"hc_mult": 0}, "hc_mult is 0"),
+    ({"o_groups": 7}, "o_groups 7 does not divide"),
+    ({"o_groups": 0}, "o_groups is 0"),
+    ({"qk_rope_head_dim": 32}, "head_dim 512 with rope"),
+    ({"index_head_dim": 192}, "not a multiple of 128"),
+    ({"engram_max_ngram_size": 1}, "engram_max_ngram_size is 1"),
+    ({"n_shared_experts": 0}, "num_shared_experts is 0"),
+    ({"dspark_target_layer_ids": []}, "dspark_target_layer_ids is empty"),
+    ({"dspark_target_layer_ids": [37, 38, 99]}, "dspark_target_layer_ids names"),
+    ({"dspark_block_size": 0}, "dspark_block_size is 0"),
     ({"index_source_layer_ids": [2, 9, 14, 20]}, "builds no indexer"),
     ({"index_source_layer_ids": [8, 14, 20]}, "no index source at or below"),
 ])
@@ -3954,14 +3986,17 @@ def test_deepseek_v41_charges_each_launch_the_traffic_its_kernel_moves():
     an unamortized per-entry write each show up where they happen."""
     g, t = v41_graph(), text_config(config_of(V41))
     checked = 0
-    layers = expanded_layers(g) + expanded_layers(g, g["speculator"]["stack"]) + [g["head"]]
-    ratios = t["compress_ratios"][:t["num_hidden_layers"]] + [0] * (len(layers) - 40)
+    layers = (expanded_layers(g) + expanded_layers(g, g["speculator"]["stack"])
+              + [g["head"]])
+    depth = t["num_hidden_layers"]
+    ratios = t["compress_ratios"][:depth] + [0] * (len(layers) - depth)
     for i, nodes in enumerate(layers):
         for n in nodes:
             if n["op"] != "Elementwise":
                 continue
             want = v41_expected_traffic(t, n["role"], ratios[i])
-            assert n.get("bytes_per_token") == want, (i, n["role"], n.get("bytes_per_token"), want)
+            assert n.get("bytes_per_token") == want, (
+                i, n["role"], n.get("bytes_per_token"), want)
             checked += 1
     # 40 target layers, 3 draft layers and the head, about six launches each.
     assert checked > 200, checked
@@ -3986,8 +4021,10 @@ V41_DRAFT_ALIASES = {
 
 
 def test_deepseek_v41_draft_layers_charge_the_mtp_weights_at_their_resident_width():
-    """The DSpark layers price the checkpoint's mtp.* tensors, element for element and
-    byte for byte at vLLM's resident widths, plus only the aliased weights named above."""
+    """The DSpark layers price every matrix of the checkpoint's mtp.* tensors that they
+    multiply by, at vLLM's resident widths, plus only the aliased weights named above.
+    The Markov head's embed half is a gather (qwen3_dspark.py:48-93) and the confidence
+    head runs only under adaptive verification, so neither is a GEMM here."""
     g, t = v41_graph(), text_config(config_of(V41))
     draft = expanded_layers(g, g["speculator"]["stack"])
     for d, nodes in enumerate(draft):
@@ -4002,3 +4039,230 @@ def test_deepseek_v41_draft_layers_charge_the_mtp_weights_at_their_resident_widt
         assert sum(e for e, _ in priced) == sum(n * k for n, k, _ in want), d
         assert sum(b for _, b in priced) == sum(
             n * k * WIDTH[V41_RESIDENT_OVERRIDES.get((n, k), dt)] for n, k, dt in want), d
+
+
+def v41_required_launches(t: dict, where: str, i: int) -> list[str]:
+    """The Elementwise launches vLLM v0.31.0 runs on SM90 for one target layer, draft
+    layer or the head, from the config's vectors alone (no graph is read)."""
+    kv, idx = t["kv_source_layer_ids"], t["index_source_layer_ids"]
+    attn = ["qkv_a_layernorm", "q_rope_kv_insert"]
+    if where == "head":
+        return ["mhc_final_post", "hc_collapse", "final_norm"]
+    if where == "draft":
+        last = i == t["num_nextn_predict_layers"] - 1
+        return (["dspark_context_kv_norm", "dspark_context_kv_rope_insert"]
+                + (["dspark_main_norm", "mhc_attn_broadcast_pre"] if i == 0
+                   else ["mhc_attn_post_pre"])
+                + attn + ["o_inv_rope", "mhc_ffn_post_pre"]
+                + (["mhc_final_post", "hc_collapse", "dspark_final_norm"] if last else []))
+    if i == 0:
+        boundary = ["mhc_attn_broadcast_pre"]
+    elif i in t["engram_layer_ids"]:
+        boundary = ["mhc_attn_post", "engram_lookup", "engram_gate", "mhc_attn_pre"]
+    else:
+        boundary = ["mhc_attn_post_pre"]
+    work = boundary + attn
+    if i in kv:
+        work += ["compressor_pool_norm", "compressor_rope_quant_insert"]
+    if i in idx:
+        work += ["index_q_rope_quant"] + (["index_k_norm_rope_store"] if i in kv else [])
+    return work + ["o_inv_rope", "mhc_ffn_post_pre"]
+
+
+def test_deepseek_v41_every_layer_launches_exactly_the_work_vllm_runs():
+    """Each layer's Elementwise launch count and total traffic equal what the config
+    assigns it, so a launch the handler forgets (an engram gate, a norm, the inverse
+    RoPE, a head mixer) is missing from the sum rather than invisible. Comparing totals
+    lets a handler regroup launches that move the same bytes."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    ratios = t["compress_ratios"]
+    stacks = ([("target", i, n) for i, n in enumerate(expanded_layers(g))]
+              + [("draft", i, n) for i, n in enumerate(
+                  expanded_layers(g, g["speculator"]["stack"]))]
+              + [("head", 0, g["head"])])
+    for where, i, nodes in stacks:
+        launches = [n for n in nodes if n["op"] == "Elementwise"]
+        want = v41_required_launches(t, where, i)
+        ratio = ratios[i] if where == "target" else 0
+        assert len(launches) == len(want), (where, i, [n["role"] for n in launches], want)
+        assert sum(n.get("bytes_per_token") or 0 for n in launches) == sum(
+            v41_expected_traffic(t, r, ratio) or 0 for r in want), (where, i)
+
+
+def test_deepseek_v41_largest_launches_move_the_bytes_their_kernels_state():
+    """Hand-computed figures for the five largest per-token launches, so a change to an
+    assumption shared by the handler and v41_expected_traffic (a record size, a width)
+    breaks a literal rather than moving both sides together."""
+    g = v41_graph()
+    layers = expanded_layers(g)
+    by_role = {n["role"]: n["bytes_per_token"] for n in layers[2]
+               if n["op"] == "Elementwise" and "bytes_per_token" in n}
+    # residual 4 x 5120 BF16 = 40,960 per pass; post 10,240 + 2 x 40,960 + 80, pre
+    # 40,960 + 80 + 10,240 (kernels/mhc/tilelang.py:296-358)
+    assert by_role["mhc_attn_post_pre"] == 143_520
+    # Q 64 x 512 BF16 read and written, KV 1,024 read, one 584 B record written
+    # (attention.py:1034-1048, 503-508)
+    assert by_role["q_rope_kv_insert"] == 132_680
+    assert by_role["o_inv_rope"] == 131_072
+    # decode at ratio 2: 2 x 4,096 + (2 x 4,096 + 1,024) / 2
+    # (fused_compress_quant_cache.py:118-221)
+    assert by_role["compressor_pool_norm"] == 12_800
+    engram = {n["role"]: n["bytes_per_token"] for n in layers[1]
+              if n["op"] == "Elementwise" and "bytes_per_token" in n}
+    # bundle, keys and the shared value read, bundle written (common/engram.py:755-843)
+    assert engram["engram_gate"] == 133_120
+
+
+def test_deepseek_v41_main_read_is_the_latent_record_every_layer_caches():
+    """Every target and draft layer reads a one-head latent cache of head_dim, RoPE
+    included, with qk_rope_head_dim of it rotated. head_dim is inclusive of the RoPE
+    width (compressor.py:209-210), and the width is what a consumer multiplies by the
+    selected positions to price a decode read."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    for nodes in expanded_layers(g) + expanded_layers(g, g["speculator"]["stack"]):
+        read = compressed_read(nodes)
+        assert (read["n_kv"], read["d_h"], read["qk_rope_head_dim"], read["n_q"]) == (
+            1, t["head_dim"], t["qk_rope_head_dim"], t["num_attention_heads"])
+        for scan in scoring_scans(nodes):
+            assert (scan["n_q"], scan["n_kv"], scan["d_h"]) == (
+                t["index_n_heads"], 1, t["index_head_dim"])
+
+
+def test_deepseek_v41_each_layer_reduces_and_gathers_what_vllm_does():
+    """Per layer: one tensor-parallel all-reduce after wo_b and one for the MoE output
+    (nvidia/model.py:318-329), the expert-parallel dispatch, and, on engram layers
+    only, the two tensor-parallel all-gathers of the rows and the wkv output
+    (common/engram.py:928-937, 996)."""
+    g, t = v41_graph(), text_config(config_of(V41))
+    def of(nodes, op, emit):
+        return sum(1 for n in nodes if n["op"] == op and n.get("emit") == emit)
+    for i, nodes in enumerate(expanded_layers(g)):
+        assert of(nodes, "AllReduce", "tensor_parallel") == 1, i
+        assert of(nodes, "AllReduce", "tensor_parallel_unless_sp_moe") == 1, i
+        assert of(nodes, "All2All", "expert_parallel") == 1, i
+        assert of(nodes, "AllGather", "tensor_parallel") == (
+            2 if i in t["engram_layer_ids"] else 0), i
+    for nodes in expanded_layers(g, g["speculator"]["stack"]):
+        assert of(nodes, "AllGather", "tensor_parallel") == 0
+
+
+def v41_derive_from_file(tmp_path, raw: dict) -> dict:
+    """The real derive(), through a config.json on disk."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw))
+    return deriver().derive(path, "synthetic")
+
+
+def test_deepseek_v41_derive_applies_the_head_and_the_speculator_the_handler_states(
+        tmp_path):
+    """Through derive() itself: the head runs the mHC post and collapse before the final
+    norm and prices lm_head at BF16, and the speculator is the handler's DSpark stack
+    rather than derive()'s generic MTP fallback. A checkpoint with no draft layers gets
+    no speculator, although num_nextn_predict_layers is the field the fallback reads."""
+    raw = config_of(V41)
+    g = v41_derive_from_file(tmp_path, raw)
+    t = text_config(raw)
+    head_traffic = sum(n.get("bytes_per_token") or 0 for n in g["head"])
+    assert head_traffic == (v41_expected_traffic(t, "mhc_final_post", 0)
+                            + v41_expected_traffic(t, "hc_collapse", 0))
+    lm = [n for n in g["head"] if n["op"] == "GEMM"]
+    assert [(n["n"], n["k"], n["weight_dtype"]) for n in lm] == [
+        (t["vocab_size"], t["hidden_size"], "bf16")]
+    assert g["speculator"]["method"] == "dspark"
+    assert g["speculator"]["num_spec_tokens"] == t["dspark_block_size"]
+
+    bare = dict(raw, text_config=dict(t, num_nextn_predict_layers=0,
+                                      compress_ratios=t["compress_ratios"][:40]))
+    assert "speculator" not in v41_derive_from_file(tmp_path, bare)
+
+
+def test_deepseek_v41_omitted_draft_ratios_price_like_stated_zeros():
+    """Metamorphic: vLLM gives a layer id past the end of compress_ratios ratio 0
+    (attention.py:300-305), so a vector that omits the three draft entries prices
+    exactly like one that states them as 0."""
+    t = v41_config()
+    short = v41_config(compress_ratios=t["compress_ratios"][:t["num_hidden_layers"]])
+    a, b = v41_derive(t), v41_derive(short)
+    assert cost_signature(a) == cost_signature(b)
+
+
+def test_deepseek_v41_main_proj_reads_one_hidden_state_per_target_layer():
+    """Metamorphic: dropping a DSpark target layer narrows main_proj's input by one
+    hidden width (dspark.py:100-108) and changes nothing else in the draft."""
+    full = v41_derive(v41_config())
+    two = v41_derive(v41_config(dspark_target_layer_ids=[38, 39]))
+    hidden = text_config(config_of(V41))["hidden_size"]
+    def main_proj(g):
+        return [n["k"] for n in expanded_layers(g, g["speculator"]["stack"])[0]
+                if n.get("role") == "dspark_main_proj"]
+    assert main_proj(full) == [3 * hidden] and main_proj(two) == [2 * hidden]
+
+
+def test_a_deriver_crash_is_reported_against_its_model(tmp_path):
+    """An exception the deriver does not raise itself is still recorded against the
+    model it came from, and the failures collected before it are still printed."""
+    models = tmp_path / "models"
+    (models / "a-unknown").mkdir(parents=True)
+    (models / "a-unknown" / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen9ForCausalLM"]}))
+    (models / "b-crash").mkdir()
+    # A string layer count makes handler_dense's int() raise ValueError.
+    (models / "b-crash" / "config.json").write_text(json.dumps({
+        "architectures": ["LlamaForCausalLM"], "hidden_size": 4096,
+        "num_hidden_layers": "forty", "num_attention_heads": 32,
+        "num_key_value_heads": 8, "intermediate_size": 14336, "vocab_size": 32000,
+        "torch_dtype": "bfloat16"}))
+    r = subprocess.run([sys.executable, str(DERIVER), str(tmp_path), "--check"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    lines = r.stderr.splitlines()
+    assert any(ln.startswith("a-unknown: no handler") for ln in lines), r.stderr
+    assert any(ln.startswith("b-crash: ValueError:") for ln in lines), r.stderr
+    assert "Traceback" not in r.stderr
+
+
+def derive_through_stub(tmp_path, monkeypatch, tail: tuple, **config) -> dict:
+    """The real derive() over a one-kind stub handler returning ([layer], stack, *tail)."""
+    dg = deriver()
+    layer = {"id": "layer", "nodes": [dg.norm("n")], "edges": []}
+    monkeypatch.setitem(dg.HANDLERS, "StubForCausalLM",
+                        lambda cfg, raw, model: ([layer], {"prologue": ["layer"]}, *tail))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"architectures": ["StubForCausalLM"], "hidden_size": 64,
+                                "vocab_size": 128, "torch_dtype": "bfloat16", **config}))
+    return dg.derive(path, "stub")
+
+
+@pytest.mark.parametrize("extras, fragment", [
+    ({"lm_head_dtpye": "bf16"}, "extras name"),
+    ({"speculator": {"method": "dspark", "num_spec_tokens": 5,
+                     "stack": {"pattern": [], "repeat": 1}}}, "not a draft module"),
+    ({"speculator": {"method": "dspark", "num_spec_tokens": 0,
+                     "stack": {"pattern": ["layer"], "repeat": 1}}}, "not a draft module"),
+    ({"speculator": {"method": "dspark", "num_spec_tokens": 5,
+                     "stack": {"pattern": ["undefined"], "repeat": 1}}},
+     "not a draft module"),
+], ids=["misspelled key", "empty draft stack", "no draft tokens", "undefined draft kind"])
+def test_derive_refuses_extras_it_cannot_honour(tmp_path, monkeypatch, extras, fragment):
+    """A handler's third result is a contract with derive(). A key derive() does not
+    read, or a speculator that drafts nothing or through a kind nobody defined, would
+    otherwise leave a default standing or price a draft pass that does not exist."""
+    with pytest.raises(deriver().DeriveError, match=fragment):
+        derive_through_stub(tmp_path, monkeypatch, (extras,))
+
+
+def test_derive_refuses_a_handler_result_of_the_wrong_length(tmp_path, monkeypatch):
+    with pytest.raises(deriver().DeriveError, match="returned 4 results"):
+        derive_through_stub(tmp_path, monkeypatch, ({}, {}))
+
+
+def test_derive_refuses_a_head_width_that_contradicts_the_exclusion_list(
+        tmp_path, monkeypatch):
+    """Two sources for one width must agree; the later must not silently win."""
+    monkeypatch.setitem(deriver().HEAD_UNQUANTIZED, "StubForCausalLM",
+                        {"lm_head": "lm_head"})
+    with pytest.raises(deriver().DeriveError, match="exclusion list gives lm_head bf16"):
+        derive_through_stub(
+            tmp_path, monkeypatch, ({"lm_head_dtype": "fp32"},),
+            quantization_config={"quant_method": "fp8",
+                                 "modules_to_not_convert": ["lm_head"]})
