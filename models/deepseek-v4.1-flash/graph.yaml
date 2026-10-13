@@ -491,6 +491,14 @@ layer_kinds:
       bytes_per_entry: 8
       tokens_per_entry: 2
       per: query_token
+  - op: Elementwise
+    role: index_prefill_k_gather
+    tp: replicated
+    context:
+      reads_cache: index
+      bytes_per_entry: 132
+      per: request
+      phase: prefill
   - op: Attention
     kind: sparse_mla
     n_q: 64
@@ -660,6 +668,8 @@ layer_kinds:
     - 30
   - - 30
     - 31
+  - - 31
+    - 32
 - id: csa2_moe
   nodes:
   - op: Elementwise
@@ -977,6 +987,14 @@ layer_kinds:
       bytes_per_entry: 8
       tokens_per_entry: 2
       per: query_token
+  - op: Elementwise
+    role: index_prefill_k_gather
+    tp: replicated
+    context:
+      reads_cache: index
+      bytes_per_entry: 132
+      per: request
+      phase: prefill
   - op: Attention
     kind: sparse_mla
     n_q: 64
@@ -1160,6 +1178,8 @@ layer_kinds:
     - 37
   - - 37
     - 38
+  - - 38
+    - 39
 - id: csa1_kvsrc_idx_cand_moe
   nodes:
   - op: Elementwise
@@ -1259,11 +1279,27 @@ layer_kinds:
       bytes_per_entry: 8
       per: query_token
   - op: Elementwise
+    role: index_prefill_k_gather
+    tp: replicated
+    context:
+      reads_cache: index
+      bytes_per_entry: 132
+      per: request
+      phase: prefill
+  - op: Elementwise
     role: candidate_select
     tp: replicated
     context:
       bytes_per_entry: 4
       per: query_token
+  - op: Elementwise
+    role: candidate_block_scores
+    tp: replicated
+    context:
+      bytes_per_entry: 8
+      tokens_per_entry: 8
+      per: query_token
+      decode_extent: max_model_len
   - op: Attention
     kind: sparse_mla
     n_q: 64
@@ -1429,6 +1465,10 @@ layer_kinds:
     - 31
   - - 31
     - 32
+  - - 32
+    - 33
+  - - 33
+    - 34
 - id: csa1_moe
   nodes:
   - op: Elementwise
@@ -1677,6 +1717,14 @@ layer_kinds:
       bytes_per_entry: 8
       per: query_token
   - op: Elementwise
+    role: index_prefill_k_gather
+    tp: replicated
+    context:
+      reads_cache: index
+      bytes_per_entry: 132
+      per: request
+      phase: prefill
+  - op: Elementwise
     role: candidate_mask
     tp: replicated
     context:
@@ -1836,6 +1884,8 @@ layer_kinds:
     - 26
   - - 26
     - 27
+  - - 27
+    - 28
 - id: dspark_0
   nodes:
   - op: Elementwise

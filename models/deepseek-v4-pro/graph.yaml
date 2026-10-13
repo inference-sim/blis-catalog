@@ -564,6 +564,14 @@ layer_kinds:
       bytes_per_entry: 8
       tokens_per_entry: 4
       per: query_token
+  - op: Elementwise
+    role: index_prefill_k_gather
+    tp: replicated
+    context:
+      reads_cache: index
+      bytes_per_entry: 132
+      per: request
+      phase: prefill
   - op: Attention
     kind: sparse_mla
     n_q: 128
@@ -740,6 +748,8 @@ layer_kinds:
     - 32
   - - 32
     - 33
+  - - 33
+    - 34
 - id: csa128_moe
   nodes:
   - op: Elementwise
@@ -1063,6 +1073,14 @@ layer_kinds:
       bytes_per_entry: 8
       tokens_per_entry: 4
       per: query_token
+  - op: Elementwise
+    role: index_prefill_k_gather
+    tp: replicated
+    context:
+      reads_cache: index
+      bytes_per_entry: 132
+      per: request
+      phase: prefill
   - op: Attention
     kind: sparse_mla
     n_q: 128
@@ -1230,6 +1248,8 @@ layer_kinds:
     - 31
   - - 31
     - 32
+  - - 32
+    - 33
 - id: mtp
   nodes:
   - op: Elementwise

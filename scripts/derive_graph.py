@@ -258,10 +258,12 @@ def mhc_mixing_bytes(cfg: dict[str, Any], raw: dict[str, Any], model: str,
             + comb_mix (hc_mult^2) + layer_input (hidden)
 
     The residual streams and layer_input are bf16 (the kernel asserts it); post_mix and
-    comb_mix are fp32 (likewise). Two corners deliberately not modelled, because a layer
-    kind prices the common case and neither is it: layer 0's attention side runs a
+    comb_mix are fp32 (likewise). For the family this was first written for (GLM-5.3,
+    common/model.py), two corners are deliberately not modelled, because a layer kind
+    prices the common case and neither is it: layer 0's attention side runs a
     standalone pre rather than a fused post+pre, and the final layer materializes a
-    trailing post. Each is one layer of 45.
+    trailing post, each one layer of 45. DeepSeek-V4 and V4.1 price both corners with
+    their own nodes and use this figure for the fused boundary alone.
 
     The hc_sinkhorn_iters rounds iterate over the [mix_hc] logits, which at hc_mult 4 is
     24 fp32 values against 32 KiB of residual traffic, so they are not counted."""
@@ -1693,10 +1695,11 @@ def handler_deepseek_v4(cfg, raw, model):
     sublayer, hash routing on the first num_hash_layers layers, and one MTP draft layer.
 
     Priced as vLLM v0.31.0 serves it on CUDA with default backends (FlashMLA, no
-    mega-MoE). Nothing below branches on the GPU generation: the attention class,
-    the 584 B record and every resident width are the same on SM90 and SM100
-    (nvidia/model.py:1146-1177; attention.py:856-879), so the graph has no
-    architecture overlay. The kernels that do differ -- Marlin W4A16 experts on SM90,
+    mega-MoE). The attention class, the 584 B record and every resident width are the
+    same on SM90 and SM100 (nvidia/model.py:1146-1177; attention.py:856-879), so the
+    graph has no architecture overlay. One launch's figure differs: on SM100 the
+    inverse-RoPE quant packs its scales as E8M0 rather than SM90's FP32 per 128
+    (nvidia/ops/o_proj.py:19-32), under 1% of that launch. The kernels that do differ -- Marlin W4A16 experts on SM90,
     FlashInfer or DeepGEMM MXFP4 on SM100 (fused_moe/oracle/mxfp4.py:367-403) -- are
     the cost model's to price.
 
@@ -1733,10 +1736,15 @@ def handler_deepseek_v4(cfg, raw, model):
         the full path, which is what the graph prices;
       * the compressor state caches are sliding windows of coff x ratio tokens, which
         the schema's window kind cannot state on a node whose own window differs, so
-        each is stated as the fixed rows a decoding request holds: cdiv(window - 1 +
-        2, block) + 1 pages at MTP's one draft token
-        (v1/kv_cache_interface.py:840-866). Their pages' 576 B padding, and the larger
-        hold during chunked prefill, are not carried (inference-sim/blis-schemas#59);
+        each is stated as the fixed rows a decoding request holds. That count is this
+        deriver's reading, not a number vLLM states: vLLM bounds a sliding-window
+        spec at cdiv(window - 1 + tokens in flight, block) + 1 pages
+        (v1/kv_cache_interface.py:840-866) and reserves for its engine-wide
+        max_in_flight_tokens (config/vllm.py:604-613), while a decoding request's own
+        in-flight tokens are 1 + num_spec_tokens a step, twice that under async
+        scheduling -- 2 or 4 at MTP's one draft token, which give the same pages for
+        these windows. Their pages' 576 B padding, and the larger hold during chunked
+        prefill, are not carried (inference-sim/blis-schemas#59);
       * h_proj runs on all hc_mult streams of the MTP input, hc_mult rows per token
         (nvidia/mtp.py:185-187); a GEMM node states one (inference-sim/blis-schemas#58);
       * the shared expert's TP padding: without sequence parallelism its intermediate
@@ -1795,8 +1803,8 @@ def handler_deepseek_v4(cfg, raw, model):
               for r in require_key(cfg, "compress_ratios", model)]
     spec_layers = whole(require(cfg, "num_spec_tokens", model), "num_nextn_predict_layers")
     if spec_layers not in (0, 1):
-        # One MTP module, reused for every draft token (nvidia/mtp.py:215-252;
-        # config/speculative.py:1487-1495).
+        # One MTP module, reused for every draft token, spec_step_idx % num_mtp_layers
+        # (nvidia/mtp.py:267, 281; config/speculative.py:1487-1495).
         raise DeriveError(f"{model}: num_nextn_predict_layers is {spec_layers}; V4's "
                           f"MTP builds one draft layer")
     if len(ratios) not in (layers, layers + spec_layers):
@@ -1938,7 +1946,8 @@ def handler_deepseek_v4(cfg, raw, model):
             with_tp(fp32_gemm("hc_attn_fn_broadcast", mix_hc, hidden), "replicated"))
 
     def mhc_head(prefix):
-        # hc_head_fused_kernel_tilelang (tilelang_kernels.py:1021-1114): pass 1 projects
+        # hc_head_fused_kernel_tilelang (tilelang.py:1041-1071), the TileLang kernel
+        # hc_head_fuse_tilelang (tilelang_kernels.py:1021-1114): pass 1 projects
         # the bundle onto hc_head_fn (mixes kept in registers), pass 2 reads the bundle
         # again for the gated sum and writes one hidden row. The final RMSNorm is a
         # separate launch (nvidia/model.py:1641-1649).
@@ -2065,6 +2074,12 @@ def handler_deepseek_v4(cfg, raw, model):
             # read back by the top-k (sparse_attn_indexer.py:583-626, 726-785).
             context_work("index_logits_topk", per="query_token", bytes_per_entry=2 * fp32,
                          tokens_per_entry=4),
+            # Each prefill chunk gathers the request's whole key stream into a
+            # workspace, one 132 B key written per entry read
+            # (sparse_attn_indexer.py:515-528).
+            context_work("index_prefill_k_gather", per="request",
+                         bytes_per_entry=index_record, reads_cache="index",
+                         phase="prefill"),
         ]
         return nodes
 
@@ -2219,7 +2234,8 @@ def handler_deepseek_v4(cfg, raw, model):
     }
 
     if spec_layers:
-        # DeepSeekV4MTP (nvidia/mtp.py:83-302): the target's embedding and lm_head
+        # DeepSeekV4MTP (nvidia/mtp.py:305-, built from the layer and predictor at
+        # :83-302): the target's embedding and lm_head
         # (shared, v1/worker/gpu/spec_decode/eagle/utils.py:15-18, 38-118), separate FP8
         # e_proj and h_proj, its own hc_head, and one DeepseekV4DecoderLayer at
         # ratio 1 with a learned gate. Its first pass each step runs over every token
@@ -2312,10 +2328,13 @@ def handler_deepseek_v41(cfg, raw, model):
         (mxfp8/emulation.py:31-50, with VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD defaulting
         True). On SM100 it stays FP8.
       * the KV record is 584 B on SM90 (DSV41_SM90_KV_RECORD_BYTES) in 576 B-aligned
-        pages. SM100 writes a 528 B MXFP8 record in 512 B pages and, under
-        nvfp4_ds_mla, a 288 B NVFP4 compressed record (attention.py:500-508;
-        nvidia/flash_mla_mega_attn.py:193-197). The 132 B indexer record is the
-        default on both.
+        pages. SM100 writes a 528 B MXFP8 record in 512 B pages, and its default mega
+        attention resolves an unstated or "fp8" cache dtype to nvfp4_ds_mla
+        (attention.py:140-149; nvidia/flash_mla_mega_attn.py:193-197), whose
+        compressed record is 288 B NVFP4 while the window keeps 528 B
+        (attention.py:500-508). The overlay states both records; which cache dtype
+        runs is the consumer's to resolve. The 132 B indexer record is the default on
+        both.
       * FlashMLA is the SM90 attention class (nvidia/model.py:190-236); SM100 defaults
         to mega attention, which fuses Q RoPE, the attention and the inverse RoPE into
         one launch. The overlay changes widths and records, not launches, so SM100's
@@ -2338,7 +2357,7 @@ def handler_deepseek_v41(cfg, raw, model):
         k_norm; the rest score their own queries against the nearest KV source's keys
         (attention.py:437-449), which the checkpoint confirms by carrying wk and k_norm
         on 2, 8, 14 and 20 alone. Every other compressed layer reads the top-k the last
-        indexer wrote into the shared buffer (attention.py:1208-1213).
+        indexer wrote into the shared buffer (nvidia/flashmla.py:185-189).
 
     Each layer states the caches its main read and its scorer hold: its own window,
     and on compressed layers the stream (and the keys) it owns or borrows, owners with
@@ -2365,6 +2384,17 @@ def handler_deepseek_v41(cfg, raw, model):
         n_q / tp gives 8. That depends on the backend and the TP width rather than on
         the model, so the main read states no tp and the consumer applies it
         (inference-sim/blis-latency-kernel#39);
+      * SM100's fused all-reduce + mHC: at TP 4 without expert parallelism, where
+        NVLink multicast is available, wo_b's and the MoE's reductions fold into the
+        mHC boundary kernel (nvidia/model.py:318-328, 645-653; nvidia/ops/mhc.py:
+        44-72), which an overlay cannot restate, so the graph keeps them as
+        all-reduces;
+      * the shared expert's TP padding: its intermediate rounds up to whole 32-wide
+        blocks per rank (deepseek_v4/nvidia/model.py:150-158, under weight_block_size
+        [32, 32]), none at TP 8 but 2,560 for 2,304 at TP 16, so the consumer applies
+        it;
+      * resident tensors no GEMM or Gather prices: the norms, attention sinks, gate
+        biases and the engram gate's q and k weights, a few MB;
       * the SM100 page size of the compressed and indexer caches, 128 tokens where
         SM90's is 64: an architecture overlay restates a cache's record and alignment
         but not its block_size (inference-sim/blis-schemas#62);
@@ -2377,8 +2407,20 @@ def handler_deepseek_v41(cfg, raw, model):
         stream into the drafter's hidden buffer (nvidia/model.py:773-784, 975-980),
         the auxiliary writes at the dspark_target_layer_ids, and, under sequence
         parallelism, the head's gather of the whole hc stream and its pre-mix ahead of
-        the collapse and norm, in place of the collapsed state after them (:976-990).
-        No emit condition names speculation (inference-sim/blis-schemas#51);
+        the collapse and norm, in place of the collapsed state after them (:976-990),
+        and the all-gathers of the auxiliary states it reads (:944-946, 958-959). No
+        emit condition names speculation (inference-sim/blis-schemas#51);
+      * prefill's gather of each layer's own window records into the BF16 workspace,
+        query_len + min(prefix, window - 1) entries per request (nvidia/flashmla.py:
+        315-325; sparse_swa.py:366-371), about 1.6 KB per prefill token a layer: it
+        grows with the chunk, not the context, and no context field states that;
+      * Engram's DP-sharded path: with DP > 1 and /dev/shm too small for the ~189 GiB
+        of tables, they shard over TP x DP and the hashes and rows are exchanged over
+        the engram DP group (nvidia/engram.py:104-159, 408-424, 490-496;
+        distributed/parallel_state.py:2104-2128). The graph states the shared-memory
+        case, one copy per node;
+      * on SM100, qkv_a_layernorm writes an FP8 query with its scales when the query
+        quantization fuses (attention.py:744-756), which the overlay cannot restate;
       * layer 0's (24, 20480) hc_attn_fn, which stays resident beside the summed
         broadcast matrix it multiplies by (nvidia/model.py:402-409, 1178-1191), 1.9 MB;
       * small per-token launches below any node's resolution: the decode top-k index
@@ -2667,11 +2709,13 @@ def handler_deepseek_v41(cfg, raw, model):
     # (nvidia/model.py:503-604) -- so no attn_norm / ffn_norm node exists. Traffic is
     # mhc_mixing_bytes(): the post and the pre each as one pass, read against the
     # TileLang contract (kernels/mhc/tilelang.py:296-358: residual bf16 (T, hc, H),
-    # post / comb / pre mixes fp32). That is exact for neither path the kernel takes.
-    # Within its fused token range the updated residual feeds the projection from
-    # registers rather than a second pass over memory (tilelang.py:289-294), so the
-    # pre's bundle read (hc x hidden x bf16) does not happen. Above it the split-k GEMM
-    # reads the bundle once more. Neither has been measured.
+    # post and comb mixes fp32; the 4 FP32 pre-mix values, 32 B a token, are not
+    # counted). The pre's re-read of the updated residual happens on both paths the
+    # kernel takes (tilelang.py:445-457). Within its fused token range (32 or fewer per
+    # rank, tilelang_kernels.py:64-95) the projection is computed inside the post
+    # kernel, so the hc_*_fn GEMM node's own bundle read does not happen there; above
+    # it a separate GEMM reads the bundle as the node states. Neither has been
+    # measured.
     #
     # Every rank holds the whole residual stream under plain TP, so mHC is replicated.
     # Every mHC launch and projection runs on the residual stream: replicated on each
@@ -2834,7 +2878,7 @@ def handler_deepseek_v41(cfg, raw, model):
             # RoPE and FP8 quantization of the index query. The FP8 path stores no q
             # scale: it is folded into the FP32 head weights it writes
             # (attention.py:1398-1407; deepseek_v4/common/ops/fused_indexer_q.py:
-            # 567-576). Reads the BF16 query and weights, writes FP8 q and FP32 weights.
+            # 669-727). Reads the BF16 query and weights, writes FP8 q and FP32 weights.
             traffic("index_q_rope_quant",
                     index_heads * index_dim * act + index_heads * act
                     + index_heads * index_dim + index_heads * fp32, tp="replicated"),
@@ -2863,12 +2907,25 @@ def handler_deepseek_v41(cfg, raw, model):
         # (sparse_attn_indexer.py:583-626, 726-785).
         nodes.append(context_work("index_logits_topk", per="query_token",
                                   bytes_per_entry=2 * fp32, tokens_per_entry=ratio))
+        # Each prefill chunk gathers the request's whole key stream out of the cache
+        # into a workspace, one 132 B key written per entry it reads
+        # (sparse_attn_indexer.py:515-528).
+        nodes.append(context_work("index_prefill_k_gather", per="request",
+                                  bytes_per_entry=index_record, reads_cache="index",
+                                  phase="prefill"))
         if i == candidate_source:
             # The candidate source scores blocks of candidate_block_size positions from
             # its logits row and keeps the top candidate_topk_blocks
             # (kernels/attention/dsa/candidate_blocks.py:20-58, 392-445).
             nodes.append(context_work("candidate_select", per="query_token",
                                       bytes_per_entry=fp32, tokens_per_entry=ratio))
+            # It writes one FP32 score per candidate block across the logits row's
+            # whole width, max_model_len / ratio in decode, and top-k reads them all
+            # back (candidate_blocks.py:400-445; sparse_attn_indexer.py:748-756).
+            nodes.append(context_work(
+                "candidate_block_scores", per="query_token", bytes_per_entry=2 * fp32,
+                tokens_per_entry=ratio * positive("candidate_block_size"),
+                decode_extent="max_model_len"))
         elif candidate_source is not None and i > candidate_source:
             # Later indexers mask their rows to those blocks with -inf stores across the
             # row's whole width, which in decode is max_model_len
@@ -3024,7 +3081,8 @@ def handler_deepseek_v41(cfg, raw, model):
     # no engram (no engram_layout is passed, dspark.py:122-132). It drafts
     # dspark_block_size tokens in ONE pass over that many positions per request
     # (v1/worker/gpu/spec_decode/dspark/speculator.py:1-23, 250-268), and each draft
-    # query reads its window plus its whole block, non-causally (sparse_swa.py:551-563).
+    # query reads its window plus its whole block, non-causally (sparse_swa.py:
+    # 1253-1258).
     #
     # Before that pass the drafter projects the hidden states of the
     # dspark_target_layer_ids through main_proj and main_norm (dspark.py:100-108,
@@ -3099,8 +3157,9 @@ def handler_deepseek_v41(cfg, raw, model):
             "weight_scale": dict(DSV41_MXFP8_RESIDENT_SCALE),
             # vLLM derives max_model_len from max_position_embeddings and applies no
             # further factor for rope_type yarn (config/model.py:2471-2570); the
-            # tokenizer's model_max_length (1,048,576 at the pinned revision) does not
-            # lower it.
+            # tokenizer's model_max_length takes part through a min()
+            # (config/model.py:2496-2501), and at 1,048,576 at the pinned revision it
+            # equals max_position_embeddings, so it does not lower it.
             "context_window": positive("max_position_embeddings"),
         },
         # BF16, not FP8: vLLM passes the quant config, but it returns no method for an
@@ -3114,7 +3173,7 @@ def handler_deepseek_v41(cfg, raw, model):
         "base_capability_families": [9],
         "arch_overrides": [{
             # SM100 and SM103 run the MXFP8 BMM natively (mxfp8/deep_gemm.py:34-35), and
-            # store the 528 B MXFP8 record with 512 B pages (attention.py:119-126,
+            # store the 528 B MXFP8 record with 512 B pages (attention.py:125-126,
             # 500-512); under nvfp4_ds_mla the compressed record is 288 B NVFP4
             # (:506-508), which mega attention resolves an unstated cache dtype to
             # (nvidia/flash_mla_mega_attn.py:193-197). The index record keeps 132 B and
@@ -4138,10 +4197,11 @@ SPEC_METHODS = {
     "NemotronHForCausalLM": "nemotron_h_mtp",
     "InklingForConditionalGeneration": "inkling_mtp",
     "DeepseekV2ForCausalLM": "deepseek_mtp",
-    # Both verified in vLLM's own resolution rather than inferred from the family name:
-    # config/speculative.py maps model_type deepseek_v3 to deepseek_mtp alongside
-    # deepseek_v32 and glm_moe_dsa, and maps deepseek_v4 to the same method on its own
-    # branch (architectures DeepSeekMTPModel and DeepSeekV4MTPModel respectively).
+    # Verified in vLLM's own resolution rather than inferred from the family name:
+    # config/speculative.py rewrites model_type deepseek_v3 to deepseek_mtp alongside
+    # deepseek_v32 and glm_moe_dsa (architectures DeepSeekMTPModel). The method names
+    # "deepseek_mtp" here and above are v0.31.0's deprecated aliases, which it accepts
+    # and rewrites to "mtp" (:1135-1139); DeepSeek-V4 states "mtp" itself.
     "DeepseekV3ForCausalLM": "deepseek_mtp",
     # vLLM v0.31.0 rewrites the draft config's model_type deepseek_v4 to deepseek_mtp
     # and reads n_predict from num_nextn_predict_layers, NOT from num_mtp_modules the

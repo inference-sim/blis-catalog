@@ -3402,7 +3402,7 @@ def test_v4_has_one_layer_kind_per_compression_ratio():
     )
 
 
-def test_v4_higher_compression_reads_less():
+def test_v4_compression_ratios_cross_over_at_index_topk_entries():
     """The two ratios bound the read differently, and which reads less depends on the
     context.
 
@@ -3856,7 +3856,7 @@ def test_deepseek_v41_blackwell_overlay_runs_wo_a_natively_and_stores_the_mxfp8_
 
 def test_deepseek_v41_engram_tables_live_in_host_memory_at_their_stored_width():
     """Each engram layer gathers 24 rows a token -- (engram_max_ngram_size - 1) n-grams
-    for each of engram_n_heads heads (common/engram.py:740-760) -- from its own table of
+    for each of engram_n_heads heads (common/engram.py:199, 925) -- from its own table of
     engram_num_embeddings rows. A row is engram_head_dim FP8 values and one E8M0 scale
     per 32, and the gathered rows reach the GPU as BF16. vLLM v0.31.0 keeps the tables
     in host memory by default (cpu_offload=True), which is why the node states host
@@ -4321,7 +4321,8 @@ def v41_expected_traffic(t: dict, role: str, ratio: int) -> float | None:
         "dspark_context_kv_rope_insert": D * act + rec,
         "dspark_main_norm": None, "dspark_final_norm": None, "final_norm": None,
         "index_logits_topk": None, "candidate_select": None, "candidate_mask": None,
-        "prefill_dequant_gather": None,
+        "candidate_block_scores": None, "prefill_dequant_gather": None,
+        "index_prefill_k_gather": None,
     }
     if role == "compressor_pool_norm":
         row = (2 * D if ratio > 1 else D) * fp32
@@ -4343,6 +4344,19 @@ def v41_expected_context(t: dict, role: str, ratio: int) -> dict | None:
         "index_logits_topk": {"bytes_per_entry": 2 * fp32, **scan, "per": "query_token"},
         # block scores read from the logits row (candidate_blocks.py:20-58, 392-445)
         "candidate_select": {"bytes_per_entry": fp32, **scan, "per": "query_token"},
+        # an FP32 score per candidate block, written and read by top-k, across the
+        # row's whole width: max_model_len in decode (candidate_blocks.py:400-445)
+        "candidate_block_scores": {"bytes_per_entry": 2 * fp32,
+                                   "tokens_per_entry": max(ratio, 1)
+                                   * t["candidate_block_size"],
+                                   "per": "query_token",
+                                   "decode_extent": "max_model_len"},
+        # prefill writes each key it reads into a workspace (sparse_attn_indexer.py:
+        # 515-528)
+        "index_prefill_k_gather": {"reads_cache": "index",
+                                   "bytes_per_entry": t["index_head_dim"]
+                                   + t["index_head_dim"] // 128 * 4,
+                                   "per": "request", "phase": "prefill"},
         # -inf stores across the whole row, max_model_len wide in decode
         # (candidate_blocks.py:114-145, 448-480)
         "candidate_mask": {"bytes_per_entry": fp32, **scan, "per": "query_token",
@@ -4464,9 +4478,9 @@ def v41_required_launches(t: dict, where: str, i: int) -> list[str]:
         work += ["compressor_pool_norm", "compressor_rope_quant_insert"]
     if i in idx:
         work += (["index_q_rope_quant"] + (["index_k_norm_rope_store"] if i in kv else [])
-                 + ["index_logits_topk"])
+                 + ["index_logits_topk", "index_prefill_k_gather"])
         if i == cand:
-            work.append("candidate_select")
+            work += ["candidate_select", "candidate_block_scores"]
         elif cand >= 0 and i > cand:
             work.append("candidate_mask")
     if t["compress_ratios"][i]:
@@ -4962,7 +4976,7 @@ def test_deepseek_v4_turning_a_layer_to_ratio_4_adds_exactly_an_indexer():
     assert added == {"index_wq_b", "index_weights_proj",
                      "index_compressor_fused_wkv_wgate", "index_compressor_save_state",
                      "index_compressor_compress_store", "index_q_rope_quant",
-                     "block_index_scores", "index_logits_topk",
+                     "block_index_scores", "index_logits_topk", "index_prefill_k_gather",
                      "compressor_compress_store"}, added
     assert gemm_elements(lf, "compressor_fused_wkv_wgate") == 2 * gemm_elements(
         lb, "compressor_fused_wkv_wgate")
@@ -5048,6 +5062,7 @@ def v4_expected_traffic(t: dict, role: str, ratio: int) -> float | None:
         "mtp_input_add": 2 * bundle + H * act,
         "final_norm": None, "mtp_final_norm": None,
         "index_logits_topk": None, "prefill_dequant_gather": None,
+        "index_prefill_k_gather": None,
     }
     return table[role]
 
@@ -5078,6 +5093,8 @@ def test_deepseek_v4_charges_each_launch_the_traffic_its_call_site_moves():
         "index_logits_topk": {"bytes_per_entry": 8, "tokens_per_entry": 4,
                               "per": "query_token"},
         "prefill_dequant_gather": {"reads_cache": "compressed", "bytes_per_entry": 1024,
+                                   "per": "request", "phase": "prefill"},
+        "index_prefill_k_gather": {"reads_cache": "index", "bytes_per_entry": 132,
                                    "per": "request", "phase": "prefill"}}
 
 
@@ -5257,11 +5274,12 @@ def v4_required_launches(t: dict, where: str, i: int) -> list[str]:
                                                       "compressor_store"])
     if r == 4:
         work += ["index_compressor_save_state", "index_compressor_compress_store",
-                 "index_q_rope_quant", "index_logits_topk"]
+                 "index_q_rope_quant", "index_logits_topk", "index_prefill_k_gather"]
     return work + ["prefill_dequant_gather"] + tail
 
 
-V4_CONTEXT_ROLES = {"index_logits_topk", "prefill_dequant_gather"}
+V4_CONTEXT_ROLES = {"index_logits_topk", "prefill_dequant_gather",
+                    "index_prefill_k_gather"}
 
 
 def v4_launch_sites(g: dict, t: dict):
@@ -5436,6 +5454,8 @@ def test_deepseek_v41_layer_launches_hold_for_any_valid_source_vectors():
     ({"num_nextn_predict_layers": -1}, "num_nextn_predict_layers is -1"),
     ({"candidate_source_layer_id": 21}, "is not an index source"),
     ({"dspark_num_experts_per_tok": 129}, "exceeds 128 draft experts"),
+    ({"engram_num_embeddings": [384006168]}, "does not give one table per engram layer"),
+    ({"engram_num_embeddings": [384006168, 0]}, "does not give one table per engram layer"),
 ])
 def test_deepseek_v41_refuses_the_remaining_layouts_it_cannot_price(over, fragment):
     with pytest.raises(deriver().DeriveError, match=fragment):
