@@ -43,7 +43,7 @@ The label applies to a whole file. The schema has no label for a figure that is 
 
 The rule is the aim, and some current entries do not yet meet it. As of this release:
 
-- Every chip's peak rates and HBM bandwidth are vendor datasheet figures, but some memory capacities and SM counts are not. The capacities of `b300` and `gb300` are what `nvidia-smi` reports. The SM count of `b300` comes from a device-properties listing NVIDIA publishes. The SM count of `gb200-nvl72` rests on NVIDIA's die-level disclosure for B200. The SM count of `gb300` comes from a third party's record of what the device reports. No datasheet states any of these, and each chip's comments say which source applies.
+- Every chip's peak rates and HBM bandwidth are vendor datasheet figures, but some memory capacities and SM counts are not. The capacities of `b300` and `gb300` are what `nvidia-smi` reports, and `b200` and `h200` record their datasheets' GB figure as GiB. The SM count of `b300` comes from a device-properties listing NVIDIA publishes. The SM count of `gb200-nvl72` rests on NVIDIA's die-level disclosure for B200. The SM count of `gb300` comes from a third party's record of what the device reports. No datasheet states any of these, and each chip's comments say which source applies.
 - The storage tiers are representative device classes chosen by the simulator's authors. They cite no source.
 - The workloads are presets chosen by the simulator's authors. They cite no trace or dataset.
 
@@ -52,6 +52,6 @@ Each of these files says so in its own comments. A pull request that replaces on
 ## What the catalog leaves out
 
 - Achieved efficiencies and overheads, such as model FLOPs utilization (MFU), effective bandwidth and fabric overhead, are learned numbers.
-- Latency floors no vendor states, such as the fixed cost of moving a KV cache from a prefill server to a decode server, are modeling inputs. That one is an inference-sim setting today (`--pd-transfer-base-latency`, 0.05 ms). blis-registry briefly held it ([blis-registry#10](https://github.com/inference-sim/blis-registry/issues/10)), then removed it because nothing read it there.
+- Latency floors no vendor states, such as the fixed cost of moving a KV cache from a prefill server to a decode server, are modeling inputs. That one is an inference-sim setting today (`--pd-transfer-base-latency`, 0.05 ms). blis-registry briefly held it: PR #16, for [blis-registry#10](https://github.com/inference-sim/blis-registry/issues/10), added it, and commit 3c9879d removed it because nothing read it there.
 - Run choices, such as GPU count, parallelism and engine settings, are stated in the scenario file.
 - A cluster that pairs a chip with a fabric is a run choice too. The catalog defines chips and fabrics separately, and the scenario pairs them.
