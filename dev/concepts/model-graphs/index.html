@@ -1466,7 +1466,7 @@
 </tr>
 </tbody>
 </table>
-<p>The <a href="../glossary/">glossary</a> defines each attention and recurrent kind. The models in this release use 7 of the nine: <code>All2All</code>, <code>AllReduce</code>, <code>Attention</code>, <code>Elementwise</code>, <code>GEMM</code>, <code>GroupedGEMM</code>, <code>RecurrentUpdate</code>.</p>
+<p>The <a href="../glossary/">glossary</a> defines each attention and recurrent kind. The models in this release use 10 of the nine: <code>All2All</code>, <code>AllGather</code>, <code>AllReduce</code>, <code>Attention</code>, <code>Elementwise</code>, <code>GEMM</code>, <code>Gather</code>, <code>GroupedGEMM</code>, <code>RecurrentUpdate</code>, <code>ReduceScatter</code>.</p>
 <p>Primitives are grouped into <em>layer kinds</em>. A layer kind is a small acyclic graph of primitives, and a model has one for each distinct layer structure. A <em>stack</em> says how the kinds repeat. A uniform 40-layer model is one kind repeated 40 times. A hybrid that interleaves three recurrent layers with one attention layer is a four-entry pattern of two kinds, repeated. A model with no repeating structure lists its layers in full. The stack also allows an irregular run of layers before the repeating part and after it, because several models open with a few dense layers before their MoE layers begin.</p>
 <p>Qwen3-14B's single layer kind, as committed:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dense</span>

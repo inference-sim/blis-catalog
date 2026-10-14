@@ -1299,7 +1299,7 @@
 
 
 <h1 id="models">Models<a class="headerlink" href="#models" title="Permanent link">&para;</a></h1>
-<p>33 models. Each has a page with its layer stack, its dimensions, every node of its model graph, and where its config came from.</p>
+<p>34 models. Each has a page with its layer stack, its dimensions, every node of its model graph, and where its config came from.</p>
 <dl>
 <dt>Weights</dt>
 <dd>The format the parameters are stored in, followed by any format individual nodes override it with.</dd>
@@ -1349,10 +1349,18 @@
 <tr>
 <td style="text-align: left;"><a href="deepseek-v4-pro/">deepseek-v4-pro</a></td>
 <td style="text-align: right;">61</td>
-<td style="text-align: left;">fp8 (mxfp4 for some nodes)</td>
-<td style="text-align: left;">gqa + sparse_mla</td>
+<td style="text-align: left;">fp8 (bf16, fp32, mxfp4 for some nodes)</td>
+<td style="text-align: left;">sparse_mla</td>
 <td style="text-align: left;">384, top-6</td>
-<td style="text-align: left;"><code>deepseek_mtp</code>, 1 token</td>
+<td style="text-align: left;"><code>mtp</code>, 1 token</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="deepseek-v4.1-flash/">deepseek-v4.1-flash</a></td>
+<td style="text-align: right;">40</td>
+<td style="text-align: left;">fp8 (bf16, fp32, mxfp4 for some nodes)</td>
+<td style="text-align: left;">sparse_mla</td>
+<td style="text-align: left;">384, top-6</td>
+<td style="text-align: left;"><code>dspark</code>, 5 tokens</td>
 </tr>
 <tr>
 <td style="text-align: left;"><a href="glm-5/">glm-5</a></td>
