@@ -258,10 +258,12 @@ def mhc_mixing_bytes(cfg: dict[str, Any], raw: dict[str, Any], model: str,
             + comb_mix (hc_mult^2) + layer_input (hidden)
 
     The residual streams and layer_input are bf16 (the kernel asserts it); post_mix and
-    comb_mix are fp32 (likewise). Two corners deliberately not modelled, because a layer
-    kind prices the common case and neither is it: layer 0's attention side runs a
+    comb_mix are fp32 (likewise). For the family this was first written for (GLM-5.3,
+    common/model.py), two corners are deliberately not modelled, because a layer kind
+    prices the common case and neither is it: layer 0's attention side runs a
     standalone pre rather than a fused post+pre, and the final layer materializes a
-    trailing post. Each is one layer of 45.
+    trailing post, each one layer of 45. DeepSeek-V4 and V4.1 price both corners with
+    their own nodes and use this figure for the fused boundary alone.
 
     The hc_sinkhorn_iters rounds iterate over the [mix_hc] logits, which at hc_mult 4 is
     24 fp32 values against 32 KiB of residual traffic, so they are not counted."""
@@ -584,10 +586,13 @@ def attention(cfg: dict[str, Any], model: str, *, kind: str | None = None,
             node["index_topk"] = int(index_topk)
         if compress_ratio:
             node["compress_ratio"] = int(compress_ratio)
-        if kind == "sparse_mla" and not (index_topk or compress_ratio):
+        # A window alone bounds a sparse read too: DeepSeek-V4.1's ratio-0 layers run
+        # the sparse FlashMLA kernel over their window and nothing else
+        # (deepseek_v41/nvidia/flashmla.py:218-246), which blis-schemas#55 admits.
+        if kind == "sparse_mla" and not (index_topk or compress_ratio or window):
             raise DeriveError(
-                f"{model}: a sparse latent read bounded by neither a top-k selection "
-                f"nor a compressed stream describes no real layer")
+                f"{model}: a sparse latent read bounded by no top-k selection, "
+                f"compressed stream or window describes no real layer")
         return node
 
     if kind in ("mla", "sparse_mla"):
@@ -771,6 +776,10 @@ def moe_block(cfg: dict[str, Any], model: str, hidden: int) -> list[dict[str, An
 EMIT_TENSOR_PARALLEL = "tensor_parallel"
 EMIT_EXPERT_PARALLEL = "expert_parallel"
 EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE = "tensor_parallel_unless_sp_moe"
+# Decided by the model's own sequence parallelism, for the architecture
+# global.architecture names (blis-schemas#55); DeepSeek-V4.1 is the family that needs it.
+EMIT_SEQUENCE_PARALLEL = "sequence_parallel"
+EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL = "tensor_parallel_unless_sequence_parallel"
 
 
 def collective(op: str, role: str, emit: str) -> dict[str, Any]:
@@ -1666,195 +1675,1556 @@ def handler_minimax_m2(cfg, raw, model):
     return handler_moe(cfg, raw, model)
 
 
+# DeepSeek-V4's KV record, the same on SM90 and SM100: 448 FP8 NoPE dims, 64 BF16 RoPE
+# dims and eight bytes of UE8M0 scales, one per 64 NoPE dims plus a pad
+# (deepseek_v4/attention.py:876-878; compressor.py:299-301). vLLM forces the cache
+# dtype to fp8_ds_mla (attention.py:106-122), whose pages pad to FlashMLA's 576 B stride
+# (attention.py:873; v1/attention/backends/mla/sparse_swa.py:84).
+DSV4_KV_RECORD_BYTES = 584
+DSV4_PAGE_ALIGNMENT = 576
+# The compressed and indexer caches take 256-token pages: FlashMLA and the V4 indexer
+# accept exactly that (sparse_mla.py:60-61; v1/attention/backends/mla/indexer.py:
+# 260-262), and the engine sizes its block from the backends' common size
+# (platforms/interface.py:616-697), so a page holds 64 entries at ratio 4 and 2 at 128.
+DSV4_SPARSE_BLOCK_TOKENS = 256
+
+
 def handler_deepseek_v4(cfg, raw, model):
-    """DeepSeek-V4: compressed sparse attention at two ratios, a top-k indexer, and a
-    routed expert layer.
+    """DeepSeek-V4: compressed sparse MLA at two ratios, each compressed layer with its
+    own compressor and caches, an indexer on the ratio-4 layers, mHC on every
+    sublayer, hash routing on the first num_hash_layers layers, and one MTP draft layer.
 
-    Three facts decide the representation, all read from vLLM's own implementation in
-    `vllm/models/deepseek_v4/` rather than inferred from field names.
+    Priced as vLLM v0.31.0 serves it on CUDA with default backends (FlashMLA, no
+    mega-MoE). The attention class, the 584 B record and every resident width are the
+    same on SM90 and SM100 (nvidia/model.py:1146-1177; attention.py:856-879), so the
+    graph has no architecture overlay. One launch's figure differs: on SM100 the
+    inverse-RoPE quant packs its scales as E8M0 rather than SM90's FP32 per 128
+    (nvidia/ops/o_proj.py:19-32), under 1% of that launch. The kernels that do differ -- Marlin W4A16 experts on SM90,
+    FlashInfer or DeepGEMM MXFP4 on SM100 (fused_moe/oracle/mxfp4.py:367-403) -- are
+    the cost model's to price.
 
-    `head_dim` is INCLUSIVE of the RoPE width. compressor.py derives
-    `nope_head_dim = head_dim - rope_head_dim`, so the 512 this config states already
-    contains qk_rope_head_dim 64; treating them as additive would overstate the cache
-    by an eighth. There is no kv_lora_rank here, which is why the MLA branch of
-    `attention()` cannot price this family -- it reconstructs the per-token width as
-    lora + rope, and this config states the total directly.
+    Every layer, per vLLM's own reading of compress_ratios (attention.py:229-235):
 
-    The per-layer `compress_ratios` vector selects between two bounds on ONE kernel.
-    Both are kernel_source FLASHMLA_SPARSE_DSV4 in the measured tables, differing only
-    in compress_ratio, and sparse_mla.py sizes the read as
-    `next_power_of_2(max_seq_len / compress_ratio)` floored at a 128-token alignment.
-    So ratio 128 reads a stream that never exceeds that floor -- measured flat, 126.0
-    to 124.6 us across a 16x context increase -- while ratio 4 grows as ctx/4 and
-    measures 1.18x over the same range.
+      * every layer keeps its own 128-token sliding window of 584 B records in
+        64-token pages (attention.py:345-352; sparse_swa.py:82-84);
+      * ratio 4 (C4A): an overlapping compressor (2 x 512 wide, compressor.py:239-240)
+        owns a compressed stream of one record per 4 tokens, and an
+        indexer scores its own FP8 key stream -- one 132 B record per 4 tokens -- to
+        select at most index_topk of them (attention.py:298-299, 1005-1031). The main
+        read is the window plus that top-k (nvidia/flashmla.py:193-203);
+      * ratio 128 (C128A): a compressor, no indexer, and a main read of the window plus
+        EVERY compressed entry, (pos + 1) // 128 of them, which grows with context
+        (sparse_mla.py:403-437);
+      * the MTP layer, at id num_hidden_layers, takes ratio 1: its window alone, with
+        no compressor, indexer or compressed cache (attention.py:232-235, 857-860).
 
-    The indexer is a separate node because it is the ONLY context-proportional term,
-    measuring 3.53x over a 12x context increase where the attention it feeds moves
-    1.18x. Folding it in would charge a context scan at a bounded rate.
+    No cache is shared between layers: each compressed layer builds its own
+    compressor, state cache and compressed cache under its own prefix
+    (attention.py:356-374; compressor.py:153-154).
+
+    What the graph cannot carry, recorded so a reader does not have to rediscover it:
+      * FlashMLA pads each rank's heads to 64, or 128 above 64 (nvidia/flashmla.py:
+        77-85): 16 heads per rank at TP 8 run as 64. The main read states no tp and
+        the consumer applies it (inference-sim/blis-latency-kernel#39). The Q RoPE +
+        insert reads each rank's heads and writes the padded set, and every rank reads
+        the whole KV row and writes the whole record. It is stated sharded, which is
+        exact at TP 1, exact for the Q half at TP 2, and nearer than replicated above;
+      * the indexer's short-context bypass: on a step that is not captured in a CUDA
+        graph, while every request in the batch has at most index_topk compressed
+        entries, vLLM skips the indexer's wq_b, its query quantization and the scoring
+        and selects every entry (attention.py:1085-1107). Captured decode always runs
+        the full path, which is what the graph prices;
+      * the compressor state caches are sliding windows of coff x ratio tokens, which
+        the schema's window kind cannot state on a node whose own window differs, so
+        each is stated as the fixed rows a decoding request holds. That count is this
+        deriver's reading, not a number vLLM states: vLLM bounds a sliding-window
+        spec at cdiv(window - 1 + tokens in flight, block) + 1 pages
+        (v1/kv_cache_interface.py:840-866) and reserves for its engine-wide
+        max_in_flight_tokens (config/vllm.py:604-613), while a decoding request's own
+        in-flight tokens are 1 + num_spec_tokens a step, twice that under async
+        scheduling -- 2 or 4 at MTP's one draft token, which give the same pages for
+        these windows. Their pages' 576 B padding, and the larger hold during chunked
+        prefill, are not carried (inference-sim/blis-schemas#59);
+      * h_proj runs on all hc_mult streams of the MTP input, hc_mult rows per token
+        (nvidia/mtp.py:185-187); a GEMM node states one (inference-sim/blis-schemas#58);
+      * the shared expert's TP padding: without sequence parallelism its intermediate
+        rounds up to whole 128-blocks per rank (nvidia/model.py:150-158), which is no
+        padding at TP 8 (24 blocks) but 4,096 for 3,072 at TP 16. It depends on the TP
+        width, so the consumer applies it;
+      * the resident block scales of the FP8 linears: FP32 per 128 x 128 block on the
+        DeepGEMM path (quantization/utils/fp8_utils.py:1085-1108), at most 0.025% of
+        their bytes, and unverified on the FlashInfer path, so weight_scale is not
+        stated;
+      * resident tensors no GEMM or Gather prices: layer 0 keeps its (24, 28672)
+        hc_attn_fn beside the summed broadcast matrix it multiplies by
+        (nvidia/model.py:1229-1236, 1333-1348, 1821-1834), 2.75 MB, and the norms,
+        biases, attention sinks, compressor ape tables and mHC scales, about 11 MB --
+        some 0.002% of the weights together;
+      * that the MTP layer's first pass each step runs over every token the target
+        scheduled, not one row per request (v1/worker/gpu/spec_decode/autoregressive/
+        speculator.py:311-327, 453-493): an autoregressive stack states only that it
+        runs once per drafted token (inference-sim/blis-schemas#60);
+      * wo_a's input read: the grouped einsum reads all o_groups x 4,096 FP8 values a
+        token (nvidia/ops/o_proj.py:89-95), where one GEMM node of k 4,096 states one
+        group's; the FLOPs and weight bytes are exact;
+      * work the target runs only with MTP enabled: the copy of the whole hc stream
+        into the drafter's buffer (nvidia/model.py:1637-1639)
+        (inference-sim/blis-schemas#51);
+      * prefill's gather of each request's window records into the BF16 workspace,
+        about 1.6 KB per prefill token (nvidia/flashmla.py:340-349), and launches
+        below any node's resolution: the decode top-k translation, the hash-route
+        index cast and the compressor's RoPE table reads.
     """
-    hidden = int(require(cfg, "hidden_size", model))
-    layers = int(require(cfg, "num_layers", model))
+    def whole(value, what):
+        if type(value) is not int:
+            raise DeriveError(f"{model}: {what} is {value!r}, not a whole number")
+        return value
 
-    ratios = cfg.get("compress_ratios")
-    if not ratios:
+    def positive(key, *, concept=False, least=1):
+        value = whole(require(cfg, key, model) if concept else require_key(cfg, key, model),
+                      key)
+        if value < least:
+            raise DeriveError(f"{model}: {key} is {value}; this architecture needs at "
+                              f"least {least}")
+        return value
+
+    hidden = positive("hidden_size", concept=True)
+    layers = positive("num_layers", concept=True)
+    base = base_dtype(cfg, raw, model)
+    if base != "bf16":
+        # The unquantized tensors are BF16 in this checkpoint, and the mHC kernels
+        # assert BF16 residual streams (kernels/mhc/tilelang.py:855).
+        raise DeriveError(f"{model}: V4's unquantized tensors and mHC residual are "
+                          f"BF16; this config declares {base}")
+    act = DTYPE_WIDTHS[base]
+    fp32 = DTYPE_WIDTHS["fp32"]
+
+    ratios = [whole(r, "a compress_ratios entry")
+              for r in require_key(cfg, "compress_ratios", model)]
+    spec_layers = whole(require(cfg, "num_spec_tokens", model), "num_nextn_predict_layers")
+    if spec_layers not in (0, 1):
+        # One MTP module, reused for every draft token, spec_step_idx % num_mtp_layers
+        # (nvidia/mtp.py:267, 281; config/speculative.py:1487-1495).
+        raise DeriveError(f"{model}: num_nextn_predict_layers is {spec_layers}; V4's "
+                          f"MTP builds one draft layer")
+    if len(ratios) not in (layers, layers + spec_layers):
         raise DeriveError(
-            f"{model}: no compress_ratios vector. This family's attention read is "
-            f"bounded by a per-layer compression ratio, and pricing every layer alike "
-            f"would misprice whichever kind it did not pick"
-        )
-    # The vector carries a trailing entry for the MTP module, which is not one of the
-    # transformer layers num_hidden_layers counts. vLLM indexes it by layer and takes
-    # compress_ratio 1 for any index at or beyond num_hidden_layers, NOT the trailing
-    # entry's value -- which this config states as 0, a ratio that cannot be read as a
-    # divisor at all (attention.py:229-235 at the pinned commit, `else:
-    # self.compress_ratio = 1`). So the draft module is an UNCOMPRESSED latent layer,
-    # and the entry is dropped rather than consulted.
-    draft_ratio = None
-    if len(ratios) == layers + 1:
-        ratios = ratios[:layers]
-        draft_ratio = 1
-    elif len(ratios) != layers:
-        raise DeriveError(
-            f"{model}: compress_ratios has {len(ratios)} entries for {layers} layers; "
-            f"expected {layers}, or {layers + 1} with a trailing draft entry"
-        )
+            f"{model}: compress_ratios has {len(ratios)} entries for {layers} layers and "
+            f"{spec_layers} draft layers")
+    # The draft layer's entry is never read: any layer id at or past num_hidden_layers
+    # takes ratio 1 (attention.py:232-235).
+    ratios = ratios[:layers]
     unknown = sorted(set(ratios) - {4, 128})
     if unknown:
+        # A ratio of 0 or 1 would be a window-only layer, which vLLM builds as max(1, r)
+        # with no compressor; the published config has none, so one is a different
+        # layout rather than a value to price.
         raise DeriveError(
-            f"{model}: compress_ratios names {unknown}, which this handler cannot "
-            f"price. vLLM's compressor asserts compress_ratio in [4, 128] "
-            f"(models/deepseek_v4/compressor.py); a third ratio needs its own bound "
-            f"rather than the nearer of these two"
-        )
+            f"{model}: compress_ratios names {unknown}; V4's compressor accepts 4 and "
+            f"128 (compressor.py:158)")
+    hash_layers = whole(require_key(cfg, "num_hash_layers", model), "num_hash_layers")
+    if not 0 <= hash_layers <= layers:
+        raise DeriveError(f"{model}: num_hash_layers {hash_layers} is outside "
+                          f"[0, {layers}]")
 
-    topk = int(require_key(cfg, "index_topk", model))
-    index_heads = int(require_key(cfg, "index_n_heads", model))
-    index_dim = int(require_key(cfg, "index_head_dim", model))
-    rope = int(require(cfg, "qk_rope_head_dim", model))
-    total_dim = int(require(cfg, "head_dim", model))
-    if total_dim <= rope:
-        raise DeriveError(
-            f"{model}: head_dim {total_dim} does not exceed qk_rope_head_dim {rope}, "
-            f"so it cannot be the inclusive width vLLM's compressor splits"
-        )
-
-    indexer = {
-        "op": "Attention",
-        "role": "block_index_scores",
-        "kind": "gqa",
-        "n_q": index_heads,
-        "n_kv": 1,
-        "d_h": index_dim,
-    }
-
-    swa_window = int(require(cfg, "sliding_window", model))
-
-    # The projection path is LOW-RANK on both sides, and an RMSNorm sits between the
-    # two input stages, so neither side can be folded into one hidden-width rectangle.
-    # Shapes from the pinned DeepseekV4Attention (attention.py:248-284):
-    #
-    #   fused_wqa_wkv : hidden -> q_lora_rank + head_dim   (fused q-LoRA down + KV)
-    #   q_norm        : over q_lora_rank
-    #   wq_b          : q_lora_rank -> n_heads * head_dim
-    #   wo_a          : grouped, (n_heads*head_dim)/o_groups -> o_groups*o_lora_rank
-    #   wo_b          : o_groups*o_lora_rank -> hidden
-    #
-    # Pricing these as one dense QKV and one dense output rectangle overstated the input
-    # side 4.1x (473,432,064 against 115,343,360) and the output side 2.5x (469,762,048
-    # against 184,549,376), which over 61 layers is tens of billions of parameters in
-    # both weight bytes and FLOPs.
-    q_lora = int(require_key(cfg, "q_lora_rank", model))
-    o_lora = int(require_key(cfg, "o_lora_rank", model))
-    o_groups = int(require_key(cfg, "o_groups", model))
-    q_heads = int(require(cfg, "num_q_heads", model))
+    q_heads = positive("num_q_heads", concept=True)
+    total_dim = positive("head_dim", concept=True)
+    rope = positive("qk_rope_head_dim", concept=True)
+    q_lora = positive("q_lora_rank")
+    o_lora = positive("o_lora_rank")
+    o_groups = positive("o_groups")
+    window = positive("sliding_window", concept=True)
+    topk = positive("index_topk")
+    index_heads = positive("index_n_heads")
+    index_dim = positive("index_head_dim")
+    hc_mult = positive("hc_mult")
     if (q_heads * total_dim) % o_groups:
         raise DeriveError(
-            f"{model}: o_groups {o_groups} does not divide the {q_heads * total_dim}-wide "
-            f"head concatenation, so the grouped output projection has no shape")
+            f"{model}: o_groups {o_groups} does not divide {q_heads * total_dim}")
+    if total_dim != 512 or rope != 64:
+        # The 584 B record is laid out for exactly this (compressor.py:299-301).
+        raise DeriveError(
+            f"{model}: V4's KV record assumes head_dim 512 with rope 64; this config "
+            f"states {total_dim} and {rope}")
+    if index_dim != 128:
+        # The indexer's compressor quantizes in one 128-block with one FP32 scale
+        # (compressor.py:308-310).
+        raise DeriveError(f"{model}: index_head_dim {index_dim}; V4's indexer cache "
+                          f"is laid out for 128")
 
-    def projection_nodes():
+    record = DSV4_KV_RECORD_BYTES
+    index_record = index_dim + index_dim // 128 * fp32      # attention.py:1010-1014
+    bundle = hc_mult * hidden * act
+    mixes = hc_mult * fp32 + hc_mult * hc_mult * fp32
+    mix_hc = (2 + hc_mult) * hc_mult
+
+    def fp32_gemm(role, n, k):
+        node = gemm(role, n, k)
+        node["weight_dtype"] = "fp32"
+        return node
+
+    def base_gemm(role, n, k):
+        node = gemm(role, n, k)
+        node["weight_dtype"] = base
+        return node
+
+    def with_tp(node, layout):
+        node["tp"] = layout
+        return node
+
+    def token_sharded(*nodes):
+        # Work on the residual stream. Under V4's own sequence parallelism that stream
+        # is sharded by token before the first layer (sp_shard, nvidia/model.py:
+        # 1571-1578), and only attention runs on the gathered rows, between its
+        # all-gather and its reduce-scatter (:1385-1390).
+        for node in nodes:
+            node["under_sequence_parallel"] = "token_sharded"
+        return list(nodes)
+
+    def traffic(role, bytes_per_token, *, tp=None):
+        if bytes_per_token != int(bytes_per_token):
+            raise DeriveError(f"{model}: {role} moves {bytes_per_token} B/token, which "
+                              f"is not a whole number of bytes")
+        node = norm(role)
+        node["bytes_per_token"] = int(bytes_per_token)
+        if tp:
+            node["tp"] = tp
+        return node
+
+    def per_entry(role, bytes_per_run, ratio, cache=None):
+        # A launch that does its work once per compressed entry, on the token that
+        # closes a group of `ratio` (compressor.py:413-420; fused_compress_quant_cache.py:
+        # 201-202). With `cache` it writes one entry of it, whose record the consumer
+        # adds from the cache.
+        node = traffic(role, bytes_per_run, tp="replicated")
+        if cache:
+            node["writes_cache"] = cache
+        node["per_tokens"] = ratio
+        return node
+
+    def context_work(role, *, per, bytes_per_entry, reads_cache=None, tokens_per_entry=1,
+                     phase=None):
+        node = with_tp(norm(role), "replicated")
+        work: dict[str, Any] = {}
+        if reads_cache:
+            work["reads_cache"] = reads_cache
+        work["bytes_per_entry"] = int(bytes_per_entry)
+        if tokens_per_entry > 1 and not reads_cache:
+            work["tokens_per_entry"] = tokens_per_entry
+        work["per"] = per
+        if phase:
+            work["phase"] = phase
+        node["context"] = work
+        return node
+
+    # mHC: FP32 parameters (nvidia/model.py:1227-1271; checkpoint F32 [24, 28672]) and the
+    # TileLang kernels, with the sublayer's RMSNorm fused into the pre's epilogue through
+    # norm_weight (:1346, 1362, 1381, 1409), so no attn_norm / ffn_norm node exists.
+    # Traffic is counted from the tensors each wrapper reads and writes
+    # (kernels/mhc/tilelang.py): the residual streams and layer input BF16, the mixes
+    # FP32. The projection onto hc_*_fn is its own GEMM node, which reads the bundle.
+    mhc_post_bytes = hidden * act + bundle + mixes + bundle     # tilelang.py:791-811
+    mhc_pre_bytes = bundle + mixes + hidden * act               # tilelang.py:542-652
+    fused_mhc = mhc_mixing_bytes(cfg, raw, model, hidden, hc_mult)
+    if fused_mhc != mhc_post_bytes + mhc_pre_bytes:
+        raise DeriveError(f"{model}: mHC post + pre disagree with the fused figure")
+
+    def mhc_boundary(side):
+        # A post fused with the next pre (tilelang.py:814-982).
+        return token_sharded(
+            traffic(f"mhc_{side}_post_pre", fused_mhc, tp="replicated"),
+            with_tp(fp32_gemm(f"hc_{side}_fn", mix_hc, hc_mult * hidden), "replicated"))
+
+    def broadcast_mhc():
+        # Layer 0 on the first PP rank: the (T, hidden) embedding is read, and the
+        # bundle, the mixes and the layer input written (tilelang.py:698-789), with the
+        # projection over hc_attn_fn summed across its copies, (mix_hc, hidden) FP32
+        # (nvidia/model.py:1821-1834).
+        return token_sharded(
+            traffic("mhc_attn_broadcast_pre", hidden * act + bundle + mixes + hidden * act,
+                    tp="replicated"),
+            with_tp(fp32_gemm("hc_attn_fn_broadcast", mix_hc, hidden), "replicated"))
+
+    def mhc_head(prefix):
+        # hc_head_fused_kernel_tilelang (tilelang.py:1041-1071), the TileLang kernel
+        # hc_head_fuse_tilelang (tilelang_kernels.py:1021-1114): pass 1 projects
+        # the bundle onto hc_head_fn (mixes kept in registers), pass 2 reads the bundle
+        # again for the gated sum and writes one hidden row. The final RMSNorm is a
+        # separate launch (nvidia/model.py:1641-1649).
+        return [with_tp(fp32_gemm(f"{prefix}hc_head_fn", hc_mult, hc_mult * hidden),
+                        "replicated"),
+                traffic(f"{prefix}hc_head_mix", bundle + hidden * act, tp="replicated")]
+
+    def projections_in():
         return [
-            gemm("fused_wqa_wkv", q_lora + total_dim, hidden),
-            norm("q_norm"),
-            gemm("wq_b", q_heads * total_dim, q_lora),
-        ], [
-            # wo_a is a batched matmul over o_groups groups; N and K are the per-call
-            # shape the consumer prices, and the group count rides in the role.
-            gemm("wo_a", o_groups * o_lora, q_heads * total_dim // o_groups),
-            gemm("wo_b", hidden, o_groups * o_lora),
+            # Under V4's sequence parallelism the attention input is all-gathered from
+            # the token shards (nvidia/model.py:1385-1386).
+            collective("AllGather", "attn_in", EMIT_SEQUENCE_PARALLEL),
+            # wq_a and wkv merged into one replicated FP8 GEMM (attention.py:248-255;
+            # checkpoint F8 [1536, 7168] and [512, 7168]), then one launch norms both
+            # latents (attention.py:528-535).
+            with_tp(gemm("fused_wqa_wkv", q_lora + total_dim, hidden), "replicated"),
+            traffic("qkv_a_layernorm", 2 * (q_lora + total_dim) * act, tp="replicated"),
+            with_tp(gemm("wq_b", q_heads * total_dim, q_lora), "column"),
+            # One launch: per-head RMSNorm and GPT-J RoPE over Q into the padded head
+            # set, and RoPE, UE8M0 FP8 quantization and insertion of the token's KV
+            # into the layer's window cache (attention.py:793-810).
+            {**traffic("q_rope_kv_insert",
+                       2 * q_heads * total_dim * act + total_dim * act, tp="sharded"),
+             "writes_cache": "swa"},
         ]
 
-    def layer_for(ratio):
-        # The read set is the UNION of the retained sliding window and the compressed
-        # positions, not a choice between them: every layer keeps its SWA window
-        # (attention.py:221, `self.window_size = config.sliding_window`, with no
-        # compress_ratio guard) and combine_topk_swa_indices merges the two position
-        # sets. So a layer states its window AND its compressed bound.
-        #
-        # The two bounds differ in kind. A ratio-4 layer SELECTS up to index_topk
-        # compressed positions through its indexer, so the compressed term is
-        # min(index_topk, context/4). A ratio-128 layer selects nothing: it reads a
-        # positional run of context/128 (sparse_mla.py, num_compressed =
-        # (position + 1) // compress_ratio), which no fixed token count expresses,
-        # hence compress_ratio in the graph.
-        selects_topk = ratio == 4
-        attn = attention(
-            cfg, model,
-            kind="sparse_mla" if ratio > 1 else "mla",
-            latent_width=total_dim,
-            window=swa_window,
-            compress_ratio=ratio if ratio > 1 else None,
-            index_topk=topk if selects_topk else None,
-        )
-        inp, out = projection_nodes()
-        nodes = [norm("input_norm"), *inp]
-        if ratio > 1:
-            # The compressor runs whenever compress_ratio > 1 -- a broader condition
-            # than the indexer's -- and its fused KV-and-gate projection is work of its
-            # own, applied to the hidden states (attention.py, fused_wkv_wgate).
-            nodes.append(gemm("compressor_fused_wkv_wgate", total_dim + 1, hidden))
-        if selects_topk:
-            # The indexer exists ONLY on ratio-4 layers: vLLM builds one under
-            # `if self.compress_ratio == 4`, noting "Only C4A uses sparse attention and
-            # hence has indexer" (attention.py:297-317). A ratio-128 layer has a
-            # compressor but no indexer, and pricing one there charges a
-            # context-proportional scan the layer never runs.
-            #
-            # Its wq_b reads the q-LoRA rank, not the hidden size, and it carries its
-            # own compressor and a per-head weights projection.
-            nodes += [
-                gemm("index_wq_proj", index_heads * index_dim, q_lora),
-                gemm("index_weights_proj", index_heads, hidden),
-                gemm("index_compressor_fused_wkv_wgate", index_dim + 1, hidden),
-                dict(indexer),
-            ]
-        nodes += [
-            attn,
-            *out,
-            collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
+    def projections_out():
+        return [
+            # Inverse RoPE and FP8 quantization of the attention output in groups of
+            # 128, with an FP32 scale per group on SM90 (common/ops/
+            # fused_inv_rope_fp8_quant.py:352-470; nvidia/ops/o_proj.py:19-32, 61-76).
+            traffic("o_inv_rope_quant",
+                    q_heads * total_dim * act + q_heads * total_dim
+                    + q_heads * total_dim // 128 * fp32, tp="sharded"),
+            # wo_a stays FP8: a grouped DeepGEMM fp8_einsum over o_groups
+            # (nvidia/ops/o_proj.py:61-95; attention.py:267-276, is_bmm), unlike
+            # V4.1's MXFP8 wo_a, which SM90 dequantizes.
+            with_tp(gemm("wo_a", o_groups * o_lora, q_heads * total_dim // o_groups),
+                    "column"),
+            with_tp(gemm("wo_b", hidden, o_groups * o_lora), "row"),
+            # wo_b reduces unless V4's sequence parallelism is on, which turns the
+            # reduction into a reduce-scatter (nvidia/model.py:1212-1213, 1389-1390).
+            collective("AllReduce", "attn_out",
+                       EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL),
+            collective("ReduceScatter", "attn_out", EMIT_SEQUENCE_PARALLEL),
         ]
-        nodes += [
-            norm("post_attn_norm"),
-            *moe_block(cfg, model, hidden),
-            collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
-            collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE),
+
+    def state_rows(state_window, block):
+        # The rows a decoding request holds of a sliding-window state: cdiv(window - 1
+        # + tokens in flight, block) + 1 pages (v1/kv_cache_interface.py:840-866), with
+        # 1 + num_spec_tokens tokens in flight.
+        in_flight = 1 + spec_layers
+        return (-(-(state_window - 1 + in_flight) // block) + 1) * block
+
+    def compressor(ratio):
+        # DeepseekCompressor (compressor.py:200-499): overlapping at ratio 4, coff 2.
+        coff = 2 if ratio == 4 else 1
+        width = coff * total_dim
+        row = 2 * width * fp32                  # kv and score state, FP32
+        state = {"name": "compressor_state", "kind": "state", "owned": True,
+                 "bytes_per_entry": row,
+                 # sliding window coff x ratio, blocks of 4 at ratio 4 and 8 at 128
+                 # (compressor.py:157-173)
+                 "entries": state_rows(coff * ratio, 4 if ratio == 4 else 8)}
+        # Each closing token gathers coff x ratio state rows, kv and score at head_dim
+        # each -- read from the Triton reference (fused_compress_quant_cache.py:
+        # 205-247); CUDA runs the CuTeDSL kernels, which pool the same rows -- softmax-
+        # pools them, and on CUDA
+        # norms, ropes, quantizes and stores one record in one CuTeDSL launch at ratio 4
+        # and two at ratio 128, through a head_dim FP32 latent
+        # (nvidia/ops/sparse_attn_compress_cutedsl.py:2398-2485, 1425-1450).
+        gathered = coff * ratio * 2 * total_dim * fp32
+        nodes = [
+            # fused wkv + wgate, BF16 and replicated (compressor.py:271-279; checkpoint
+            # BF16 [coff x 512, 7168] each), with an FP32 output (attention.py:694-701)
+            with_tp(base_gemm("compressor_fused_wkv_wgate", 2 * width, hidden),
+                    "replicated"),
+            # reads the FP32 kv and score and the ape row, writes one state row
+            # (compressor.py:399-410)
+            {**traffic("compressor_save_state", row + width * fp32, tp="replicated"),
+             "writes_cache": "compressor_state"},
+        ]
+        if ratio == 4:
+            nodes.append(per_entry("compressor_compress_store", gathered, ratio,
+                                   cache="compressed"))
+        else:
+            nodes += [per_entry("compressor_compress", gathered + total_dim * fp32, ratio),
+                      per_entry("compressor_store", total_dim * fp32, ratio,
+                                cache="compressed")]
+        return nodes, state
+
+    def indexer():
+        # The C4A indexer (attention.py:974-1130): its own overlapping compressor at
+        # index_head_dim, writing 132 B FP8 keys, a replicated FP8 wq_b from the q
+        # latent, a BF16 weights projection, and FP8 MQA logits over every key
+        # (sparse_attn_indexer.py:726-736).
+        width = 2 * index_dim
+        row = 2 * width * fp32
+        state = {"name": "index_compressor_state", "kind": "state", "owned": True,
+                 "bytes_per_entry": row, "entries": state_rows(2 * 4, 4)}
+        nodes = [
+            with_tp(gemm("index_wq_b", index_heads * index_dim, q_lora), "replicated"),
+            with_tp(base_gemm("index_weights_proj", index_heads, hidden), "replicated"),
+            with_tp(base_gemm("index_compressor_fused_wkv_wgate", 2 * width, hidden),
+                    "replicated"),
+            {**traffic("index_compressor_save_state", row + width * fp32,
+                       tp="replicated"),
+             "writes_cache": "index_compressor_state"},
+            per_entry("index_compressor_compress_store",
+                      2 * 4 * 2 * index_dim * fp32, 4, cache="index"),
+            # BF16 q and weights in; FP8 q and FP32 weights out, the q scale folded into
+            # the weights (common/ops/fused_indexer_q.py:547-680)
+            traffic("index_q_rope_quant",
+                    index_heads * index_dim * act + index_heads * act
+                    + index_heads * index_dim + index_heads * fp32, tp="replicated"),
+            {"op": "Attention", "role": "block_index_scores", "kind": "sparse_mla",
+             "n_q": index_heads, "n_kv": 1, "d_h": index_dim, "compress_ratio": 4,
+             "tp": "replicated",
+             "caches": [{"name": "index", "kind": "index", "owned": True,
+                         "bytes_per_entry": index_record, "tokens_per_entry": 4,
+                         "block_size": DSV4_SPARSE_BLOCK_TOKENS,
+                         "page_alignment": DSV4_PAGE_ALIGNMENT}, state]},
+            # The logits land as an FP32 row per query token over the scanned entries,
+            # read back by the top-k (sparse_attn_indexer.py:583-626, 726-785).
+            context_work("index_logits_topk", per="query_token", bytes_per_entry=2 * fp32,
+                         tokens_per_entry=4),
+            # Each prefill chunk gathers the request's whole key stream into a
+            # workspace, one 132 B key written per entry read
+            # (sparse_attn_indexer.py:515-528).
+            context_work("index_prefill_k_gather", per="request",
+                         bytes_per_entry=index_record, reads_cache="index",
+                         phase="prefill"),
         ]
         return nodes
 
-    kinds = []
-    for ratio in sorted(set(ratios)):
-        nodes = layer_for(ratio)
-        kinds.append({"id": f"csa{ratio}_moe", "nodes": nodes, "edges": chain(nodes)})
-    # The draft module is its own layer kind rather than a reuse of a target layer's:
-    # at ratio 1 it is uncompressed, so it reads the full context within its window and
-    # carries no indexer. Without it the speculator's generic fallback mirrors
-    # kinds[-1] -- csa128_moe -- pricing the tightest-bounded read in the model for the
-    # one layer that has no bound at all.
-    if draft_ratio is not None:
-        nodes = layer_for(draft_ratio)
-        kinds.append({"id": "mtp_moe", "nodes": nodes, "edges": chain(nodes)})
-    sequence = [f"csa{r}_moe" for r in ratios]
-    return kinds, compress(sequence)
+    def main_attention(ratio, extra_caches):
+        node = attention(
+            cfg, model,
+            kind="sparse_mla",
+            latent_width=total_dim,
+            window=window,
+            compress_ratio=ratio if ratio > 1 else None,
+            index_topk=topk if ratio == 4 else None,
+        )
+        node["caches"] = [{"name": "swa", "kind": "window", "owned": True,
+                           "bytes_per_entry": record, "window": window,
+                           "block_size": 64, "page_alignment": DSV4_PAGE_ALIGNMENT}]
+        if ratio > 1:
+            node["caches"].append({"name": "compressed", "kind": "kv", "owned": True,
+                                   "bytes_per_entry": record, "tokens_per_entry": ratio,
+                                   "block_size": DSV4_SPARSE_BLOCK_TOKENS,
+                                   "page_alignment": DSV4_PAGE_ALIGNMENT})
+        node["caches"] += extra_caches
+        return node
+
+    experts = positive("num_experts", concept=True)
+    top_k = positive("top_k", concept=True)
+    if top_k > experts:
+        raise DeriveError(f"{model}: top_k {top_k} exceeds {experts} experts")
+    shared = positive("num_shared_experts", concept=True)
+    expert_width = EXPERT_DTYPES.get(str(cfg.get("expert_dtype")))
+    if expert_width is None:
+        raise DeriveError(f"{model}: expert_dtype {cfg.get('expert_dtype')!r} is not one "
+                          f"this deriver maps")
+    vocab = positive("vocab_size", concept=True)
+
+    def ffn(hashed):
+        nodes = [
+            *mhc_boundary("ffn"),
+            # The gate GEMM runs on every layer, hash layers included: the hash table
+            # replaces only the expert choice, and the weights still come from the
+            # logits (fused_moe/runner/moe_runner.py:903-910; fused_topk_bias_router.py:
+            # 87-100). GateLinear is unquantized with FP32 logits (nvidia/model.py:
+            # 850-856; checkpoint BF16 [384, 7168]).
+            *token_sharded(with_tp(base_gemm("router", experts, hidden), "replicated")),
+        ]
+        if hashed:
+            # tid2eid[input_ids]: top_k INT32 expert ids per token on the default path
+            # (nvidia/model.py:866-880; the checkpoint stores I64 [129280, 6]).
+            nodes += token_sharded({"op": "Gather", "role": "hash_route", "rows": vocab,
+                                    "row_bytes": top_k * 4, "rows_per_token": 1,
+                                    "out_bytes_per_token": top_k * 4})
+        nodes += [
+            # Mxfp4MoEMethod (deepseek_v4/quant_config.py:181-191; checkpoint packed FP4
+            # with an E8M0 scale per 32)
+            *token_sharded({"op": "GroupedGEMM", "role": "experts",
+                            "n": positive("moe_ffn_size", concept=True), "k": hidden,
+                            "experts": experts, "top_k": top_k,
+                            "weight_dtype": expert_width},
+                           # The shared expert is a dense FP8 MLP, DeepseekV4MLP: a
+                           # merged gate/up column-parallel linear and a row-parallel
+                           # down, TP-split normally and whole on every rank over the
+                           # token shard under V4's sequence parallelism
+                           # (nvidia/model.py:132-175, 900-914). Expert parallelism
+                           # does not place it; its output joins the routed experts'
+                           # all-reduce (reduce_results False, :911).
+                           with_tp(gemm("shared_gate_up",
+                                        2 * positive("moe_ffn_size", concept=True) * shared,
+                                        hidden), "column"),
+                           with_tp(gemm("shared_down", hidden,
+                                        positive("moe_ffn_size", concept=True) * shared),
+                                   "row")),
+            collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+            # FusedMoE all-reduces shared + routed once unless sequence parallelism is
+            # on (fused_moe/runner/moe_runner.py:506-512); V4 passes its own flag and
+            # never reads the engine-wide use_sequence_parallel_moe.
+            collective("AllReduce", "mlp_out",
+                       EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL),
+        ]
+        return nodes
+
+    def attention_block(ratio):
+        nodes = projections_in()
+        extra = []
+        if ratio > 1:
+            comp, state = compressor(ratio)
+            nodes += comp
+            extra.append(state)
+        if ratio == 4:
+            nodes += indexer()
+        nodes.append(main_attention(ratio, extra))
+        if ratio > 1:
+            # Prefill dequantizes the request's whole compressed stream into a BF16
+            # workspace, head_dim values per entry, once per chunk (nvidia/flashmla.py:
+            # 324-337).
+            nodes.append(context_work("prefill_dequant_gather", per="request",
+                                      bytes_per_entry=total_dim * act,
+                                      reads_cache="compressed", phase="prefill"))
+        return nodes + projections_out()
+
+    def layer_nodes(i):
+        nodes = broadcast_mhc() if i == 0 else mhc_boundary("attn")
+        nodes += attention_block(ratios[i])
+        return nodes + ffn(i < hash_layers)
+
+    def kind_id(i):
+        name = f"csa{ratios[i]}"
+        if i < hash_layers:
+            name += "_hash"
+        if i == 0:
+            name += "_first"
+        return name + "_moe"
+
+    kinds, built, sequence = [], {}, []
+    for i in range(layers):
+        kid = kind_id(i)
+        sequence.append(kid)
+        nodes = layer_nodes(i)
+        if kid in built:
+            if nodes != built[kid]:
+                raise DeriveError(f"{model}: layer {i} shares kind {kid} with an earlier "
+                                  f"layer but builds different work")
+            continue
+        built[kid] = nodes
+        kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+
+    # BF16 embedding: the FP8 config gives an embedding no quant method
+    # (quantization/fp8.py:177-208), so it is vocab-sharded and all-reduced before the
+    # stream is sharded (nvidia/model.py:1455-1462, 1558-1578).
+    embed = {"op": "Gather", "role": "embed_tokens", "rows": vocab,
+             "row_bytes": hidden * act, "rows_per_token": 1,
+             "out_bytes_per_token": hidden * act, "shard": "rows"}
+    lm_head = with_tp(base_gemm("lm_head", vocab, hidden), "column")
+    head = [
+        *token_sharded(traffic("mhc_final_post", mhc_post_bytes, tp="replicated")),
+        # V4 gathers the whole hc stream before its learned hc_head, so the mixer and
+        # the final norm run on every token on every rank (nvidia/model.py:1622-1649).
+        {**collective("AllGather", "head_in", EMIT_SEQUENCE_PARALLEL),
+         "bytes_per_token": bundle},
+        *mhc_head(""),
+        norm("final_norm"),
+        # ParallelLMHead with no quant_config (nvidia/model.py:1956-1960; checkpoint
+        # head.weight BF16).
+        lm_head,
+    ]
+
+    extras: dict[str, Any] = {
+        "global": {
+            "architecture": "DeepseekV4ForCausalLM",
+            "context_window": positive("max_position_embeddings"),
+        },
+        "embedding": [embed, collective("AllReduce", "embed_out", EMIT_TENSOR_PARALLEL)],
+        "head": head,
+    }
+
+    if spec_layers:
+        # DeepSeekV4MTP (nvidia/mtp.py:305-, built from the layer and predictor at
+        # :83-302): the target's embedding and lm_head
+        # (shared, v1/worker/gpu/spec_decode/eagle/utils.py:15-18, 38-118), separate FP8
+        # e_proj and h_proj, its own hc_head, and one DeepseekV4DecoderLayer at
+        # ratio 1 with a learned gate. Its first pass each step runs over every token
+        # the target scheduled -- two per request in pure decode at one draft token --
+        # and only its logits over one row per request
+        # (spec_decode/autoregressive/speculator.py:277-278, 311-327, 453-493).
+        draft = [
+            # mask, enorm over the embedding and hnorm over the hc streams, before the
+            # shard (nvidia/mtp.py:168-184; common/ops/fused_mtp_input_rmsnorm.py)
+            traffic("mtp_input_norm", 2 * (hidden * act + bundle), tp="replicated"),
+            *token_sharded(
+                with_tp(gemm("mtp_e_proj", hidden, hidden), "replicated"),
+                with_tp(gemm("mtp_h_proj", hidden, hidden), "replicated"),
+                # h_proj(previous) + e_proj(embeds).unsqueeze(-2) (nvidia/mtp.py:185-187)
+                traffic("mtp_input_add", 2 * bundle + hidden * act, tp="replicated"),
+                # a plain pre on the 3-D stream (nvidia/model.py:1350-1364)
+                traffic("mhc_attn_pre", mhc_pre_bytes, tp="replicated"),
+                with_tp(fp32_gemm("hc_attn_fn", mix_hc, hc_mult * hidden), "replicated")),
+            *attention_block(1),
+            *ffn(False),
+            *token_sharded(traffic("mtp_mhc_post", mhc_post_bytes, tp="replicated")),
+            # gathered back before the head under sequence parallelism (nvidia/mtp.py:
+            # 206-209)
+            {**collective("AllGather", "mtp_out", EMIT_SEQUENCE_PARALLEL),
+             "bytes_per_token": bundle},
+        ]
+        kinds.append({"id": "mtp", "nodes": draft, "edges": chain(draft)})
+        extras["speculator"] = {
+            # vLLM v0.31.0 rewrites every MTP-family name to "mtp"
+            # (config/speculative.py:1135-1139); one draft token by default, from
+            # n_predict = num_nextn_predict_layers (:696-707, 1483-1486).
+            "method": "mtp",
+            "num_spec_tokens": spec_layers,
+            "embedding": [{**embed, "role": "mtp_embed_tokens",
+                           "aliases": "embedding.embed_tokens"},
+                          collective("AllReduce", "mtp_embed_out", EMIT_TENSOR_PARALLEL)],
+            "stack": {"pattern": ["mtp"], "repeat": 1},
+            # compute_logits over the sampled rows: hc_head, the shared head's norm, and
+            # the target's lm_head (nvidia/mtp.py:276-302).
+            "head": [*mhc_head("mtp_"), norm("mtp_final_norm"),
+                     {**with_tp(gemm("mtp_lm_head", vocab, hidden), "column"),
+                      "aliases": "head.lm_head"}],
+        }
+    return kinds, compress(sequence), extras
+
+
+# DeepSeek-V4.1's SM90 KV record, in bytes per cached entry: 448 FP8 NoPE dims, 64 BF16
+# RoPE dims, seven UE8M0 scales (one per 64 NoPE dims) and a pad byte
+# (deepseek_v41/common/ops/fused_compress_quant_cache.py:303-351). attention.py:503-508
+# sizes both the sliding-window and the compressed record at 584 by default on every
+# part but the SM100 family, where _use_v41_mxfp8_kv_record() (:119-126) switches to the
+# MXFP8 record; an explicit nvfp4_ds_mla cache makes the compressed record 288 B
+# (:506-508), and FlashMLA serves that only on SM100 (:513-517).
+DSV41_SM90_KV_RECORD_BYTES = 584
+# The indexer K cache entry is index_head_dim FP8 values plus one FP32 scale per 128
+# of them: `index_head_dim + index_head_dim // 128 * 4` (attention.py:89-97). The
+# MXFP4 layout is opt-in and raises on anything but SM100
+# (v1/attention/backends/mla/indexer.py:58-73).
+# Every packed V4.1 page is padded to the SM90 decode kernel's 576 B TMA stride
+# (attention.py:512, 1174-1176); SM100's 512 is the architecture overlay's.
+DSV41_SM90_PAGE_ALIGNMENT = 576
+# The compressed and indexer caches take the engine's block, which V4.1's backends fix:
+# its sparse MLA and indexer backends accept only 64-token pages on SM90 and 128 on
+# SM100 (deepseek_v41/sparse_mla.py:89-90; v1/attention/backends/mla/indexer.py:277-278),
+# and the engine picks the size every backend accepts (platforms/interface.py:616-697).
+DSV41_SM90_SPARSE_BLOCK_TOKENS = 64
+# MXFP8 weights' resident scale: the checkpoint's 32 x 32 UE8M0 blocks repeated to one
+# byte per 32 elements of a row at load (model_executor/layers/quantization/modelopt.py:
+# 2200-2248).
+DSV41_MXFP8_RESIDENT_SCALE = {"elements": 32, "bytes": 1}
+
+
+def dsv41_index_k_record_bytes(index_dim: int) -> int:
+    return index_dim + index_dim // 128 * 4
+
+
+def handler_deepseek_v41(cfg, raw, model):
+    """DeepSeek-V4.1: V4's compressed sparse MLA, with the compressed cache and the
+    indexer SHARED across layers, two engram n-gram layers, mHC on every sublayer, and
+    a three-layer DSpark draft module.
+
+    Priced as vLLM v0.31.0 serves it on SM90 (H200, the part the serving campaign in
+    blis-catalog#29 ran on), with no attention backend forced, as the base of
+    capability family 9; `arch_overrides` states what family 10 (SM100) changes:
+
+      * wo_a is MXFP8 in the checkpoint and BF16 resident on SM90. It is a batched
+        matmul, whose only kernels are DeepGemmMxfp8BmmLinearKernel and the emulation
+        kernel (model_executor/kernels/linear/__init__.py:895-900). The first is
+        Blackwell-only (mxfp8/deep_gemm.py:34-35); the second dequantizes at load
+        (mxfp8/emulation.py:31-50, with VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD defaulting
+        True). On SM100 it stays FP8.
+      * the KV record is 584 B on SM90 (DSV41_SM90_KV_RECORD_BYTES) in 576 B-aligned
+        pages. SM100 writes a 528 B MXFP8 record in 512 B pages, and its default mega
+        attention resolves an unstated or "fp8" cache dtype to nvfp4_ds_mla
+        (attention.py:140-149; nvidia/flash_mla_mega_attn.py:193-197), whose
+        compressed record is 288 B NVFP4 while the window keeps 528 B
+        (attention.py:500-508). The overlay states both records; which cache dtype
+        runs is the consumer's to resolve. The 132 B indexer record is the default on
+        both.
+      * FlashMLA is the SM90 attention class (nvidia/model.py:190-236); SM100 defaults
+        to mega attention, which fuses Q RoPE, the attention and the inverse RoPE into
+        one launch. The overlay changes widths and records, not launches, so SM100's
+        fused launches are priced as SM90's separate ones.
+
+    Every layer index below comes from the config's own vectors, which vLLM reads the
+    same way (attention.py:294-338):
+
+      * compress_ratios[i] is 0 (sliding window only), 1 (a full-length compressed
+        stream, no pooling) or 2 (pairs pooled by a learned gate). vLLM rejects any
+        other value (attention.py:300-311, compressor.py:192-197).
+      * kv_source_layer_ids name the only layers that build a compressor and OWN a
+        compressed cache. Every other compressed layer reads the cache of the nearest
+        source at or below it, `max(s for s in kv_source_layers if s <= layer_id)`
+        (attention.py:333-335), while still projecting its own 512-wide KV into its own
+        sliding-window cache (attention.py:547-558). The checkpoint agrees: compressor
+        tensors exist on layers 2, 8, 14 and 20 only.
+      * index_source_layer_ids name the layers that build an indexer (attention.py:
+        421-472). Those that are also KV sources own an indexer K cache and its wk /
+        k_norm; the rest score their own queries against the nearest KV source's keys
+        (attention.py:437-449), which the checkpoint confirms by carrying wk and k_norm
+        on 2, 8, 14 and 20 alone. Every other compressed layer reads the top-k the last
+        indexer wrote into the shared buffer (nvidia/flashmla.py:185-189).
+
+    Each layer states the caches its main read and its scorer hold: its own window,
+    and on compressed layers the stream (and the keys) it owns or borrows, owners with
+    the page alignment and readers with the owner's record. A ratio-2 owner also holds
+    the compressor's FP32 state ring. The main read states compress_ratio to name the
+    stream its top-k positions come from, which its kv cache must match; it reads its
+    window plus at most index_topk of them whatever the ratio (nvidia/flashmla.py:
+    230-246; inference-sim/blis-latency-kernel#32). The scorer scans ctx / ratio.
+
+    The collectives follow V4.1's own sequence parallelism, `_use_sequence_parallel`
+    (nvidia/model.py:239-247: PP 1, EP on, TP > 1, and a mega-MoE backend or DP > 1),
+    never the engine-wide use_sequence_parallel_moe (config/parallel.py:719-736).
+    Under it `wo_b` stops reducing and attention is all-gathered and reduce-scattered
+    (nvidia/model.py:318-319, 579-586), FusedMoE skips its final all-reduce (fused_moe/
+    runner/moe_runner.py:506-512), and the engram rows are gathered along tokens. The
+    draft layers take the same flag (dspark.py:85). Work on the residual stream -- mHC,
+    the engram injection, the MoE and the head before its gather -- states
+    `under_sequence_parallel: token_sharded`, since under the mode it runs on the rank's
+    ceil(tokens / tp) rows; attention, its compressor and its indexer run on all of them.
+
+    What the graph cannot carry, recorded so a reader does not have to rediscover it:
+      * FlashMLA pads each rank's query heads to 64 (nvidia/flashmla.py:66-74). When TP
+        splits the heads (attention.py:276-284), a rank at TP 8 computes 64 heads where
+        n_q / tp gives 8. That depends on the backend and the TP width rather than on
+        the model, so the main read states no tp and the consumer applies it
+        (inference-sim/blis-latency-kernel#39);
+      * SM100's fused all-reduce + mHC: at TP 4 without expert parallelism, where
+        NVLink multicast is available, wo_b's and the MoE's reductions fold into the
+        mHC boundary kernel (nvidia/model.py:318-328, 645-653; nvidia/ops/mhc.py:
+        44-72), which an overlay cannot restate, so the graph keeps them as
+        all-reduces;
+      * the shared expert's TP padding: its intermediate rounds up to whole 32-wide
+        blocks per rank (deepseek_v4/nvidia/model.py:150-158, under weight_block_size
+        [32, 32]), none at TP 8 but 2,560 for 2,304 at TP 16, so the consumer applies
+        it;
+      * resident tensors no GEMM or Gather prices: the norms, attention sinks, gate
+        biases and the engram gate's q and k weights, a few MB;
+      * the SM100 page size of the compressed and indexer caches, 128 tokens where
+        SM90's is 64: an architecture overlay restates a cache's record and alignment
+        but not its block_size (inference-sim/blis-schemas#62);
+      * the SM100 mega-attention launches (above), and the draft context's window
+        insert, which writes a draft layer's cache from another kind and so states the
+        SM90 record in its traffic rather than following the overlay;
+      * the 68 B MXFP4 indexer record, opt-in through indexer_kv_dtype, which no
+        deployment key carries (inference-sim/blis-schemas#57);
+      * work the target runs only when DSpark is enabled: the copy of the whole hc
+        stream into the drafter's hidden buffer (nvidia/model.py:773-784, 975-980),
+        the auxiliary writes at the dspark_target_layer_ids, and, under sequence
+        parallelism, the head's gather of the whole hc stream and its pre-mix ahead of
+        the collapse and norm, in place of the collapsed state after them (:976-990),
+        and the all-gathers of the auxiliary states it reads (:944-946, 958-959). No
+        emit condition names speculation (inference-sim/blis-schemas#51);
+      * prefill's gather of each layer's own window records into the BF16 workspace,
+        query_len + min(prefix, window - 1) entries per request (nvidia/flashmla.py:
+        315-325; sparse_swa.py:366-371), about 1.6 KB per prefill token a layer: it
+        grows with the chunk, not the context, and no context field states that;
+      * Engram's DP-sharded path: with DP > 1 and /dev/shm too small for the ~189 GiB
+        of tables, they shard over TP x DP and the hashes and rows are exchanged over
+        the engram DP group (nvidia/engram.py:104-159, 408-424, 490-496;
+        distributed/parallel_state.py:2104-2128). The graph states the shared-memory
+        case, one copy per node;
+      * on SM100, qkv_a_layernorm writes an FP8 query with its scales when the query
+        quantization fuses (attention.py:744-756), which the overlay cannot restate;
+      * layer 0's (24, 20480) hc_attn_fn, which stays resident beside the summed
+        broadcast matrix it multiplies by (nvidia/model.py:402-409, 1178-1191), 1.9 MB;
+      * small per-token launches below any node's resolution: the decode top-k index
+        translation (nvidia/flashmla.py:181-193), the top-k buffer clear
+        (sparse_attn_indexer.py:479-480) and the engram n-gram hash (nvidia/model.py:
+        842-879).
+    """
+    # Every count below is read as a whole number and checked against what it counts.
+    # The config is the only source for these shapes, so a float, a bool, a zero or an
+    # id outside the stack is a misread config rather than a value to round or drop.
+    def whole(value, what):
+        if type(value) is not int:
+            raise DeriveError(f"{model}: {what} is {value!r}, not a whole number")
+        return value
+
+    def positive(key, *, concept=False, least=1):
+        value = whole(require(cfg, key, model) if concept else require_key(cfg, key, model),
+                      key)
+        if value < least:
+            raise DeriveError(f"{model}: {key} is {value}; this architecture needs at "
+                              f"least {least}")
+        return value
+
+    def layer_ids(key, lo, hi, *, nonempty=False):
+        ids = [whole(i, f"an entry of {key}") for i in require_key(cfg, key, model)]
+        if len(set(ids)) != len(ids):
+            raise DeriveError(f"{model}: {key} repeats a layer: {ids}")
+        if any(not lo <= i < hi for i in ids):
+            raise DeriveError(f"{model}: {key} names a layer outside [{lo}, {hi}): {ids}")
+        if nonempty and not ids:
+            raise DeriveError(f"{model}: {key} is empty")
+        return sorted(ids)
+
+    hidden = positive("hidden_size", concept=True)
+    layers = positive("num_layers", concept=True)
+    base = base_dtype(cfg, raw, model)
+    if base != "bf16":
+        # The tensors vLLM keeps unquantized are BF16 in this checkpoint, and the mHC
+        # kernels assert BF16 residual streams (kernels/mhc/tilelang.py:342-358), so a
+        # different declared dtype is a different model rather than a different width.
+        raise DeriveError(f"{model}: V4.1's unquantized tensors and mHC residual are "
+                          f"BF16; this config declares {base}")
+    act = DTYPE_WIDTHS[base]
+    fp32 = DTYPE_WIDTHS["fp32"]
+
+    ratios = [whole(r, "a compress_ratios entry")
+              for r in require_key(cfg, "compress_ratios", model)]
+    # Zero draft layers is a checkpoint without DSpark: no speculator, and no dspark_*
+    # field is read.
+    spec_layers = whole(require(cfg, "num_spec_tokens", model), "num_nextn_predict_layers")
+    if spec_layers < 0:
+        raise DeriveError(f"{model}: num_nextn_predict_layers is {spec_layers}")
+    if len(ratios) not in (layers, layers + spec_layers):
+        raise DeriveError(
+            f"{model}: compress_ratios has {len(ratios)} entries for {layers} layers and "
+            f"{spec_layers} draft layers")
+    # vLLM indexes the vector by layer id and gives any id past its end ratio 0
+    # (attention.py:300-305), so the draft layers 40-42 read their own entries here.
+    draft_ratios = [ratios[layers + i] if layers + i < len(ratios) else 0
+                    for i in range(spec_layers)]
+    ratios = ratios[:layers]
+    unknown = sorted(set(ratios + draft_ratios) - {0, 1, 2})
+    if unknown:
+        raise DeriveError(
+            f"{model}: compress_ratios names {unknown}; vLLM's V4.1 compressor accepts "
+            f"0, 1 and 2 only (deepseek_v41/compressor.py:192-197)")
+    if any(draft_ratios):
+        raise DeriveError(
+            f"{model}: a draft layer declares a compressed read, but a DSpark layer is "
+            f"never a KV or index source (attention.py:322-324), so it has no stream to "
+            f"read")
+
+    kv_sources = layer_ids("kv_source_layer_ids", 0, layers)
+    index_sources = layer_ids("index_source_layer_ids", 0, layers)
+    # Layer 0 takes the broadcast branch, and the engram injection is the elif after
+    # it (nvidia/model.py:485-522), so vLLM would silently never run an engram there;
+    # and no draft layer is given an engram layout (dspark.py:122-132).
+    engram_layers = set(layer_ids("engram_layer_ids", 1, layers))
+    # vLLM finds a layer's table by its position in the config's own list,
+    # engram_layout.layer_ids.index(layer_id) over tuple(config.engram_layer_ids)
+    # (nvidia/model.py:296-305; common/engram.py:176-178), which need not be sorted.
+    engram_order = [whole(i, "an entry of engram_layer_ids")
+                    for i in require_key(cfg, "engram_layer_ids", model)]
+
+    def kv_source_of(i):
+        return max((s for s in kv_sources if s <= i), default=None)
+
+    for s in kv_sources + index_sources:
+        if ratios[s] == 0:
+            raise DeriveError(
+                f"{model}: source layer {s} has no compressed stream to own or index")
+    for i, r in enumerate(ratios):
+        if r == 0:
+            continue
+        src = kv_source_of(i)
+        # vLLM does not check this; a reader layer whose source pools differently would
+        # read a stream at a ratio it does not declare, which no node can price.
+        if src is None or ratios[src] != r:
+            raise DeriveError(
+                f"{model}: layer {i} (ratio {r}) reads the compressed cache of layer "
+                f"{src}, which declares ratio {None if src is None else ratios[src]}")
+    for i, r in enumerate(ratios):
+        # vLLM takes max() over the index sources at or below every compressed layer,
+        # and max() over an empty set raises (attention.py:333-338).
+        if r and not any(s <= i for s in index_sources):
+            raise DeriveError(
+                f"{model}: compressed layer {i} has no index source at or below it, "
+                f"which vLLM rejects")
+    for s in index_sources:
+        # An index source that is not a KV source scores against its KV source's
+        # indexer K cache, which exists only if that layer indexes too
+        # (attention.py:437-449, NotImplementedError otherwise).
+        if s not in kv_sources and kv_source_of(s) not in index_sources:
+            raise DeriveError(
+                f"{model}: index source {s} needs the keys of layer {kv_source_of(s)}, "
+                f"which builds no indexer")
+
+    q_heads = positive("num_q_heads", concept=True)
+    total_dim = positive("head_dim", concept=True)
+    rope = positive("qk_rope_head_dim", concept=True)
+    q_lora = positive("q_lora_rank")
+    o_lora = positive("o_lora_rank")
+    o_groups = positive("o_groups")
+    window = positive("sliding_window", concept=True)
+    topk = positive("index_topk")
+    index_heads = positive("index_n_heads")
+    index_dim = positive("index_head_dim")
+    hc_mult = positive("hc_mult")
+    if (q_heads * total_dim) % o_groups:
+        raise DeriveError(
+            f"{model}: o_groups {o_groups} does not divide {q_heads * total_dim}")
+    if total_dim != 512 or rope != 64:
+        # compressor.py:210 asserts exactly this, and the 584 B record is laid out for
+        # it, so another width is a different kernel rather than a different value.
+        raise DeriveError(
+            f"{model}: V4.1's compressor and KV record assume head_dim 512 with rope "
+            f"64; this config states {total_dim} and {rope}")
+    if index_dim % 128:
+        # The FP8 indexer cache carries one FP32 scale per 128 values (attention.py:
+        # 89-97); another width would leave a partial group no record describes.
+        raise DeriveError(
+            f"{model}: index_head_dim {index_dim} is not a multiple of 128")
+
+    # The candidate source publishes the blocks later indexers mask to
+    # (nvidia/model.py:662-675, attention.py:450-471); it must be an index source.
+    # vLLM reads both fields with getattr defaults of -1 and 0 and turns candidate
+    # selection off unless the source is a layer and the block count is positive
+    # (nvidia/model.py:666-668).
+    candidate_source = cfg.get("candidate_source_layer_id")
+    if candidate_source is not None:
+        candidate_source = whole(candidate_source, "candidate_source_layer_id")
+        blocks = whole(cfg.get("candidate_topk_blocks", 0), "candidate_topk_blocks")
+        if candidate_source < 0 or blocks <= 0:
+            candidate_source = None
+        elif candidate_source not in index_sources:
+            raise DeriveError(f"{model}: candidate_source_layer_id {candidate_source} "
+                              f"is not an index source")
+    # One Engram table per engram layer, in the order engram_layer_ids lists them
+    # (common/engram.py:167-202).
+    engram_tables = []
+    if engram_layers:
+        n_cols = (positive("engram_max_ngram_size", least=2) - 1) * positive(
+            "engram_n_heads")
+        row_dim = positive("engram_head_dim")
+        engram_tables = [whole(n, "an entry of engram_num_embeddings")
+                         for n in require_key(cfg, "engram_num_embeddings", model)]
+        if len(engram_tables) != len(engram_layers) or min(engram_tables) < 1:
+            raise DeriveError(f"{model}: engram_num_embeddings {engram_tables} does not "
+                              f"give one table per engram layer")
+    # Read before any layer is built: the compressor ring is sized by it.
+    block = positive("dspark_block_size") if spec_layers else 0
+
+    record = DSV41_SM90_KV_RECORD_BYTES
+    index_record = dsv41_index_k_record_bytes(index_dim)
+    bundle = hc_mult * hidden * act
+    mixes = hc_mult * fp32 + hc_mult * hc_mult * fp32
+    mix_hc = (2 + hc_mult) * hc_mult
+
+    def fp32_gemm(role, n, k):
+        node = gemm(role, n, k)
+        node["weight_dtype"] = "fp32"
+        return node
+
+    def base_gemm(role, n, k):
+        node = gemm(role, n, k)
+        node["weight_dtype"] = base
+        return node
+
+    def with_tp(node, layout):
+        node["tp"] = layout
+        return node
+
+    def token_sharded(*nodes):
+        # Work on the residual stream. Under V4.1's own sequence parallelism that stream
+        # is sharded by token (sp_shard, nvidia/model.py:898-905) and only attention runs
+        # on the gathered rows, between its all-gather and its reduce-scatter (:579-586).
+        for node in nodes:
+            node["under_sequence_parallel"] = "token_sharded"
+        return list(nodes)
+
+    def traffic(role, bytes_per_token, *, tp=None):
+        # Amortized figures divide by the pool ratio; a remainder would be a fraction of
+        # a byte the schema's integer field cannot hold, so it raises rather than rounds.
+        if bytes_per_token != int(bytes_per_token):
+            raise DeriveError(f"{model}: {role} moves {bytes_per_token} B/token, which "
+                              f"is not a whole number of bytes")
+        node = norm(role)
+        node["bytes_per_token"] = int(bytes_per_token)
+        if tp:
+            node["tp"] = tp
+        return node
+
+    def store(role, bytes_per_run, cache, ratio=1):
+        # A launch that writes one entry of its layer's `cache` each time it runs: the
+        # record's own bytes are added by the consumer from the cache (and follow the
+        # architecture overlay and the cache dtype), so bytes_per_token is the rest.
+        node = traffic(role, bytes_per_run, tp="replicated")
+        node["writes_cache"] = cache
+        if ratio > 1:
+            node["per_tokens"] = ratio
+        return node
+
+    def context_work(role, *, per, bytes_per_entry, reads_cache=None, tokens_per_entry=1,
+                     phase=None, decode_extent=None):
+        node = with_tp(norm(role), "replicated")
+        work: dict[str, Any] = {}
+        if reads_cache:
+            work["reads_cache"] = reads_cache
+        work["bytes_per_entry"] = int(bytes_per_entry)
+        if tokens_per_entry > 1 and not reads_cache:
+            work["tokens_per_entry"] = tokens_per_entry
+        work["per"] = per
+        if phase:
+            work["phase"] = phase
+        if decode_extent:
+            work["decode_extent"] = decode_extent
+        node["context"] = work
+        return node
+
+    # Caches, from what each layer allocates (attention.py:503-512, 547-558, 1100-1134,
+    # 1166-1195; compressor.py:146-163). A reader states its owner's record exactly and
+    # finds the owner by name, as the nearest earlier layer that owns one -- vLLM's own
+    # `max(s for s in kv_source_layers if s <= layer_id)` (attention.py:333-338).
+    # Pages: the window ring takes 32-token blocks (attention.py:554); every packed
+    # record pads its page to the decode kernel's 576 B TMA stride on SM90 (:512, and
+    # :1174-1176 for the index cache, which shares the block).
+    def window_cache():
+        return {"name": "swa", "kind": "window", "owned": True,
+                "bytes_per_entry": record, "window": window, "block_size": 32,
+                "page_alignment": DSV41_SM90_PAGE_ALIGNMENT}
+
+    def compressed_cache(ratio, owned):
+        cache = {"name": "compressed", "kind": "kv", "owned": owned,
+                 "bytes_per_entry": record}
+        if ratio > 1:
+            cache["tokens_per_entry"] = ratio
+        if owned:
+            cache["block_size"] = DSV41_SM90_SPARSE_BLOCK_TOKENS
+            cache["page_alignment"] = DSV41_SM90_PAGE_ALIGNMENT
+        return cache
+
+    def index_cache(ratio, owned):
+        cache = {"name": "index", "kind": "index", "owned": owned,
+                 "bytes_per_entry": index_record}
+        if ratio > 1:
+            cache["tokens_per_entry"] = ratio
+        if owned:
+            cache["block_size"] = DSV41_SM90_SPARSE_BLOCK_TOKENS
+            cache["page_alignment"] = DSV41_SM90_PAGE_ALIGNMENT
+        return cache
+
+    def ring_cache():
+        # A ratio-2 compressor's FP32 state ring: kv and score rows of head_dim each, in
+        # blocks of max(8, the next power of two at or above num_speculative_tokens + 2)
+        # rows (compressor.py:146-163, 230-238). At DSpark's 5 tokens and without
+        # speculation alike that is 8.
+        rows = max(8, 1 << ((block + 2 if spec_layers else 2) - 1).bit_length())
+        return {"name": "compressor_ring", "kind": "state", "owned": True,
+                "bytes_per_entry": 2 * total_dim * fp32, "entries": rows}
+
+    # mHC. The parameters are FP32 (nvidia/model.py:400-444; the checkpoint agrees, F32
+    # [24, 20480]) and on SM90 every boundary is TileLang's delayed fused post + pre
+    # (nvidia/ops/mhc.py:305-322), because the overlap stream and Mega-mHC are
+    # SM100-only (nvidia/ops/mhc.py:44-56, nvidia/ops/mega_mhc.py:17-28). The
+    # sublayer's RMSNorm is fused into the epilogue -- norm_weight is passed in
+    # (nvidia/model.py:503-604) -- so no attn_norm / ffn_norm node exists. Traffic is
+    # mhc_mixing_bytes(): the post and the pre each as one pass, read against the
+    # TileLang contract (kernels/mhc/tilelang.py:296-358: residual bf16 (T, hc, H),
+    # post and comb mixes fp32; the 4 FP32 pre-mix values, 32 B a token, are not
+    # counted). The pre's re-read of the updated residual happens on both paths the
+    # kernel takes (tilelang.py:445-457). Within its fused token range (32 or fewer per
+    # rank, tilelang_kernels.py:64-95) the projection is computed inside the post
+    # kernel, so the hc_*_fn GEMM node's own bundle read does not happen there; above
+    # it a separate GEMM reads the bundle as the node states. Neither has been
+    # measured.
+    #
+    # Every rank holds the whole residual stream under plain TP, so mHC is replicated.
+    # Every mHC launch and projection runs on the residual stream: replicated on each
+    # rank, and on the rank's token shard under V4.1's sequence parallelism.
+    fused_mhc = mhc_mixing_bytes(cfg, raw, model, hidden, hc_mult)
+    mhc_post_bytes = hidden * act + bundle + mixes + bundle
+    mhc_pre_bytes = bundle + mixes + hidden * act
+
+    def mhc_boundary(side):
+        return token_sharded(
+            traffic(f"mhc_{side}_post_pre", fused_mhc, tp="replicated"),
+            with_tp(fp32_gemm(f"hc_{side}_fn", mix_hc, hc_mult * hidden), "replicated"))
+
+    def final_mhc():
+        # The final mHC post and the hc collapse run before the final norm
+        # (nvidia/model.py:947-987); V4.1 has no learned hc_head (:982-986).
+        return token_sharded(
+            traffic("mhc_final_post", mhc_post_bytes, tp="replicated"),
+            traffic("hc_collapse", bundle + hc_mult * fp32 + hidden * act,
+                    tp="replicated"))
+
+    def broadcast_mhc(fn_width, fn_role):
+        # The embedding is broadcast to hc_mult copies by a materializing expand (read
+        # hidden, write the bundle), then a standalone pre. Target layer 0 projects with
+        # hc_attn_fn summed over its copies, a (mix_hc, hidden) matrix
+        # (nvidia/model.py:485-505, 1178-1191); the drafter repeats the copies itself
+        # (dspark.py:226) and its first layer takes the full hc_attn_fn on the 3-D
+        # stream (nvidia/model.py:506-521).
+        return token_sharded(
+            traffic("mhc_attn_broadcast_pre", hidden * act + bundle + mhc_pre_bytes,
+                    tp="replicated"),
+            with_tp(fp32_gemm(fn_role, mix_hc, fn_width), "replicated"))
+
+    engram_rows = dict(zip(engram_order, engram_tables))
+
+    def engram_block(i):
+        # Engram replaces the fused boundary before its attention with a separate post,
+        # the injection, and a separate pre (nvidia/model.py:522-552).
+        #
+        # The lookup gathers (max_ngram_size - 1) * engram_n_heads rows of engram_head_dim
+        # FP8 values plus one UE8M0 scale per 32 from each layer's own table and writes
+        # them to HBM as BF16 (common/engram.py:588-642, 959-966). The tables are pinned
+        # host memory by default (config/engram.py:38-56, `cpu_offload: bool = True`),
+        # split across TP by hash head (common/engram.py:663-676). wkv is an FP8
+        # column-parallel GEMM from the flattened rows to (hc_mult + 1) hidden-wide
+        # outputs (:928-937; checkpoint F8_E4M3 [25600, 6144]). The fused gate then reads
+        # the bundle, the hc_mult keys and the value, and writes the bundle (:755-843).
+        #
+        # Without sequence parallelism each rank looks up its heads for every token, the
+        # rows are all-gathered along heads, and wkv's output is all-gathered
+        # (gather_output=True). With it the lookup still covers every token, before the
+        # stream is sharded (nvidia/model.py:890-895), the rows are all-gathered along
+        # tokens and cut to the rank's shard, and wkv is replicated over that shard with
+        # no gather (common/engram.py:928-937, 977-1016), as is the gate.
+        out = n_cols * row_dim * act
+        return [
+            *token_sharded(traffic("mhc_attn_post", mhc_post_bytes, tp="replicated")),
+            {"op": "Gather", "role": "engram_lookup", "rows": engram_rows[i],
+             "row_bytes": row_dim + row_dim // 32, "rows_per_token": n_cols,
+             "out_bytes_per_token": out, "residency": "host",
+             "residency_control": "engram_cpu_offload", "shard": "heads"},
+            {**collective("AllGather", "engram_rows",
+                          EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL),
+             "bytes_per_token": out},
+            {**collective("AllGather", "engram_rows_by_token", EMIT_SEQUENCE_PARALLEL),
+             "bytes_per_token": out},
+            *token_sharded(with_tp(gemm("engram_wkv", (hc_mult + 1) * hidden,
+                                        n_cols * row_dim), "column")),
+            {**collective("AllGather", "engram_wkv_out",
+                          EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL),
+             "bytes_per_token": (hc_mult + 1) * hidden * act},
+            *token_sharded(
+                traffic("engram_gate", bundle + bundle + hidden * act + bundle,
+                        tp="replicated"),
+                traffic("mhc_attn_pre", mhc_pre_bytes, tp="replicated"),
+                with_tp(fp32_gemm("hc_attn_fn", mix_hc, hc_mult * hidden), "replicated")),
+        ]
+
+    def projections_in():
+        # attention.py:354-370. fused_wqa_wkv merges wq_a and wkv into one replicated
+        # GEMM (`disable_tp=True`; the checkpoint ships them separately: F8 [1280, 5120]
+        # and [512, 5120]); one fused_q_kv_rmsnorm launch norms both halves (:757-763),
+        # at q_lora_rank and head_dim wide, on the replicated latents.
+        return [
+            # Under V4.1's own sequence parallelism the attention input is all-gathered
+            # from the token shards (nvidia/model.py:579-580).
+            collective("AllGather", "attn_in", EMIT_SEQUENCE_PARALLEL),
+            with_tp(gemm("fused_wqa_wkv", q_lora + total_dim, hidden), "replicated"),
+            traffic("qkv_a_layernorm", 2 * (q_lora + total_dim) * act, tp="replicated"),
+            with_tp(gemm("wq_b", q_heads * total_dim, q_lora), "column"),
+            # One launch: GPT-J RoPE over Q and its pad to padded_heads, then RoPE, UE8M0
+            # FP8 quantization and insertion of this token's KV into the layer's own
+            # window cache (attention.py:1034-1048). Q is read and written at q_heads x
+            # head_dim and the KV row read at head_dim; the record it writes is the
+            # cache's. FlashMLA pads each rank's Q to 64 heads (nvidia/flashmla.py:
+            # 66-74), so the Q write does not shrink with TP; replicated is the nearer
+            # layout (inference-sim/blis-latency-kernel#39).
+            store("q_rope_kv_insert", 2 * q_heads * total_dim * act + total_dim * act,
+                  "swa"),
+        ]
+
+    def projections_out():
+        return [
+            # The inverse RoPE over the attention output, unquantized on SM90. FlashMLA's
+            # _o_proj is dsv41_o_proj, whose fused WO-A path is SM100-only, so it falls
+            # through to deep_gemm_fp8_o_proj (deepseek_v41/nvidia/ops/o_proj.py:30-45,
+            # 63-95), which runs fused_inv_rope_fp8_quant with quantize=False once wo_a is
+            # BF16 (deepseek_v4/nvidia/ops/o_proj.py:61-77), over each rank's own heads.
+            traffic("o_inv_rope", 2 * q_heads * total_dim * act, tp="sharded"),
+            # Grouped: o_groups batched matmuls of (o_lora, heads*head_dim/o_groups),
+            # split by group across TP. BF16 resident on SM90 (see the docstring), with
+            # its E8M0 scales kept "for the dtype/ndim asserts" (mxfp8/emulation.py:
+            # 36-50); FP8 on SM100, by the architecture overlay.
+            {**with_tp(base_gemm("wo_a", o_groups * o_lora,
+                                 q_heads * total_dim // o_groups), "column"),
+             "weight_scale": dict(DSV41_MXFP8_RESIDENT_SCALE)},
+            with_tp(gemm("wo_b", hidden, o_groups * o_lora), "row"),
+            # wo_b reduces unless V4.1's own sequence parallelism is on, which turns its
+            # reduction into a reduce-scatter (nvidia/model.py:318-319, 585-586).
+            collective("AllReduce", "attn_out",
+                       EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL),
+            collective("ReduceScatter", "attn_out", EMIT_SEQUENCE_PARALLEL),
+        ]
+
+    def compressor(ratio):
+        # Owned by KV sources only (attention.py:565-575). A BF16 replicated GEMM with an
+        # FP32 output (compressor.py:216-227, attention.py:916-921), wkv and wgate merged
+        # where the ratio pools (no gate at ratio 1: the checkpoint has no wgate on layer
+        # 20). fused_save_compress_norm (fused_compress_quant_cache.py:118-221) pools
+        # each closed group into one BF16 latent, which rope_quant_insert then reads and
+        # writes as one record of the compressed cache (:304-351), once per entry.
+        #
+        # The pool's traffic is the DECODE figure. At ratio 2 the request program also
+        # rewrites the chunk's last rows into the FP32 state ring every step (:180-193,
+        # ring capacity >= 8 rows, compressor.py:146-150), and a decode chunk is one
+        # token, so every token reads its raw row and writes it to the ring, and a
+        # group-closing token reads the previous row from the ring and the current one
+        # raw before writing the latent. In prefill only a chunk's tail reaches the
+        # ring, and the figure falls to one raw row plus the amortized latent. Ratio 1
+        # keeps no ring (compressor.py:230-238).
+        width = 2 * total_dim if ratio > 1 else total_dim
+        raw_row = width * fp32
+        if ratio > 1:
+            pool = 2 * raw_row + (2 * raw_row + total_dim * act) / ratio
+        else:
+            pool = raw_row + total_dim * act
+        return [
+            with_tp(base_gemm("compressor_fused_wkv_wgate", width, hidden), "replicated"),
+            traffic("compressor_pool_norm", pool, tp="replicated"),
+            store("compressor_rope_quant_insert", total_dim * act, "compressed", ratio),
+        ]
+
+    def indexer(i, ratio, owns_k):
+        nodes = [
+            # Replicated FP8 query projection from the q-LoRA latent, and the BF16
+            # per-head weight projection from hidden (attention.py:1258-1271; checkpoint
+            # F8 [4096, 1280] and BF16 [32, 5120]).
+            with_tp(gemm("index_wq_b", index_heads * index_dim, q_lora), "replicated"),
+            with_tp(base_gemm("index_weights_proj", index_heads, hidden), "replicated"),
+            # RoPE and FP8 quantization of the index query. The FP8 path stores no q
+            # scale: it is folded into the FP32 head weights it writes
+            # (attention.py:1398-1407; deepseek_v4/common/ops/fused_indexer_q.py:
+            # 669-727). Reads the BF16 query and weights, writes FP8 q and FP32 weights.
+            traffic("index_q_rope_quant",
+                    index_heads * index_dim * act + index_heads * act
+                    + index_heads * index_dim + index_heads * fp32, tp="replicated"),
+        ]
+        if owns_k:
+            # The key comes from the compressor's latent, not from hidden: a BF16
+            # (index_head_dim, head_dim) GEMM, then one launch for k_norm, RoPE, FP8
+            # quantization and the paged store (attention.py:1288-1298;
+            # common/ops/indexer_k_store.py). The GEMM runs over every token's latent
+            # row; only the store keeps the group-boundary rows (attention.py:
+            # 1365-1372), so only the store runs once per entry.
+            nodes += [
+                with_tp(base_gemm("index_wk", index_dim, total_dim), "replicated"),
+                store("index_k_norm_rope_store", index_dim * act, "index", ratio),
+            ]
+        nodes.append({
+            # The scoring pass scans every compressed position of its KV source to
+            # discover the top-k, so it carries the compression bound and no top-k
+            # (sparse_attn_indexer.py:585-626). Its heads are replicated.
+            "op": "Attention", "role": "block_index_scores", "kind": "sparse_mla",
+            "n_q": index_heads, "n_kv": 1, "d_h": index_dim, "compress_ratio": ratio,
+            "tp": "replicated", "caches": [index_cache(ratio, owns_k)],
+        })
+        # The scores land as an FP32 row per query token, written over the scanned
+        # positions only (clean_logits=False) and read back by the top-k
+        # (sparse_attn_indexer.py:583-626, 726-785).
+        nodes.append(context_work("index_logits_topk", per="query_token",
+                                  bytes_per_entry=2 * fp32, tokens_per_entry=ratio))
+        # Each prefill chunk gathers the request's whole key stream out of the cache
+        # into a workspace, one 132 B key written per entry it reads
+        # (sparse_attn_indexer.py:515-528).
+        nodes.append(context_work("index_prefill_k_gather", per="request",
+                                  bytes_per_entry=index_record, reads_cache="index",
+                                  phase="prefill"))
+        if i == candidate_source:
+            # The candidate source scores blocks of candidate_block_size positions from
+            # its logits row and keeps the top candidate_topk_blocks
+            # (kernels/attention/dsa/candidate_blocks.py:20-58, 392-445).
+            nodes.append(context_work("candidate_select", per="query_token",
+                                      bytes_per_entry=fp32, tokens_per_entry=ratio))
+            # It writes one FP32 score per candidate block across the logits row's
+            # whole width, max_model_len / ratio in decode, and top-k reads them all
+            # back (candidate_blocks.py:400-445; sparse_attn_indexer.py:748-756).
+            nodes.append(context_work(
+                "candidate_block_scores", per="query_token", bytes_per_entry=2 * fp32,
+                tokens_per_entry=ratio * positive("candidate_block_size"),
+                decode_extent="max_model_len"))
+        elif candidate_source is not None and i > candidate_source:
+            # Later indexers mask their rows to those blocks with -inf stores across the
+            # row's whole width, which in decode is max_model_len
+            # (candidate_blocks.py:114-145, 448-480; sparse_attn_indexer.py:726-765).
+            nodes.append(context_work("candidate_mask", per="query_token",
+                                      bytes_per_entry=fp32, tokens_per_entry=ratio,
+                                      decode_extent="max_model_len"))
+        return nodes
+
+    def main_attention(ratio, owns_stream, *, read_window=None):
+        # Every layer reads its own last sliding_window positions; a compressed layer
+        # adds at most index_topk positions of its source's compressed stream
+        # (nvidia/flashmla.py:181-246) and a ratio-0 layer passes no extra cache (:242).
+        # compress_ratio states the stream the top-k positions come from, which its kv
+        # cache must match; the read itself is window + index_topk positions
+        # (inference-sim/blis-latency-kernel#32).
+        node = attention(
+            cfg, model,
+            kind="sparse_mla",
+            latent_width=total_dim,
+            window=read_window or window,
+            compress_ratio=ratio or None,
+            index_topk=topk if ratio else None,
+        )
+        node["caches"] = [window_cache()]
+        if ratio:
+            node["caches"].append(compressed_cache(ratio, owns_stream))
+            if owns_stream and ratio > 1:
+                node["caches"].append(ring_cache())
+        return node
+
+    def routed_experts(experts, top_k):
+        quant = raw.get("quantization_config") or {}
+        mapped = EXPERT_DTYPES.get(str(quant.get("expert_dtype")))
+        if mapped is None:
+            raise DeriveError(
+                f"{model}: quantization_config.expert_dtype "
+                f"{quant.get('expert_dtype')!r} is not one this deriver maps")
+        # Mxfp4MoEMethod (deepseek_v41/quant_config.py:211-228); gate and up fused, so
+        # the node's N is the inner width and the consumer prices three matrices.
+        return {"op": "GroupedGEMM", "role": "experts",
+                "n": positive("moe_ffn_size", concept=True), "k": hidden,
+                "experts": experts, "top_k": top_k,
+                "weight_dtype": mapped}
+
+    def ffn(experts, top_k):
+        shared = positive("num_shared_experts", concept=True)
+        routed_node = routed_experts(experts, top_k)
+        return [
+            *mhc_boundary("ffn"),
+            # The whole MoE runs on the residual stream, so on the rank's token shard
+            # under V4.1's sequence parallelism.
+            # The router is an unquantized GateLinear with FP32 logits
+            # (deepseek_v4/nvidia/model.py:850-856; checkpoint BF16 [384, 5120]).
+            *token_sharded(with_tp(base_gemm("router", experts, hidden), "replicated"),
+                           routed_node),
+            # The shared expert is MXFP8, the routed ones MXFP4
+            # (deepseek_v4/nvidia/model.py:900-914 under
+            # deepseek_v41/quant_config.py:188-210), so it is its own node at the global
+            # width rather than a field of the routed one. It is a dense MLP, a merged
+            # gate/up column-parallel linear and a row-parallel down, TP-split normally
+            # and whole on every rank over the token shard under V4.1's sequence
+            # parallelism (`disable_tp=is_sequence_parallel`, :164, :173); expert
+            # parallelism does not place it.
+            *token_sharded(
+                with_tp(gemm("shared_gate_up", 2 * routed_node["n"] * shared, hidden),
+                        "column"),
+                with_tp(gemm("shared_down", hidden, routed_node["n"] * shared), "row")),
+            collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+            # V4.1 passes its own sequence-parallel flag to the MoE (nvidia/model.py:
+            # 324-327), and FusedMoE then skips its final reduction
+            # (fused_moe/runner/moe_runner.py:506-512); it never reads the engine-wide
+            # use_sequence_parallel_moe.
+            collective("AllReduce", "mlp_out",
+                       EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL),
+        ]
+
+    routed = positive("num_experts", concept=True)
+    routed_top_k = positive("top_k", concept=True)
+    if routed_top_k > routed:
+        raise DeriveError(f"{model}: top_k {routed_top_k} exceeds {routed} experts")
+
+    def layer_nodes(i):
+        ratio = ratios[i]
+        if i == 0:
+            nodes = broadcast_mhc(hidden, "hc_attn_fn_broadcast")
+        elif i in engram_layers:
+            nodes = engram_block(i)
+        else:
+            nodes = mhc_boundary("attn")
+        nodes += projections_in()
+        if i in kv_sources:
+            nodes += compressor(ratio)
+        if i in index_sources:
+            nodes += indexer(i, ratio, owns_k=i in kv_sources)
+        nodes.append(main_attention(ratio, i in kv_sources))
+        if ratio:
+            # Prefill dequantizes the whole compressed stream it reads into a BF16
+            # workspace before the sparse kernel, once per request chunk: each record
+            # read, 512 BF16 values written (nvidia/flashmla.py:305-315). Readers run it
+            # too, over their source's stream.
+            nodes.append(context_work("prefill_dequant_gather", per="request",
+                                      bytes_per_entry=total_dim * act,
+                                      reads_cache="compressed", phase="prefill"))
+        nodes += projections_out()
+        nodes += ffn(routed, routed_top_k)
+        return nodes
+
+    def kind_id(i):
+        ratio = ratios[i]
+        name = f"csa{ratio}" if ratio else "swa"
+        # Both roles are named independently: a KV source need not index, and an id
+        # that folded the two would give such a layer an indexing source's nodes.
+        if i in kv_sources:
+            name += "_kvsrc"
+        if i in index_sources:
+            name += "_idx"
+        if i == candidate_source:
+            name += "_cand"
+        elif candidate_source is not None and i in index_sources and i > candidate_source:
+            name += "_mask"
+        if i in engram_layers:
+            # Each engram layer gathers from its own table, of its own size.
+            name += f"_engram{i}"
+        if i == 0:
+            name += "_first"
+        return name + "_moe"
+
+    kinds, built, sequence = [], {}, []
+    for i in range(layers):
+        kid = kind_id(i)
+        sequence.append(kid)
+        nodes = layer_nodes(i)
+        if kid in built:
+            # A layer that reuses a kind must build exactly its nodes; an id that misses
+            # a per-layer difference would otherwise price this layer as the first one.
+            if nodes != built[kid]:
+                raise DeriveError(f"{model}: layer {i} shares kind {kid} with an earlier "
+                                  f"layer but builds different work")
+            continue
+        built[kid] = nodes
+        kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+
+    vocab = positive("vocab_size", concept=True)
+    embed = {"op": "Gather", "role": "embed_tokens", "rows": vocab,
+             "row_bytes": hidden * act, "rows_per_token": 1,
+             "out_bytes_per_token": hidden * act, "shard": "rows"}
+    lm_head = with_tp(base_gemm("lm_head", vocab, hidden), "column")
+
+    # The DSpark draft module (nvidia/dspark.py): num_nextn_predict_layers decoder layers
+    # at ids num_hidden_layers + i, each sliding-window only, with mHC and an MoE of
+    # dspark_n_routed_experts at dspark_num_experts_per_tok (nvidia/model.py:118-145), and
+    # no engram (no engram_layout is passed, dspark.py:122-132). It drafts
+    # dspark_block_size tokens in ONE pass over that many positions per request
+    # (v1/worker/gpu/spec_decode/dspark/speculator.py:1-23, 250-268), and each draft
+    # query reads its window plus its whole block, non-causally (sparse_swa.py:
+    # 1253-1258).
+    #
+    # Before that pass the drafter projects the hidden states of the
+    # dspark_target_layer_ids through main_proj and main_norm (dspark.py:100-108,
+    # 159-164), and each draft layer derives its context KV from that through its own
+    # fused_wqa_wkv, kv_norm and a fused RoPE + insert (dspark.py:166-197, 252-275), over
+    # the target's scheduled tokens: the context stack.
+    #
+    # After the pass: mHC post, hc collapse, the final norm and the target's lm_head over
+    # every block position (aliased, dspark.py:279-282, 341-347). Then the Markov head
+    # once per draft position, in order, over one row per request: an embedding of the
+    # previous token and a (vocab, markov_rank) BF16 projection (speculator.py:156-199;
+    # model_executor/models/qwen3_dspark.py:48-93), on its full path because
+    # dspark_draft_topk is unset and defaults to None (config/speculative.py:1503-1515).
+    # The bias add and sampling over each vocab-wide row are not priced. The confidence
+    # head is built but consulted only under adaptive verification
+    # (speculator.py:106-113), which is off by default (config/speculative.py:552).
+    draft_kinds = []
+    if spec_layers:
+        # main_proj's input is one hidden-wide state per target layer, so the ids are
+        # checked as layers of this stack, not just counted.
+        targets = layer_ids("dspark_target_layer_ids", 0, layers, nonempty=True)
+        draft_experts = positive("dspark_n_routed_experts")
+        draft_top_k = positive("dspark_num_experts_per_tok")
+        if draft_top_k > draft_experts:
+            raise DeriveError(f"{model}: dspark_num_experts_per_tok {draft_top_k} "
+                              f"exceeds {draft_experts} draft experts")
+        markov = positive("dspark_markov_rank")
+    for d in range(spec_layers):
+        nodes = []
+        if d == 0:
+            nodes += broadcast_mhc(hc_mult * hidden, "hc_attn_fn")
+        else:
+            nodes += mhc_boundary("attn")
+        nodes += projections_in()
+        nodes.append(main_attention(draft_ratios[d], False, read_window=window + block))
+        nodes += projections_out()
+        nodes += ffn(draft_experts, draft_top_k)
+        draft_kinds.append({"id": f"dspark_{d}", "nodes": nodes, "edges": chain(nodes)})
+    kinds += draft_kinds
+    if spec_layers:
+        context = [with_tp(gemm("dspark_main_proj", hidden, hidden * len(targets)),
+                           "replicated"),
+                   with_tp(norm("dspark_main_norm"), "replicated")]
+        for d in range(spec_layers):
+            context += [
+                {**with_tp(gemm(f"dspark_context_fused_wqa_wkv_{d}", q_lora + total_dim,
+                                hidden), "replicated"),
+                 "aliases": f"dspark_{d}.fused_wqa_wkv"},
+                traffic(f"dspark_context_kv_norm_{d}", 2 * total_dim * act,
+                        tp="replicated"),
+                # It writes draft layer d's window cache, which a node of this kind
+                # cannot name, so the record is stated in its traffic.
+                traffic(f"dspark_context_kv_rope_insert_{d}", total_dim * act + record,
+                        tp="replicated"),
+            ]
+        kinds.append({"id": "dspark_context", "nodes": context, "edges": chain(context)})
+
+    head = [*final_mhc(), *token_sharded(norm("final_norm")),
+            # Under V4.1's own sequence parallelism, and without a drafter's hidden
+            # buffer, the collapsed and normalized state is all-gathered before the head
+            # (nvidia/model.py:986-990).
+            collective("AllGather", "head_in", EMIT_SEQUENCE_PARALLEL),
+            # ParallelLMHead is built with no quant_config (nvidia/model.py:1338-1342;
+            # checkpoint head.weight BF16), so it is not the global FP8.
+            lm_head]
+
+    extras: dict[str, Any] = {
+        "global": {
+            "architecture": raw["architectures"][0],
+            # The checkpoint's 32 x 32 UE8M0 blocks are expanded to 1 x 32 at load
+            # (modelopt.py:2200-2248), so every MXFP8 weight holds one byte per 32.
+            "weight_scale": dict(DSV41_MXFP8_RESIDENT_SCALE),
+            # vLLM derives max_model_len from max_position_embeddings and applies no
+            # further factor for rope_type yarn (config/model.py:2471-2570); the
+            # tokenizer's model_max_length takes part through a min()
+            # (config/model.py:2496-2501), and at 1,048,576 at the pinned revision it
+            # equals max_position_embeddings, so it does not lower it.
+            "context_window": positive("max_position_embeddings"),
+        },
+        # BF16, not FP8: vLLM passes the quant config, but it returns no method for an
+        # embedding (quantization/fp8.py:177-209), so the table falls back to
+        # UnquantizedEmbeddingMethod (vocab_parallel_embedding.py:314-317). Each rank
+        # looks up its vocabulary shard and the partials are all-reduced
+        # (vocab_parallel_embedding.py:518-563), before sp_shard (nvidia/model.py:828,
+        # 904).
+        "embedding": [embed, collective("AllReduce", "embed_out", EMIT_TENSOR_PARALLEL)],
+        "head": head,
+        "base_capability_families": [9],
+        "arch_overrides": [{
+            # SM100 and SM103 run the MXFP8 BMM natively (mxfp8/deep_gemm.py:34-35), and
+            # store the 528 B MXFP8 record with 512 B pages (attention.py:125-126,
+            # 500-512); under nvfp4_ds_mla the compressed record is 288 B NVFP4
+            # (:506-508), which mega attention resolves an unstated cache dtype to
+            # (nvidia/flash_mla_mega_attn.py:193-197). The index record keeps 132 B and
+            # takes 512 B pages (:1174-1176).
+            "capability_family": 10,
+            "nodes": [{"role": "wo_a", "weight_dtype": "fp8"}],
+            "caches": [
+                {"name": "swa", "bytes_per_entry": 528, "page_alignment": 512},
+                {"name": "compressed", "bytes_per_entry": 528, "page_alignment": 512,
+                 "bytes_by_cache_dtype": {"nvfp4_ds_mla": 288}},
+                {"name": "index", "page_alignment": 512},
+            ],
+        }],
+    }
+    if spec_layers:
+        extras["speculator"] = {
+            # vLLM v0.31.0 names this method "dspark" and rejects "mtp" for deepseek_v41
+            # (config/speculative.py:1358-1369). Its default draft length is
+            # dspark_block_size, not num_nextn_predict_layers, which counts draft LAYERS
+            # (:1475-1482; nvidia/dspark.py:87-91).
+            "method": "dspark",
+            "num_spec_tokens": block,
+            "drafting": "parallel_block",
+            # The drafter's own VocabParallelEmbedding, whose weights are the target's
+            # (dspark.py:93-98), looks up its block's tokens and all-reduces them across TP
+            # before the stream is sharded (dspark.py:205-215;
+            # vocab_parallel_embedding.py:560-563), so the reduction runs in both modes.
+            "embedding": [{**embed, "role": "dspark_embed_tokens",
+                           "aliases": "embedding.embed_tokens"},
+                          collective("AllReduce", "dspark_embed_out", EMIT_TENSOR_PARALLEL)],
+            "stack": {"pattern": [k["id"] for k in draft_kinds], "repeat": 1},
+            "context_stack": {"pattern": ["dspark_context"], "repeat": 1},
+            "head": [
+                *final_mhc(),
+                # Under its sequence parallelism the drafter all-gathers its collapsed
+                # state (dspark.py:247-248).
+                collective("AllGather", "dspark_head_in", EMIT_SEQUENCE_PARALLEL),
+                norm("dspark_final_norm"),
+                {**with_tp(gemm("dspark_lm_head", vocab, hidden), "column"),
+                 "aliases": "head.lm_head"},
+            ],
+            "sequential_head": [
+                {"op": "Gather", "role": "markov_w1", "rows": vocab,
+                 "row_bytes": markov * act, "rows_per_token": 1,
+                 "out_bytes_per_token": markov * act},
+                with_tp(base_gemm("markov_w2", vocab, markov), "replicated"),
+            ],
+        }
+    # With no draft layers there is no speculator to state: derive()'s fallback reads
+    # the same num_nextn_predict_layers and emits none at zero.
+    return kinds, compress(sequence), extras
 
 
 def handler_minimax_m3(cfg, raw, model):
@@ -2603,6 +3973,10 @@ HANDLERS = {
     # gives the indexer its own node.
     "DeepseekV3ForCausalLM": handler_moe,
     "DeepseekV4ForCausalLM": handler_deepseek_v4,
+    # Its own handler rather than V4's: V4.1 shares the compressed cache and the indexer
+    # across layers, pools at ratios 1 and 2 where V4 asserts 4 or 128, and adds engram
+    # layers and a DSpark draft module. See handler_deepseek_v41.
+    "DeepseekV41ForCausalLM": handler_deepseek_v41,
     "GlmMoeDsaForCausalLM": handler_moe,
     "InklingForConditionalGeneration": handler_moe,
     "GptOssForCausalLM": handler_moe,
@@ -2627,6 +4001,13 @@ HANDLERS = {
 
 # --- Driver ---------------------------------------------------------------------
 
+# What a handler's optional third result may carry; see derive().
+EXTRAS_KEYS = frozenset({"global", "embedding", "head", "speculator",
+                         "base_capability_families", "arch_overrides"})
+# The global shapes a handler may add; the rest derive() computes itself.
+EXTRA_GLOBAL_KEYS = frozenset({"architecture", "weight_scale", "context_window",
+                               "default_context_window"})
+
 
 def derive(config_path: Path, model: str) -> dict[str, Any]:
     """Derive one graph from one vendor config."""
@@ -2645,7 +4026,21 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
             f"letting a default misprice the model"
         )
 
-    kinds, stack = handler(cfg, raw, model)
+    # A handler returns (kinds, stack), or (kinds, stack, extras) where its family needs
+    # what derive() cannot work out from a config alone: global shapes beyond the ones
+    # below, its own embedding or head, a speculator whose structure no fallback below
+    # reproduces, or the facts that differ by GPU architecture.
+    result = handler(cfg, raw, model)
+    if len(result) not in (2, 3):
+        raise DeriveError(f"{model}: handler returned {len(result)} results, not 2 or 3")
+    kinds, stack = result[0], result[1]
+    extras = result[2] if len(result) == 3 else {}
+    # A misspelled key would be ignored and the default it exists to replace would
+    # stand, which is the mispricing the key was added to prevent.
+    unknown = set(extras) - EXTRAS_KEYS
+    if unknown:
+        raise DeriveError(f"{model}: handler extras name {sorted(unknown)}, which "
+                          f"derive() does not read")
 
     graph: dict[str, Any] = {
         "kind": "ModelGraph",
@@ -2672,6 +4067,15 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
     if "text_config" in raw:
         graph["modality"] = "text_decoder_of_multimodal"
 
+    extra_global = extras.get("global") or {}
+    clash = set(extra_global) - EXTRA_GLOBAL_KEYS
+    if clash:
+        raise DeriveError(f"{model}: handler restates global {sorted(clash)}, which "
+                          f"derive() computes itself")
+    graph["global"].update(extra_global)
+    if "embedding" in extras:
+        graph["embedding"] = extras["embedding"]
+
     hidden = graph["global"]["hidden_size"]
     lm_head = gemm("lm_head", graph["global"]["vocab_size"], hidden)
     # An fp8 checkpoint that excludes lm_head from quantization stores it at the base
@@ -2685,10 +4089,44 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
                                         HEAD_UNQUANTIZED.get(arch, {}))
     if head_widths.get("lm_head"):
         lm_head["weight_dtype"] = head_widths["lm_head"]
-    graph["head"] = [
-        norm("final_norm"),
-        lm_head,
-    ]
+    if "head" in extras:
+        # A handler that states its own head still prices one LM head of vocab x
+        # hidden, and at the width the exclusion list gives where it gives one: two
+        # sources for one width must agree rather than the later silently winning.
+        heads = [n for n in extras["head"] if n.get("role") == "lm_head"]
+        if len(heads) != 1 or (heads[0].get("n"), heads[0].get("k")) != (
+                graph["global"]["vocab_size"], hidden):
+            raise DeriveError(f"{model}: handler head does not state one "
+                              f"{graph['global']['vocab_size']} x {hidden} lm_head")
+        if head_widths.get("lm_head") not in (None, heads[0].get("weight_dtype")):
+            raise DeriveError(
+                f"{model}: the fp8 exclusion list gives lm_head {head_widths['lm_head']} "
+                f"and the handler {heads[0].get('weight_dtype')}")
+        graph["head"] = extras["head"]
+    else:
+        graph["head"] = [norm("final_norm"), lm_head]
+
+    if ("arch_overrides" in extras) != ("base_capability_families" in extras):
+        raise DeriveError(f"{model}: arch_overrides and base_capability_families are "
+                          f"stated together or not at all")
+    for key in ("base_capability_families", "arch_overrides"):
+        if key in extras:
+            graph[key] = extras[key]
+
+    if "speculator" in extras:
+        # The handler priced the draft module itself, so the fallbacks below do not
+        # apply. It must still describe one: tokens to draft, through layer kinds the
+        # handler defined.
+        spec_extra = extras["speculator"]
+        defined = {k["id"] for k in kinds}
+        pattern = spec_extra["stack"].get("pattern") or []
+        if (int(spec_extra["num_spec_tokens"]) < 1 or not pattern
+                or not set(pattern) <= defined):
+            raise DeriveError(
+                f"{model}: handler speculator drafts {spec_extra['num_spec_tokens']} "
+                f"tokens through {pattern}, which is not a draft module")
+        graph["speculator"] = spec_extra
+        return graph
 
     spec = pick(cfg, "num_spec_tokens")
     # num_mtp_modules is NOT in the alias table: it is not a cross-family spelling of
@@ -2713,9 +4151,10 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
         mtp_vector = cfg.get("mtp_layers_block_type")
         if DRAFT_KIND_ID in defined:
             # A handler that priced the draft module itself, because the family gives it
-            # a structure no target layer shares. DeepSeek-V4 is the case in hand: its
-            # draft layer is uncompressed where every target layer is compressed, so
-            # mirroring any of them would price the wrong read.
+            # a structure no target layer shares. GLM-5.3-Flash is a case in hand
+            # (handler_glm5_next): its draft layer is sparse-MLA with its own
+            # embedding-mixing prefix, a copy of no target layer. DeepSeek-V4 and V4.1
+            # state their whole speculator in the handler's extras instead.
             pattern = [DRAFT_KIND_ID]
         elif mtp_vector:
             pattern = [n if n in defined else kinds[-1]["id"] for n in mtp_vector]
@@ -2758,17 +4197,20 @@ SPEC_METHODS = {
     "NemotronHForCausalLM": "nemotron_h_mtp",
     "InklingForConditionalGeneration": "inkling_mtp",
     "DeepseekV2ForCausalLM": "deepseek_mtp",
-    # Both verified in vLLM's own resolution rather than inferred from the family name:
-    # config/speculative.py maps model_type deepseek_v3 to deepseek_mtp alongside
-    # deepseek_v32 and glm_moe_dsa, and maps deepseek_v4 to the same method on its own
-    # branch (architectures DeepSeekMTPModel and DeepSeekV4MTPModel respectively).
+    # Verified in vLLM's own resolution rather than inferred from the family name:
+    # config/speculative.py rewrites model_type deepseek_v3 to deepseek_mtp alongside
+    # deepseek_v32 and glm_moe_dsa (architectures DeepSeekMTPModel). The method names
+    # "deepseek_mtp" here and above are v0.31.0's deprecated aliases, which it accepts
+    # and rewrites to "mtp" (:1135-1139); DeepSeek-V4 states "mtp" itself.
     "DeepseekV3ForCausalLM": "deepseek_mtp",
-    # vLLM rewrites model_type deepseek_v4 to deepseek_mtp and reads n_predict from
-    # num_nextn_predict_layers, NOT from num_mtp_modules the way MiniMax-M3 does
-    # (config/speculative.py:664-669, architectures DeepSeekV4MTPModel). The alias table
-    # already resolves that field, so this architecture needs no entry in
-    # MTP_MODULE_ARCHS.
-    "DeepseekV4ForCausalLM": "deepseek_mtp",
+    # vLLM v0.31.0 rewrites the draft config's model_type deepseek_v4 to deepseek_mtp
+    # and reads n_predict from num_nextn_predict_layers, NOT from num_mtp_modules the
+    # way MiniMax-M3 does (config/speculative.py:696-707, architectures
+    # DeepSeekV4MTPModel), so this architecture needs no entry in MTP_MODULE_ARCHS. The
+    # METHOD it serves is "mtp", which every MTP-family name is rewritten to
+    # (:1135-1139). handler_deepseek_v4 states its own speculator; this entry is the
+    # fallback's.
+    "DeepseekV4ForCausalLM": "mtp",
     "Qwen3_5MoeForConditionalGeneration": "qwen3_5_mtp",
     # vLLM rewrites model_type glm5_next to glm5_next_mtp and reads n_predict from
     # get_text_config().num_nextn_predict_layers, architectures ["Glm5NextMTPModel"]
@@ -2830,16 +4272,27 @@ def main() -> int:
         if args.model and entry.name != args.model:
             continue
         cfg = entry / "config.json"
+        # Each entry is the full line to print. A DeriveError already names the model,
+        # because derive() is also called directly and its message has to stand alone
+        # there; the other failures do not, so only they get the prefix.
         if not cfg.is_file():
-            failed.append((entry.name, "no config.json"))
+            failed.append(f"{entry.name}: no config.json")
             continue
         try:
             graph = derive(cfg, entry.name)
         except DeriveError as exc:
-            failed.append((entry.name, str(exc)))
+            why = str(exc)
+            # Every message in this file starts with the model name; one that does not
+            # still gets it, so no failure line is ever anonymous.
+            failed.append(why if why.startswith(f"{entry.name}:")
+                          else f"{entry.name}: {why}")
             continue
-        except (KeyError, ValueError, TypeError) as exc:
-            failed.append((entry.name, f"{type(exc).__name__}: {exc}"))
+        except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
+            # Any other exception is a deriver bug or a config it did not anticipate.
+            # It is recorded against this model like any failure, so one bad entry
+            # neither hides the failures already collected nor goes unattributed; the
+            # run still exits non-zero.
+            failed.append(f"{entry.name}: {type(exc).__name__}: {exc}")
             continue
 
         text = dump(graph)
@@ -2858,8 +4311,8 @@ def main() -> int:
             out.write_text(text)
             written.append(entry.name)
 
-    for name, why in failed:
-        print(f"{name}: {why}", file=sys.stderr)
+    for line in failed:
+        print(line, file=sys.stderr)
     for name, why in stale:
         print(f"{name}: {why}", file=sys.stderr)
 

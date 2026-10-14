@@ -5,7 +5,7 @@ hide:
 
 # Chips
 
-[[catalog.count.chips]] chips. Figures are nominal and per GPU. Most come from vendor datasheets; the others come from published simulator descriptors, vendor APIs or public measurements, and each file's notes say which. See [Sources](#sources). What a chip achieves in practice is a coefficient in [blis-registry](https://github.com/inference-sim/blis-registry).
+[[catalog.count.chips]] chips. Figures are nominal and per GPU. Peak rates and HBM bandwidth come from vendor datasheets. A few memory capacities and SM counts come from what a device reports, or from a vendor disclosure about the die, because no datasheet states them. Each file's notes say which. See [Sources](#sources). What a chip achieves in practice is a coefficient in [blis-registry](https://github.com/inference-sim/blis-registry).
 
 <figure markdown="1">
 [[catalog.hardware.figure]]
