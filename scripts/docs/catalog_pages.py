@@ -632,8 +632,19 @@ def networks_notes(cat: Catalog) -> str:
         for name, f in sorted(cat.fabrics.items()) if comment_notes(f))
 
 
+def is_replay(doc: dict[str, Any]) -> bool:
+    """A file whose top-level key is replay: is a replay workload, not a shape
+    (blis-schemas LoadCatalogWorkload)."""
+    return "replay" in doc
+
+
 def workload_rows(cat: Catalog) -> list[str]:
-    return sorted(cat.workloads, key=lambda w: (cat.workloads[w]["prompt"]["tokens"], w))
+    shapes = [w for w in cat.workloads if not is_replay(cat.workloads[w])]
+    return sorted(shapes, key=lambda w: (cat.workloads[w]["prompt"]["tokens"], w))
+
+
+def replay_rows(cat: Catalog) -> list[str]:
+    return sorted(w for w in cat.workloads if is_replay(cat.workloads[w]))
 
 
 def workloads_figure(cat: Catalog) -> str:
@@ -657,6 +668,36 @@ def workloads_table(cat: Catalog) -> str:
                      num(w.get("prefix_tokens", 0))])
     return table(["Workload", "Prompt mean", "sd", "range", "Output mean", "sd", "range",
                   "Shared prefix"], "lrrrrrrr", rows)
+
+
+def replays_table(cat: Catalog) -> str:
+    rows = []
+    for name in replay_rows(cat):
+        r = cat.workloads[name]["replay"]
+        src = r["corpus"]["source"]
+        corpus = (f"[{src['huggingface']}](https://huggingface.co/datasets/"
+                  f"{src['huggingface']}/tree/{src['revision']})")
+        rows.append([f"`{name}`", f"`{r['scenario']}`", r["harness_version"], corpus,
+                     f"`{src['revision'][:12]}`", num(r.get("random_seed")),
+                     num(r.get("benchmark_duration_s")), num(r.get("grace_period_s")),
+                     f"`{r.get('max_context_length', '—')}`"])
+    return table(["Workload", "Scenario", "Harness", "Corpus", "Revision", "Seed",
+                  "Duration s", "Grace s", "Max context"], "llllrrrrl", rows)
+
+
+def replays_corpus_table(cat: Catalog) -> str:
+    rows = []
+    for name in replay_rows(cat):
+        c = cat.workloads[name]["replay"]["corpus"]
+        rows.append([f"`{name}`", f"`{c['loader']}`", f"`{c['format']}`",
+                     f"`{c['source'].get('file', '—')}`", f"`{c.get('sha256', '—')}`"])
+    return table(["Workload", "Loader", "Format", "File", "SHA-256"], "lllll", rows)
+
+
+def replays_notes(cat: Catalog) -> str:
+    return "\n\n".join(
+        notes_block(f"{name}: provenance notes", comment_notes(cat.workloads[name]))
+        for name in replay_rows(cat) if comment_notes(cat.workloads[name]))
 
 
 def storage_table(cat: Catalog) -> str:
@@ -697,6 +738,10 @@ def fragments(cat: Catalog) -> dict[str, str]:
         "networks.notes": networks_notes(cat),
         "workloads.figure": workloads_figure(cat),
         "workloads.table": workloads_table(cat),
+        "count.replays": str(len(replay_rows(cat))),
+        "workloads.replays": replays_table(cat),
+        "workloads.replays_corpus": replays_corpus_table(cat),
+        "workloads.replays_notes": replays_notes(cat),
         "storage.table": storage_table(cat),
     }
 

@@ -16,7 +16,7 @@ This site documents [[catalog.release]].
 | [`models/`](reference/models/index.md) | Models: the vendor's `config.json`, where it came from, and the model graph derived from it | [[catalog.count.models]] |
 | [`hardware/`](reference/hardware.md) | Chips: peak rates, memory, intra-node bandwidth | [[catalog.count.chips]] |
 | [`networks/`](reference/networks.md) | Fabrics: what an inter-node network can carry | [[catalog.count.fabrics]] |
-| [`workloads/`](reference/workloads.md) | Workloads: distributions of prompt and output length | [[catalog.count.workloads]] |
+| [`workloads/`](reference/workloads.md) | Workloads: distributions of prompt and output length, and trace-replay scenarios | [[catalog.count.workloads]] |
 | [`devices/`](reference/storage.md) | Storage tiers: where a KV cache can be offloaded, and at what cost | [[catalog.count.tiers]] |
 
 The catalog is plain YAML and JSON. Reading it needs no tools.

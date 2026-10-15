@@ -61,7 +61,7 @@ A model entry is the directory `models/<name>/`, holding three files.
 
 ## Workloads
 
-`workloads/<name>.yaml`, one workload per file. All values are tokens per request.
+`workloads/<name>.yaml`, one workload per file, in one of two forms. A file whose top-level key is `replay:` is a [replay workload](#replay-workloads); any other is a shape, below. All values in a shape are tokens per request.
 
 | Key | Required | Meaning |
 | :--- | :--- | :--- |
@@ -70,6 +70,10 @@ A model entry is the directory `models/<name>/`, holding three files.
 | `prompt.tokens_stdev` | no | standard deviation; not negative |
 | `prompt.tokens_min`, `prompt.tokens_max` | no | bounds; the mean lies between those given |
 | `output.*` | | the same four keys, for the output |
+
+### Replay workloads
+
+A replay workload states, under `replay:`, a trace-replay scenario the blis-schemas `workload.ReplayDefinition` type defines: `scenario`, `harness_version`, a `corpus` (`loader`, `format`, `encoding`, `source.huggingface`, `source.revision`, and optionally `source.file`, `source.split` and `sha256`), and the scenario's settings (`random_seed`, `benchmark_duration_s`, `grace_period_s`, `max_context_length`, the keys the scenario locks, and the acceptance selectors `category` and `thinking`). It states no `concurrency`: a scenario that binds the workload states it. Comment keys are accepted at the top level only. The schema refuses any value the harness's own scenario validator would refuse, such as a duration below 900 s for `inferencex-agentx-mvp`.
 
 ## Storage tiers
 

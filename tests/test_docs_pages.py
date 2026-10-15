@@ -147,3 +147,24 @@ def test_svg_is_well_formed(cat):
                 pages.layer_strip(cat.models[0])):
         ET.fromstring(svg)  # raises on malformed markup
         assert not re.search(r"\bnan\b|\binf\b", svg)
+
+
+def test_workloads_split_into_shapes_and_replays(cat):
+    # A replay workload has no prompt or output distribution, so it must stay out of the
+    # shape figure and table, and every file must land in exactly one of the two.
+    shapes, replays = pages.workload_rows(cat), pages.replay_rows(cat)
+    assert sorted(shapes + replays) == sorted(cat.workloads)
+    assert "agentx-mvp" in replays and "agentx-mvp" not in shapes
+    assert len(pages.workloads_table(cat).splitlines()[2:]) == len(shapes)
+
+
+def test_replay_tables_restate_the_corpus_pin(cat):
+    rows = pages.replays_table(cat).splitlines()[2:]
+    assert len(rows) == len(pages.replay_rows(cat))
+    corpus = pages.replays_corpus_table(cat)
+    for name in pages.replay_rows(cat):
+        c = cat.workloads[name]["replay"]["corpus"]
+        assert f"/tree/{c['source']['revision']})" in pages.replays_table(cat)
+        assert c["sha256"] in corpus
+    notes = pages.replays_notes(cat)
+    assert "Apache-2.0" in notes and "build_weka_hf_dataset.py" in notes

@@ -32,7 +32,8 @@ blis-catalog/
 ├── networks/                   # WHAT AN INTER-NODE FABRIC CAN DO — one file per reusable fabric class
 │   ├── ib-400g.yaml  roce-200g.yaml  ethernet-100gbe.yaml
 ├── workloads/                  # WHAT TRAFFIC LOOKS LIKE
-│   ├── chatbot.yaml  summarization.yaml  contentgen.yaml  multidoc.yaml
+│   ├── chatbot.yaml  summarization.yaml  contentgen.yaml  multidoc.yaml   # shapes
+│   └── agentx-mvp.yaml          # a replay workload: a trace-replay scenario over a pinned corpus
 └── devices/                    # WHAT A STORAGE TIER CAN DO
     └── storage.yaml            # nvme_gen4, nvme_gen3, sata_ssd, cpu_dram, s3
 ```
