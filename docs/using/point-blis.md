@@ -65,7 +65,7 @@ On the kernel backend, inference-sim itself also reads three kinds of catalog fi
 
 | inference-sim reads | When |
 | :--- | :--- |
-| `workloads/<name>.yaml` | a run names a workload preset with `--workload` |
+| `workloads/<name>.yaml` | a run names a workload shape with `--workload` (a replay workload is bound through a scenario instead) |
 | `devices/storage.yaml` | KV-cache offload names a storage tier |
 | `models/<name>/config.json` | a disaggregated (prefill/decode) run |
 

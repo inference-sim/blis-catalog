@@ -31,7 +31,12 @@ jobs:
         # fails naming the file when an entry is malformed. Nothing here re-implements
         # a rule — pinned by version so the gate is reproducible and bumping it is a
         # one-line change.
-        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.3.0 .
+        # TODO(#34): workloads/agentx-mvp.yaml is a replay workload, which v0.3.0
+        # rejects. Until blis-schemas tags a release carrying inference-sim/blis-schemas#71,
+        # this pins the Go pseudo-version of blis-schemas PR #74's head, 4f2dd14
+        # (the docs generator links a pseudo-version's commit). DO NOT MERGE on a
+        # pseudo-version: a release TAG carrying #71 is required before merge.
+        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.3.1-0.20261015202052-4f2dd141a893 .
 
   derive-graph:
     name: check derived graphs

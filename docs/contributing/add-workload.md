@@ -29,6 +29,30 @@ Set the bounds with care. Two workloads with the same means but different tails 
 
 To record where the numbers came from, such as a benchmark or a published trace, add a `_comment` key at the top level or inside `prompt:` or `output:`.
 
+## A replay workload
+
+A workload that a load generator replays from a published corpus, rather than draws from distributions, is a replay workload. Its file's top-level key is `replay:`, and it states what the harness runs: the scenario, the harness release, the corpus pinned by repository, revision and SHA-256, and the scenario's settings. It states no `concurrency`, which each run chooses. `workloads/agentx-mvp.yaml` is the example:
+
+```yaml
+replay:
+  scenario: inferencex-agentx-mvp
+  harness_version: 0.12.0
+  corpus:
+    loader: semianalysis_cc_traces_weka_062126_256k
+    format: weka-trace-v7
+    encoding: jsonl
+    source:
+      huggingface: semianalysisai/cc-traces-weka-062126-256k
+      revision: 8fecd2fc56694469f758f0afbbb6335ad3043740   # a commit, never a branch
+      file: traces.jsonl
+    sha256: e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef
+  random_seed: 42
+  benchmark_duration_s: 900
+  max_context_length: max_model_len
+```
+
+Do not commit the corpus; a consumer fetches it at the revision and checks the digest. Record its license, the script that built it and its own published statistics in top-level `_comment` keys. The validator refuses any setting the harness's scenario validator would refuse; blis-schemas' [workload reference]([[catalog.schemas_tree]]/docs/reference/workload.md) lists the keys.
+
 ## Then
 
 Run the [checks](checks.md) and open a pull request that cites the source of the numbers.
