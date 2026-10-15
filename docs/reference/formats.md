@@ -84,3 +84,7 @@ A replay workload states, under `replay:`, a trace-replay scenario the blis-sche
 | `read_bandwidth_mb_s` | MB/s | sustained read bandwidth; positive |
 | `write_bandwidth_mb_s` | MB/s | sustained write bandwidth; positive |
 | `base_latency_us` | µs | fixed cost of one transfer; positive |
+
+## Measured runs
+
+`measurements/sources.yaml` is the licence registry: one entry per source a run may cite, with its `status` (`verified`, `unverified` or `refused`), the uses its terms permit (`score`, `derive_coefficients`, `redistribute`; none unless verified) and quoted evidence. `measurements/<license_ref>/<name>.yaml` is one measured run, a blis-schemas `measurement.MeasuredRun`: its source and every input's sha256, the measured model, engine version, cluster, deployment and workload where stated, metric definitions, load-ordered points, provenance rows and differences. Its verdict is recomputed by the gate and must match. A committed run must cite a source that permits `redistribute`. These are third-party measurements recorded with their provenance; nothing here is fitted.
