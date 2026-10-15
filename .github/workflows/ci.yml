@@ -33,10 +33,10 @@ jobs:
         # one-line change.
         # TODO(#34): workloads/agentx-mvp.yaml is a replay workload, which v0.3.0
         # rejects. Until blis-schemas tags a release carrying inference-sim/blis-schemas#71,
-        # this pins the Go pseudo-version of blis-schemas PR #74's head, 9685411
+        # this pins the Go pseudo-version of blis-schemas PR #74's head, 323204d
         # (the docs generator links a pseudo-version's commit). DO NOT MERGE on a
         # pseudo-version: a release TAG carrying #71 is required before merge.
-        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.3.1-0.20261015034608-968541158c8f .
+        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.3.1-0.20261015043604-323204d809fa .
 
   derive-graph:
     name: check derived graphs

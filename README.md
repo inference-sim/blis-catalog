@@ -187,7 +187,7 @@ CI validates every committed entry by running that owner's binary against the
 checkout, pinned by version:
 
 ```sh
-go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.3.1-0.20261015034608-968541158c8f .
+go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.3.1-0.20261015043604-323204d809fa .
 ```
 
 It walks all five namespaces (`models/`, `hardware/`, `networks/`, `workloads/`,
