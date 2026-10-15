@@ -2413,7 +2413,10 @@ def handler_deepseek_v41(cfg, raw, model):
       * prefill's gather of each layer's own window records into the BF16 workspace,
         query_len + min(prefix, window - 1) entries per request (nvidia/flashmla.py:
         315-325; sparse_swa.py:366-371), about 1.6 KB per prefill token a layer: it
-        grows with the chunk, not the context, and no context field states that;
+        grows with the chunk, not the context, and no context field states that. A
+        per-request `context` read of `swa` is charged over the whole context
+        (computed + scheduled), which on the last 8K chunk of a 100K-token prompt
+        states 12x the window-bounded gather (inference-sim/blis-catalog#33);
       * Engram's DP-sharded path: with DP > 1 and /dev/shm too small for the ~189 GiB
         of tables, they shard over TP x DP and the hashes and rows are exchanged over
         the engram DP group (nvidia/engram.py:104-159, 408-424, 490-496;
