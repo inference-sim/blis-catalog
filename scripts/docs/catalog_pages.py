@@ -41,6 +41,8 @@ import yaml
 
 REPO_URL = "https://github.com/inference-sim/blis-catalog"
 SCHEMAS_URL = "https://github.com/inference-sim/blis-schemas"
+# A tag (v0.3.0) or a Go pseudo-version (v0.0.0-20261014221549-81166a9b9ec3).
+PIN_PATTERN = r"cmd/validate-catalog@(v[0-9][^\s]*)"
 HF_URL = "https://huggingface.co"
 
 MODELS_DIR = "reference/models"
@@ -173,7 +175,7 @@ def load(root: Path) -> Catalog:
         root=root,
         release=release,
         ref=release or "main",
-        validate_pin=_first_match(r"cmd/validate-catalog@(v[0-9][^\s]*)",
+        validate_pin=_first_match(PIN_PATTERN,
                                   root / ".github/workflows/ci.yml",
                                   "the pinned validate-catalog version"),
         deriver_version=_first_match(r"^DERIVER_VERSION = (\d+)$",
@@ -670,6 +672,11 @@ def workloads_table(cat: Catalog) -> str:
                   "Shared prefix"], "lrrrrrrr", rows)
 
 
+def code(v: Any) -> str:
+    """A stated value in code type, or a dash for an unstated one."""
+    return "—" if v is None else f"`{v}`"
+
+
 def replays_table(cat: Catalog) -> str:
     rows = []
     for name in replay_rows(cat):
@@ -680,7 +687,7 @@ def replays_table(cat: Catalog) -> str:
         rows.append([f"`{name}`", f"`{r['scenario']}`", r["harness_version"], corpus,
                      f"`{src['revision'][:12]}`", num(r.get("random_seed")),
                      num(r.get("benchmark_duration_s")), num(r.get("grace_period_s")),
-                     f"`{r.get('max_context_length', '—')}`"])
+                     code(r.get("max_context_length"))])
     return table(["Workload", "Scenario", "Harness", "Corpus", "Revision", "Seed",
                   "Duration s", "Grace s", "Max context"], "llllrrrrl", rows)
 
@@ -690,7 +697,7 @@ def replays_corpus_table(cat: Catalog) -> str:
     for name in replay_rows(cat):
         c = cat.workloads[name]["replay"]["corpus"]
         rows.append([f"`{name}`", f"`{c['loader']}`", f"`{c['format']}`",
-                     f"`{c['source'].get('file', '—')}`", f"`{c.get('sha256', '—')}`"])
+                     code(c["source"].get("file")), code(c.get("sha256"))])
     return table(["Workload", "Loader", "Format", "File", "SHA-256"], "lllll", rows)
 
 
@@ -708,6 +715,17 @@ def storage_table(cat: Catalog) -> str:
     return table(["Tier", "Read MB/s", "Write MB/s", "Base latency µs"], "lrrr", rows)
 
 
+PSEUDO_VERSION = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+-(?:.*[.-])?[0-9]{14}-([0-9a-f]{12})$")
+
+
+def schemas_ref(pin: str) -> str:
+    """The blis-schemas ref a validate-catalog pin names on GitHub: the tag itself, or,
+    for a Go pseudo-version (v0.0.0-20261014221549-81166a9b9ec3), its commit, since no
+    tag of that name exists."""
+    m = PSEUDO_VERSION.match(pin)
+    return m.group(1) if m else pin
+
+
 def release_text(cat: Catalog) -> str:
     if cat.release:
         return f"release [{cat.release}]({REPO_URL}/releases/tag/{cat.release})"
@@ -721,7 +739,7 @@ def fragments(cat: Catalog) -> dict[str, str]:
         "ref": cat.ref,
         "validate_pin": cat.validate_pin,
         "deriver_version": cat.deriver_version,
-        "schemas_tree": f"{SCHEMAS_URL}/tree/{cat.validate_pin}",
+        "schemas_tree": f"{SCHEMAS_URL}/tree/{schemas_ref(cat.validate_pin)}",
         "count.models": str(len(cat.models)),
         "count.chips": str(len(cat.chips)),
         "count.fabrics": str(len(cat.fabrics)),
