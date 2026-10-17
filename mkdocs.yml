@@ -104,6 +104,7 @@ nav:
       - Add a workload: contributing/add-workload.md
       - Checks and CI: contributing/checks.md
       - Releasing and the docs site: contributing/releasing.md
+      - Changes across the repositories: contributing/cross-repo-changes.md
   - Concepts:
       - concepts/index.md
       - The catalog in BLIS: concepts/repositories.md
