@@ -40,7 +40,7 @@ A model entry is the directory `models/<name>/`, holding three files.
 | `TFlopsFP8` | TFLOP/s | always written | dense FP8 peak; `0` on a chip without native FP8, otherwise greater than `TFlopsPeak` |
 | `TFlopsNVFP4` | TFLOP/s | no | dense NVFP4 peak; omitted where the format is not native |
 | `BwPeakTBs` | TB/s | yes | HBM bandwidth; positive |
-| `MemoryGiB` | GiB | yes | device memory, positive: the total the CUDA driver reports (what vLLM's `gpu_memory_utilization` multiplies) where a public log states it (h100, h200, each cited in `_comment_memory`), otherwise the datasheet HBM capacity |
+| `MemoryGiB` | GiB | yes | device memory, positive: the total the CUDA driver reports (what vLLM's `gpu_memory_utilization` multiplies) where a public log or NVIDIA device dump states it (h100, h200, b200, b300, gb200-nvl72, gb300, each cited in `_comment_memory`), otherwise the datasheet HBM capacity |
 | `IntraNodeBwGBps` | GB/s | yes | intra-node link (NVLink where present), one direction; positive |
 | `SMCount` | count | yes | streaming multiprocessors enabled on this chip; positive |
 | `GPUsPerNode` | count | no | GPUs in one node; stated only for rack-scale chips |
