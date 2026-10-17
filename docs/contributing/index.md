@@ -27,5 +27,6 @@ Maintainers tag releases on `main`; [Releasing and the docs site](releasing.md) 
 
 - **A new field, or a new rule about an existing field**, belongs in [blis-schemas](https://github.com/inference-sim/blis-schemas), which defines the format of every catalog file. The catalog adopts it by raising the validator version its CI pins.
 - **A new way of pricing something** belongs in [blis-latency-kernel](https://github.com/inference-sim/blis-latency-kernel).
+- **A change that spans several repositories** follows [Changes across the repositories](cross-repo-changes.md), which links the canonical process and lists the catalog's own steps.
 
 A new model architecture built from operations the schemas already define needs neither. It needs a handler in this repository's deriver; see [Add a model](add-model.md#if-the-architecture-is-new).
