@@ -1467,6 +1467,16 @@ EXPECTED_IDENTICAL = {
         "scorers and their projections per forward pass — so grouping it here would "
         "assert away the very distinction the indexer-frequency derivation exists to "
         "capture",
+    frozenset({"deepseek-v3", "deepseek-r1-0528"}):
+        "one checkpoint geometry: DeepSeek-R1-0528 is a post-trained DeepSeek-V3 whose "
+        "config.json differs from V3's only in transformers_version",
+    frozenset({"kimi-k2.5", "kimi-k2.6"}):
+        "one checkpoint geometry: Kimi-K2.6's config.json differs from K2.5's only in "
+        "eos_token_id (163585 against 163586), which the cost model does not read",
+    frozenset({"qwen3.5-397b-a17b", "qwen3.5-397b-a17b-fp8"}):
+        "one architecture in two checkpoints: the FP8 release adds a quantization_config "
+        "(block fp8) and differs in nothing else the cost model reads; the signature "
+        "compares node shapes, not the global weight width, as for glm-5.2 and glm-5.2-fp8",
     frozenset({"llama-2-70b-hf", "llama-3.1-70b-instruct"}):
         "identical compute shapes; they differ in vocab, context length and rope theta",
 }
