@@ -25,3 +25,5 @@ The consumers pin the catalog by commit, so a catalog change reaches them only w
 Name each of those in the pull request's dependency table. A changed figure that alters a
 published estimate (a memory size, a bandwidth, a derived graph) needs the held-out evidence
 the canonical page requires, measured on a build that vendors this catalog's pushed head.
+
+A private-names check (`.github/workflows/private-names.yml`) reads its pattern from a repository secret and fails a pull request whose files, paths, commit messages, title or body match it.
