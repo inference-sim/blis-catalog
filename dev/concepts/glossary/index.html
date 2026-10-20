@@ -593,6 +593,8 @@
       
         
       
+        
+      
     
     
     
@@ -774,6 +776,34 @@
     
   
     Releasing and the docs site
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/cross-repo-changes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changes across the repositories
   
 
     
@@ -1462,7 +1492,7 @@
 <dt>Storage tier</dt>
 <dd>A place a KV cache can be offloaded to, such as CPU memory or an NVMe drive, described by an entry in <code>devices/storage.yaml</code>.</dd>
 <dt>Workload</dt>
-<dd>The distribution of request lengths, prompt and output, described by a file in <code>workloads/</code>. It does not include the arrival rate.</dd>
+<dd>The distribution of request lengths, prompt and output, described by a file in <code>workloads/</code>. It does not include the arrival rate. A replay workload in the same directory instead names a load generator's trace-replay scenario over a pinned corpus, and leaves the lane count to each run.</dd>
 </dl>
 <h2 id="model-graphs">Model graphs<a class="headerlink" href="#model-graphs" title="Permanent link">&para;</a></h2>
 <dl>

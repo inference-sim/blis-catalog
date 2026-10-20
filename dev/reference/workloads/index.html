@@ -593,6 +593,8 @@
       
         
       
+        
+      
     
     
     
@@ -774,6 +776,34 @@
     
   
     Releasing and the docs site
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/cross-repo-changes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changes across the repositories
   
 
     
@@ -1200,6 +1230,24 @@
         
       
       
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workloads
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
       <a href="./" class="md-nav__link md-nav__link--active">
         
   
@@ -1216,6 +1264,64 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#shapes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Shapes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#replay-workloads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Replay workloads
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Replay workloads">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#sources" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sources
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
       
     </li>
   
@@ -1277,6 +1383,53 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#shapes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Shapes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#replay-workloads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Replay workloads
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Replay workloads">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#sources" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sources
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1293,7 +1446,8 @@
 
 
 <h1 id="workloads">Workloads<a class="headerlink" href="#workloads" title="Permanent link">&para;</a></h1>
-<p>4 workloads. A workload says how long requests are, not how many arrive; the arrival rate or concurrency is set by each run.</p>
+<p>5 workloads, in two forms. A <strong>shape</strong> says how long requests are, not how many arrive; the arrival rate or concurrency is set by each run. A <strong>replay workload</strong> names a load generator's trace-replay scenario over a pinned corpus; the corpus decides the requests, and each run sets the number of lanes.</p>
+<h2 id="shapes">Shapes<a class="headerlink" href="#shapes" title="Permanent link">&para;</a></h2>
 <figure>
 <div class="cf-scroll"><svg class="cf-figure" viewBox="0 0 668 164" role="img" aria-label="Prompt and output token distributions for each workload, on a log scale" xmlns="http://www.w3.org/2000/svg"><title>Prompt and output token distributions for each workload, on a log scale</title><text class="cf-label" x="94" y="51.0" text-anchor="end">chatbot</text><text class="cf-label" x="94" y="77.0" text-anchor="end">contentgen</text><text class="cf-label" x="94" y="103.0" text-anchor="end">summarization</text><text class="cf-label" x="94" y="129.0" text-anchor="end">multidoc</text><text class="cf-title" x="104" y="14">Prompt tokens</text><line class="cf-grid" x1="104.0" x2="104.0" y1="28" y2="142"/><text class="cf-tick" x="104.0" y="156" text-anchor="middle">1</text><line class="cf-grid" x1="154.0" x2="154.0" y1="28" y2="142"/><text class="cf-tick" x="154.0" y="156" text-anchor="middle">10</text><line class="cf-grid" x1="204.0" x2="204.0" y1="28" y2="142"/><text class="cf-tick" x="204.0" y="156" text-anchor="middle">100</text><line class="cf-grid" x1="254.0" x2="254.0" y1="28" y2="142"/><text class="cf-tick" x="254.0" y="156" text-anchor="middle">1k</text><line class="cf-grid" x1="304.0" x2="304.0" y1="28" y2="142"/><text class="cf-tick" x="304.0" y="156" text-anchor="middle">10k</text><line class="cf-grid" x1="354.0" x2="354.0" y1="28" y2="142"/><text class="cf-tick" x="354.0" y="156" text-anchor="middle">100k</text><line class="cf-range" x1="119.1" x2="249.2" y1="47.0" y2="47.0"/><line class="cf-spread" x1="213.7" x2="231.6" y1="47.0" y2="47.0"/><circle class="cf-dot" cx="224.4" cy="47.0" r="4"><title>chatbot: mean 256, stdev 100, min 2, max 800</title></circle><line class="cf-range" x1="154.0" x2="269.6" y1="73.0" y2="73.0"/><line class="cf-spread" x1="251.1" x2="257.5" y1="73.0" y2="73.0"/><circle class="cf-dot" cx="254.5" cy="73.0" r="4"><title>contentgen: mean 1 024, stdev 150, min 10, max 2 048</title></circle><line class="cf-range" x1="204.0" x2="299.7" y1="99.0" y2="99.0"/><line class="cf-spread" x1="281.8" x2="287.1" y1="99.0" y2="99.0"/><circle class="cf-dot" cx="284.6" cy="99.0" r="4"><title>summarization: mean 4 096, stdev 500, min 100, max 8 192</title></circle><line class="cf-range" x1="238.9" x2="319.6" y1="125.0" y2="125.0"/><line class="cf-spread" x1="301.8" x2="306.9" y1="125.0" y2="125.0"/><circle class="cf-dot" cx="304.5" cy="125.0" r="4"><title>multidoc: mean 10 240, stdev 1 200, min 500, max 20 480</title></circle><text class="cf-title" x="402" y="14">Output tokens</text><line class="cf-grid" x1="402.0" x2="402.0" y1="28" y2="142"/><text class="cf-tick" x="402.0" y="156" text-anchor="middle">1</text><line class="cf-grid" x1="452.0" x2="452.0" y1="28" y2="142"/><text class="cf-tick" x="452.0" y="156" text-anchor="middle">10</text><line class="cf-grid" x1="502.0" x2="502.0" y1="28" y2="142"/><text class="cf-tick" x="502.0" y="156" text-anchor="middle">100</text><line class="cf-grid" x1="552.0" x2="552.0" y1="28" y2="142"/><text class="cf-tick" x="552.0" y="156" text-anchor="middle">1k</text><line class="cf-grid" x1="602.0" x2="602.0" y1="28" y2="142"/><text class="cf-tick" x="602.0" y="156" text-anchor="middle">10k</text><line class="cf-grid" x1="652.0" x2="652.0" y1="28" y2="142"/><text class="cf-tick" x="652.0" y="156" text-anchor="middle">100k</text><line class="cf-range" x1="402.0" x2="552.5" y1="47.0" y2="47.0"/><line class="cf-spread" x1="511.7" x2="529.6" y1="47.0" y2="47.0"/><circle class="cf-dot" cx="522.4" cy="47.0" r="4"><title>chatbot: mean 256, stdev 100, min 1, max 1 024</title></circle><line class="cf-range" x1="452.0" x2="567.6" y1="73.0" y2="73.0"/><line class="cf-spread" x1="547.8" x2="556.4" y1="73.0" y2="73.0"/><circle class="cf-dot" cx="552.5" cy="73.0" r="4"><title>contentgen: mean 1 024, stdev 200, min 10, max 2 048</title></circle><line class="cf-range" x1="452.0" x2="567.6" y1="99.0" y2="99.0"/><line class="cf-spread" x1="529.9" x2="543.0" y1="99.0" y2="99.0"/><circle class="cf-dot" cx="537.5" cy="99.0" r="4"><title>summarization: mean 512, stdev 150, min 10, max 2 048</title></circle><line class="cf-range" x1="486.9" x2="582.6" y1="125.0" y2="125.0"/><line class="cf-spread" x1="556.6" x2="565.2" y1="125.0" y2="125.0"/><circle class="cf-dot" cx="561.3" cy="125.0" r="4"><title>multidoc: mean 1 536, stdev 300, min 50, max 4 096</title></circle></svg></div>
 <figcaption>Tokens per request, on a logarithmic scale. The thin line spans the stated minimum to maximum, the thick bar one standard deviation either side of the mean (clipped to those bounds), and the dot marks the mean.</figcaption>
@@ -1355,6 +1509,60 @@
 </tbody>
 </table>
 <p>A file states a mean, a standard deviation and bounds, not the form of the distribution. That is the sampler's choice: inference-sim draws from a normal distribution with the stated mean and standard deviation, clamped to the bounds.</p>
+<h2 id="replay-workloads">Replay workloads<a class="headerlink" href="#replay-workloads" title="Permanent link">&para;</a></h2>
+<p>Replay workloads in this release: 1. A file whose top-level key is <code>replay:</code> states the scenario, the harness release it reproduces, the corpus by repository, revision and digest, and the scenario's settings. It does not state a lane count (<code>concurrency</code>): a scenario that binds the workload states it, with <code>replay: {workload: &lt;name&gt;, concurrency: C}</code>.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Workload</th>
+<th style="text-align: left;">Scenario</th>
+<th style="text-align: left;">Harness</th>
+<th style="text-align: left;">Corpus</th>
+<th style="text-align: right;">Revision</th>
+<th style="text-align: right;">Seed</th>
+<th style="text-align: right;">Duration s</th>
+<th style="text-align: right;">Grace s</th>
+<th style="text-align: left;">Max context</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>agentx-mvp</code></td>
+<td style="text-align: left;"><code>inferencex-agentx-mvp</code></td>
+<td style="text-align: left;">0.12.0</td>
+<td style="text-align: left;"><a href="https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k/tree/8fecd2fc56694469f758f0afbbb6335ad3043740">semianalysisai/cc-traces-weka-062126-256k</a></td>
+<td style="text-align: right;"><code>8fecd2fc5669</code></td>
+<td style="text-align: right;">42</td>
+<td style="text-align: right;">900</td>
+<td style="text-align: right;">30</td>
+<td style="text-align: left;"><code>max_model_len</code></td>
+</tr>
+</tbody>
+</table>
+<p>The corpus is not in the catalog. A consumer fetches the file at the stated revision and checks its SHA-256 before replaying it.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">Workload</th>
+<th style="text-align: left;">Loader</th>
+<th style="text-align: left;">Format</th>
+<th style="text-align: left;">File</th>
+<th style="text-align: left;">SHA-256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>agentx-mvp</code></td>
+<td style="text-align: left;"><code>semianalysis_cc_traces_weka_062126_256k</code></td>
+<td style="text-align: left;"><code>weka-trace-v7</code></td>
+<td style="text-align: left;"><code>traces.jsonl</code></td>
+<td style="text-align: left;"><code>e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="sources">Sources<a class="headerlink" href="#sources" title="Permanent link">&para;</a></h3>
+<p>Each replay file records its provenance in its <code>_comment</code> keys. They are reproduced here as written.</p>
+<details class="quote"><summary>agentx-mvp: provenance notes</summary><p><code>_comment</code> Provenance: the agentic workload our calibration runs benchmark with, aiperf 0.12.0 --scenario inferencex-agentx-mvp over the public-dataset alias semianalysis_cc_traces_weka_062126_256k (inference-sim/blis-catalog#34). The corpus is not vendored: a consumer fetches traces.jsonl from the Hugging Face dataset semianalysisai/cc-traces-weka-062126-256k at the pinned revision and checks it against sha256 before replaying it. A real aiperf 0.12.0 run does not pin the revision: the alias&#x27;s plugin metadata sets hf_dataset_name and hf_split but no hf_revision (plugin/plugins.yaml:2429-2447), so the loader reads the dataset&#x27;s HEAD (dataset/loader/base_hf_dataset.py:77), and aiperf exposes no CLI flag to override it (--tokenizer-revision is the tokenizer&#x27;s). A run that claims this workload must therefore check the downloaded traces.jsonl against sha256. The lane count (aiperf --concurrency) is each run&#x27;s choice, so it is stated where the workload is bound, not here.</p><p><code>_comment_corpus</code> Corpus: Apache-2.0, ungated. traces.jsonl is 568,864,747 bytes. The dataset&#x27;s stats.txt at the pinned revision states 393 traces, 28,444 main turns, 1,697 subagent groups, 39,822 subagent inner requests, 68,266 model requests, 6,891,228,864 input tokens and 58,728,807 output tokens. Its README.md says it was built on 2026-06-21 by utils/agentic/build_weka_hf_dataset.py from semianalysisai/cc-traces-weka-062126 (SemiAnalysis Claude Code proxy traces, trace version 7 only), capping each request at 256,000 input + output tokens.</p><p><code>_comment_run</code> Run settings, as our calibration runs use them: random_seed 42 (aiperf alone would draw a random seed); benchmark_duration_s 900, the scenario&#x27;s floor (its default is 1800); grace_period_s 30, aiperf&#x27;s --benchmark-grace-period default, which the scenario does not set; max_context_length max_model_len, the deployment&#x27;s resolved --max-model-len, which drops every trace whose recorded peak prompt plus output exceeds it.</p><p><code>_comment_locked</code> cache_bust, system_idle_gap_cap_s, trajectory_start, warmup and split_flattened_agents are stated at the values aiperf 0.12.0 applies under the scenario (common/scenario/inferencex_agentx_mvp.py; common/environment.py WEKA_SPLIT_FLATTENED_AGENTS), so the file reads as the whole run. category coding is the corpus plugin&#x27;s default_prompt_corpus, and thinking on is the THINKING_MODE InferenceX&#x27;s benchmark workflows set (InferenceX 9fa76586 .github/workflows/benchmark-tmpl.yml:96), which its launcher requires for speculative AgentX throughput runs (inferencex-e2e/infx/launch/request.py:141-146); together they select the acceptance profile.</p></details>
 
 
 
