@@ -1467,6 +1467,16 @@ EXPECTED_IDENTICAL = {
         "scorers and their projections per forward pass — so grouping it here would "
         "assert away the very distinction the indexer-frequency derivation exists to "
         "capture",
+    frozenset({"deepseek-v3", "deepseek-r1-0528"}):
+        "one checkpoint geometry: DeepSeek-R1-0528 is a post-trained DeepSeek-V3 whose "
+        "config.json differs from V3's only in transformers_version",
+    frozenset({"kimi-k2.5", "kimi-k2.6"}):
+        "one checkpoint geometry: Kimi-K2.6's config.json differs from K2.5's only in "
+        "eos_token_id (163585 against 163586), which the cost model does not read",
+    frozenset({"qwen3.5-397b-a17b", "qwen3.5-397b-a17b-fp8"}):
+        "one architecture in two checkpoints: the FP8 release adds a quantization_config "
+        "(block fp8) and differs in nothing else the cost model reads; the signature "
+        "compares node shapes, not the global weight width, as for glm-5.2 and glm-5.2-fp8",
     frozenset({"llama-2-70b-hf", "llama-3.1-70b-instruct"}):
         "identical compute shapes; they differ in vocab, context length and rope theta",
 }
@@ -5559,3 +5569,35 @@ def test_derive_refuses_a_head_width_that_contradicts_the_exclusion_list(
             tmp_path, monkeypatch, ({"head": head},),
             quantization_config={"quant_method": "fp8",
                                  "modules_to_not_convert": ["lm_head"]})
+
+
+def test_m3_indexer_states_its_own_bf16_key_cache():
+    """vLLM keeps a key-only indexer cache beside every sparse layer's full K/V.
+
+    MiniMaxM3IndexerCache registers one head of sparse_index_dim per token, stored at
+    bf16 unless indexer_kv_dtype says otherwise (models/minimax_m3/common/indexer.py,
+    v0.31.0). Without it the graph holds 14,592 B a token fewer than the server and
+    BLIS's pool came out 1.5-2.0x the logged "GPU KV cache size"."""
+    g, t = _m3()
+    idx = [n for k in g["layer_kinds"] for n in k["nodes"]
+           if n.get("role") == "block_index_scores"]
+    assert idx
+    for n in idx:
+        caches = n.get("caches") or []
+        assert [(c["kind"], c["owned"], c["bytes_per_entry"]) for c in caches] == [
+            ("index", True, 2 * t["sparse_attention_config"]["sparse_index_dim"])]
+
+
+def test_w4a16_group_scales_are_resident():
+    """compressed-tensors WNA16 keeps one params_dtype scale per group_size weights.
+
+    Kimi-K2.5 is int4 at group 32 with bf16 scales (compressed_tensors_moe_wna16.py,
+    v0.31.0): 1/16 B a parameter that an int4 format with no stated scale leaves out,
+    which the KV pool then absorbs."""
+    for name in ("kimi-k2.5", "kimi-k2.6"):
+        d = ROOT / "models" / name
+        if not d.is_dir():
+            continue
+        g = graph_of(d)
+        assert g["global"]["weight_dtype"] == "int4"
+        assert g["global"].get("weight_scale") == {"elements": 32, "bytes": 2}, name

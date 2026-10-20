@@ -147,3 +147,47 @@ def test_svg_is_well_formed(cat):
                 pages.layer_strip(cat.models[0])):
         ET.fromstring(svg)  # raises on malformed markup
         assert not re.search(r"\bnan\b|\binf\b", svg)
+
+
+def test_workloads_split_into_shapes_and_replays(cat):
+    # A replay workload has no prompt or output distribution, so it must stay out of the
+    # shape figure and table, and every file must land in exactly one of the two.
+    shapes, replays = pages.workload_rows(cat), pages.replay_rows(cat)
+    assert sorted(shapes + replays) == sorted(cat.workloads)
+    assert "agentx-mvp" in replays and "agentx-mvp" not in shapes
+    assert len(pages.workloads_table(cat).splitlines()[2:]) == len(shapes)
+
+
+def test_replay_tables_restate_the_corpus_pin(cat):
+    rows = pages.replays_table(cat).splitlines()[2:]
+    assert len(rows) == len(pages.replay_rows(cat))
+    corpus = pages.replays_corpus_table(cat)
+    for name in pages.replay_rows(cat):
+        c = cat.workloads[name]["replay"]["corpus"]
+        assert f"/tree/{c['source']['revision']})" in pages.replays_table(cat)
+        # sha256 is optional in the schema; the table shows a dash without one.
+        assert c.get("sha256", "—") in corpus
+
+
+def test_agentx_mvp_notes_carry_its_provenance(cat):
+    notes = pages.replays_notes(cat)
+    assert "agentx-mvp: provenance notes" in notes
+    assert "Apache-2.0" in notes and "build_weka_hf_dataset.py" in notes
+
+
+@pytest.mark.parametrize("pin,ref", [
+    ("v0.3.0", "v0.3.0"),
+    ("v0.0.0-20261014221549-81166a9b9ec3", "81166a9b9ec3"),
+    ("v0.3.1-0.20261014221549-81166a9b9ec3", "81166a9b9ec3"),
+    ("v0.4.0-rc.1.0.20261014221549-81166a9b9ec3", "81166a9b9ec3"),
+])
+def test_schemas_tree_links_a_tag_or_a_pseudo_versions_commit(pin, ref):
+    # GitHub has no /tree/<pseudo-version>, but it has /tree/<commit>.
+    assert pages.schemas_ref(pin) == ref
+
+
+def test_pin_reader_accepts_a_pseudo_version(tmp_path):
+    pin = "v0.0.0-20261014221549-81166a9b9ec3"
+    ci = tmp_path / "ci.yml"
+    ci.write_text(f"run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@{pin} .\n")
+    assert pages._first_match(pages.PIN_PATTERN, ci, "pin") == pin

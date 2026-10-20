@@ -53,7 +53,7 @@ Storage tier
 :   A place a KV cache can be offloaded to, such as CPU memory or an NVMe drive, described by an entry in `devices/storage.yaml`.
 
 Workload
-:   The distribution of request lengths, prompt and output, described by a file in `workloads/`. It does not include the arrival rate.
+:   The distribution of request lengths, prompt and output, described by a file in `workloads/`. It does not include the arrival rate. A replay workload in the same directory instead names a load generator's trace-replay scenario over a pinned corpus, and leaves the lane count to each run.
 
 ## Model graphs
 

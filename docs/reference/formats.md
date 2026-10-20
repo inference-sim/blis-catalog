@@ -40,7 +40,7 @@ A model entry is the directory `models/<name>/`, holding three files.
 | `TFlopsFP8` | TFLOP/s | always written | dense FP8 peak; `0` on a chip without native FP8, otherwise greater than `TFlopsPeak` |
 | `TFlopsNVFP4` | TFLOP/s | no | dense NVFP4 peak; omitted where the format is not native |
 | `BwPeakTBs` | TB/s | yes | HBM bandwidth; positive |
-| `MemoryGiB` | GiB | yes | HBM capacity; positive |
+| `MemoryGiB` | GiB | yes | device memory, positive: the total the CUDA driver reports (what vLLM's `gpu_memory_utilization` multiplies) where a public log or NVIDIA device dump states it (h100, h200, b200, b300, gb200-nvl72, gb300, each cited in `_comment_memory`), otherwise the datasheet HBM capacity |
 | `IntraNodeBwGBps` | GB/s | yes | intra-node link (NVLink where present), one direction; positive |
 | `SMCount` | count | yes | streaming multiprocessors enabled on this chip; positive |
 | `GPUsPerNode` | count | no | GPUs in one node; stated only for rack-scale chips |
@@ -61,7 +61,7 @@ A model entry is the directory `models/<name>/`, holding three files.
 
 ## Workloads
 
-`workloads/<name>.yaml`, one workload per file. All values are tokens per request.
+`workloads/<name>.yaml`, one workload per file, in one of two forms. A file whose top-level key is `replay:` is a [replay workload](#replay-workloads); any other is a shape, below. All values in a shape are tokens per request.
 
 | Key | Required | Meaning |
 | :--- | :--- | :--- |
@@ -70,6 +70,10 @@ A model entry is the directory `models/<name>/`, holding three files.
 | `prompt.tokens_stdev` | no | standard deviation; not negative |
 | `prompt.tokens_min`, `prompt.tokens_max` | no | bounds; the mean lies between those given |
 | `output.*` | | the same four keys, for the output |
+
+### Replay workloads
+
+A replay workload states, under `replay:`, a trace-replay scenario the blis-schemas `workload.ReplayDefinition` type defines: `scenario`, `harness_version`, a `corpus` (`loader`, `format`, `encoding`, `source.huggingface`, `source.revision`, and optionally `source.file`, `source.split` and `sha256`), and the scenario's settings (`random_seed`, `benchmark_duration_s`, `grace_period_s`, `max_context_length`, the keys the scenario locks, and the acceptance selectors `category` and `thinking`). It states no `concurrency`: a scenario that binds the workload states it. Comment keys are accepted at the top level only. The schema refuses any value the harness's own scenario validator would refuse, such as a duration below 900 s for `inferencex-agentx-mvp`.
 
 ## Storage tiers
 
@@ -80,3 +84,7 @@ A model entry is the directory `models/<name>/`, holding three files.
 | `read_bandwidth_mb_s` | MB/s | sustained read bandwidth; positive |
 | `write_bandwidth_mb_s` | MB/s | sustained write bandwidth; positive |
 | `base_latency_us` | µs | fixed cost of one transfer; positive |
+
+## Measured runs
+
+`measurements/sources.yaml` is the licence registry: one entry per source a run may cite, with its `status` (`verified`, `unverified` or `refused`), the uses its terms permit (`score`, `derive_coefficients`, `redistribute`; none unless verified) and quoted evidence. `measurements/<license_ref>/<name>.yaml` is one measured run, a blis-schemas `measurement.MeasuredRun`: its source and every input's sha256, the measured model, engine version, cluster, deployment and workload where stated, metric definitions, load-ordered points, provenance rows and differences. Its verdict is recomputed by the gate and must match. A committed run must cite a source that permits `redistribute`. These are third-party measurements recorded with their provenance; nothing here is fitted.

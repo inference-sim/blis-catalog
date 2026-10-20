@@ -1,9 +1,11 @@
 # blis-catalog
 
 The authoritative catalog for [BLIS](https://github.com/inference-sim/inference-sim):
-models, hardware, networks, workload types, and storage devices.
-Everything here is a **declared fact** that a person wrote down — a datasheet or
-vendor spec — nothing is learned, fitted, measured, or inferred. Learned and
+models, hardware, networks, workload types, and storage devices, plus the
+measured runs BLIS is validated against.
+Everything outside `measurements/` is a **declared fact** that a person wrote
+down — a datasheet or vendor spec — nothing is learned, fitted, measured, or
+inferred; `measurements/` records third-party runs with their provenance. Learned and
 measured numbers (alpha/beta coefficients, LoRA cost defaults, per-GPU MFU
 prefill/decode estimates, measured fabric-overhead corrections, PD-transfer
 estimates) live in `blis-registry`; deployment choices (GPU type,
@@ -32,10 +34,28 @@ blis-catalog/
 ├── networks/                   # WHAT AN INTER-NODE FABRIC CAN DO — one file per reusable fabric class
 │   ├── ib-400g.yaml  roce-200g.yaml  ethernet-100gbe.yaml
 ├── workloads/                  # WHAT TRAFFIC LOOKS LIKE
-│   ├── chatbot.yaml  summarization.yaml  contentgen.yaml  multidoc.yaml
-└── devices/                    # WHAT A STORAGE TIER CAN DO
-    └── storage.yaml            # nvme_gen4, nvme_gen3, sata_ssd, cpu_dram, s3
+│   ├── chatbot.yaml  summarization.yaml  contentgen.yaml  multidoc.yaml   # shapes
+│   └── agentx-mvp.yaml          # a replay workload: a trace-replay scenario over a pinned corpus
+├── devices/                    # WHAT A STORAGE TIER CAN DO
+│   └── storage.yaml            # nvme_gen4, nvme_gen3, sata_ssd, cpu_dram, s3
+└── measurements/               # WHAT A PUBLISHED RUN MEASURED, AND UNDER WHAT TERMS
+    ├── sources.yaml            # licence registry: status, permitted uses, quoted evidence
+    └── <license_ref>/<run>.yaml  # one measured sweep (blis-schemas MeasuredRun)
 ```
+
+`measurements/` is the one place third-party *measured* numbers live in the
+catalog: validation cases a cost model is scored against, each recorded with the
+sha256 of every input it was extracted from, its licence, and how far its
+configuration is from what BLIS simulates. They are facts about a run someone
+else did, not fitted values; anything fitted from them is a `calibrated`
+coefficient in `blis-registry`. Runs are emitted by the adapters in
+inference-sim's `tools/validation/`, never typed by hand. No measured run is
+committed yet. `scripts/measurements/aiconfigurator_example.py` shows the format:
+it extracts one sweep from ai-dynamo/aiconfigurator's `silicon_sample.csv` at
+commit `f254959eb89e2f206b8f9a77051644d7c1cbdb89`
+(`aic-core/src/aiconfigurator_core/systems/silicon_sample.csv`, sha256
+`4240bfaf555b6f8b2c62512074e5efbb7791cdbb0344b068408f397588499adb`) into a local file
+(`--out`; `--check` re-extracts and diffs).
 
 A few things are deliberately **absent**: GPU type and tensor-parallel degree
 (deployment choices, stated on the CLI), learned coefficients (`blis-registry`),
@@ -186,11 +206,11 @@ CI validates every committed entry by running that owner's binary against the
 checkout, pinned by version:
 
 ```sh
-go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.3.0 .
+go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.4.0 .
 ```
 
-It walks all five namespaces (`models/`, `hardware/`, `networks/`, `workloads/`,
-`devices/`), prints a per-entry summary, and fails naming the file when an entry
+It walks all six namespaces (`models/`, `hardware/`, `networks/`, `workloads/`,
+`devices/`, `measurements/`), prints a per-entry summary, and fails naming the file when an entry
 is malformed. To learn *what* each namespace requires, or to add a rule, go to
 blis-schemas — not here. The simulator additionally validates the *semantics* of
 whatever it loads at run time ([inference-sim#1750](https://github.com/inference-sim/inference-sim/issues/1750)),

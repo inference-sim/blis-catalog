@@ -489,6 +489,31 @@ UNQUANTIZED_BASE = {
 }
 
 
+def int_group_scale(cfg: dict[str, Any], raw: dict[str, Any],
+                    model: str) -> dict[str, int] | None:
+    """The resident scale of an integer group-quantized checkpoint, or None.
+
+    An INT format fixes no scale layout (blis-schemas DType.IntrinsicScale), so a W4A16
+    checkpoint's scales are resident only if the graph states them. compressed-tensors
+    WNA16 allocates one scale per group_size weights in params_dtype, the model's BF16
+    (w13_weight_scale / w2_weight_scale, compressed_tensors_moe_wna16.py:282-310 at
+    v0.31.0). On Kimi-K2.5 at group 32 that is 1/16 B a parameter, 7.4 GiB a rank at TP8,
+    which the KV pool otherwise absorbs."""
+    quant = raw.get("quantization_config") or cfg.get("quantization_config") or {}
+    if "compressed-tensors" not in str(quant.get("quant_method", "")).lower():
+        return None
+    groups = [(s or {}).get("weights") or {}
+              for s in (quant.get("config_groups") or {}).values()]
+    ints = [w for w in groups if w.get("type") == "int" and w.get("strategy") == "group"]
+    if not ints:
+        return None
+    sizes = {int(w.get("group_size") or 0) for w in ints}
+    if len(sizes) != 1 or min(sizes) < 1:
+        raise DeriveError(f"{model}: integer weight groups state group sizes "
+                          f"{sorted(sizes)}; one resident scale layout cannot hold them")
+    return {"elements": sizes.pop(), "bytes": DTYPE_WIDTHS[base_dtype(cfg, raw, model)]}
+
+
 def base_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
     """The declared parameter dtype, ignoring any quantization block."""
     declared = pick(cfg, "dtype") or pick(raw, "dtype")
@@ -2413,7 +2438,12 @@ def handler_deepseek_v41(cfg, raw, model):
       * prefill's gather of each layer's own window records into the BF16 workspace,
         query_len + min(prefix, window - 1) entries per request (nvidia/flashmla.py:
         315-325; sparse_swa.py:366-371), about 1.6 KB per prefill token a layer: it
-        grows with the chunk, not the context, and no context field states that;
+        grows with the chunk, not the context, and no context field states that (the
+        compressed part of the gather is prefill_dequant_gather). A per-request
+        `context` read of `swa`, for the window part of the gather, is charged over
+        the whole context (computed + scheduled), which on the last 8K chunk of a
+        100K-token prompt states 12x the window-bounded gather
+        (inference-sim/blis-catalog#33);
       * Engram's DP-sharded path: with DP > 1 and /dev/shm too small for the ~189 GiB
         of tables, they shard over TP x DP and the hashes and rows are exchanged over
         the engram DP group (nvidia/engram.py:104-159, 408-424, 490-496;
@@ -3336,6 +3366,21 @@ def handler_minimax_m3(cfg, raw, model):
     # The indexer scores the whole context to choose blocks, so its read is bounded by
     # context rather than by the top-k. It is placed BEFORE the bounded attention node,
     # which is the order it runs in: its scores pick the blocks that node then reads.
+    #
+    # The indexer's keys are a cache of their own, resident beside the main K/V and
+    # growing with context: MiniMaxM3IndexerCache registers a key-only MLAAttentionSpec
+    # of one head of sparse_index_dim per token (models/minimax_m3/common/indexer.py:
+    # 102-153 at v0.31.0). Its dtype is attention_config.indexer_kv_dtype, which resolves
+    # "auto" to bf16 whatever --kv-cache-dtype says (nvidia/model.py:501-505;
+    # config/attention.py:83-87, 146-150), so the record is index_dim BF16 values under
+    # every cache dtype. Left unstated, a consumer infers no cache for this node and the
+    # pool comes out 1.5x too large at TP8 (45,312 B a token in the server's own
+    # "Available KV cache memory" over "GPU KV cache size", against 30,720 of main K/V).
+    #
+    # The main K/V is NOT bounded either: vLLM registers a FullAttentionSpec for it
+    # (nvidia/model.py:559-567), so only its READ is bounded by the top-k. It is left
+    # inferred, as a GQA cache whose heads split over TP, which a stated entry (one
+    # whole-layer record, never divided by TP) cannot express.
     indexer = {
         "op": "Attention",
         "role": "block_index_scores",
@@ -3343,6 +3388,8 @@ def handler_minimax_m3(cfg, raw, model):
         "n_q": index_heads,
         "n_kv": 1,
         "d_h": index_dim,
+        "caches": [{"name": "index", "kind": "index", "owned": True,
+                    "bytes_per_entry": index_dim * DTYPE_WIDTHS["bf16"]}],
     }
     at = next(i for i, n in enumerate(sparse_attn) if n.get("op") == "Attention")
     sparse_nodes = sparse_attn[:at] + [
@@ -4073,6 +4120,12 @@ def derive(config_path: Path, model: str) -> dict[str, Any]:
         raise DeriveError(f"{model}: handler restates global {sorted(clash)}, which "
                           f"derive() computes itself")
     graph["global"].update(extra_global)
+    scale = int_group_scale(cfg, raw, model)
+    if scale and graph["global"]["weight_dtype"] in ("int4", "int8"):
+        if graph["global"].get("weight_scale") not in (None, scale):
+            raise DeriveError(f"{model}: the handler and the quantization config state "
+                              f"different weight scales")
+        graph["global"]["weight_scale"] = scale
     if "embedding" in extras:
         graph["embedding"] = extras["embedding"]
 
