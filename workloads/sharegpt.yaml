@@ -1,0 +1,17 @@
+_comment: "Provenance: single-turn ShareGPT, the chat workload the serving benchmarks size against. Unlike chatbot/contentgen/multidoc/summarization — presets the simulator's authors chose, citing no source — every figure below is measured from a published dataset, so this file states how to reproduce it. Corpus: ShareGPT_V3_unfiltered_cleaned_split.json from the Hugging Face dataset anon8231489123/ShareGPT_Vicuna_unfiltered (672,837,942 bytes, sha256 35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4), the file vLLM's benchmarks/benchmark_serving.py --dataset-name sharegpt reads and the one gateway-api-inference-extension's benchmark cites. The corpus is not vendored here: it is 94,145 conversations and 642 MiB, so a consumer fetches it and checks the digest."
+_comment_sampling: "Sampling, replicating vLLM benchmark_serving.py's sample_sharegpt_requests: take each conversation's FIRST (human, gpt) pair — this is what makes the preset single-turn, in contrast to agentx-mvp.yaml, whose sessions accumulate context across turns — tokenize the human value as the prompt and the gpt value as the output, drop any pair with fewer than 4 tokens on either side, and drop any pair whose prompt + output exceeds 1024 tokens. 94,145 conversations yield 86,772 pairs clearing the 4-token floor and 80,006 (92%) clearing the 1024-token cap; the figures below are over those 80,006. The 1024-token cap is vLLM's published convention, not a property of the dataset, and it is what keeps this a usable normal shape: unfiltered, the same 86,772 pairs give a prompt mean of 316 tokens with a stdev of 1060 and a maximum of 221,043, a tail a mean-and-stdev Shape cannot represent."
+_comment_tokenizer: "Token counts are tokenizer-dependent, so the tokenizer is part of the measurement: Qwen/Qwen2.5-14B. The same sampling under ibm-granite/granite-3.0-2b-base gives figures about 14% higher (prompt mean 365 against 321 on an 8,000-conversation sample), which bounds how much a different tokenizer moves these numbers. Measured 2026-10-23."
+_comment_prefix: "prefix_tokens: 0 — a single-turn sample shares no prefix across requests. ShareGPT's multi-turn structure, where turn N replays turns 1..N-1 and is the reason real chat traffic has prefix-cache hits, is deliberately NOT modelled here; that is what the multi-turn agentx-mvp replay carries."
+prefix_tokens: 0
+prompt:
+  _comment: "mean 208, stdev 231, min 4, max 1013 over the 80,006 sampled pairs. p50 93, p90 579, p99 795 — the distribution is right-skewed, so a normal draw at this mean and stdev overstates the middle; min/max are the observed bounds, not chosen limits."
+  tokens: 208
+  tokens_stdev: 231
+  tokens_min: 4
+  tokens_max: 1013
+output:
+  _comment: "mean 185, stdev 190, min 4, max 979 over the same pairs. p50 121, p90 455, p99 770. These are ShareGPT's recorded replies, not a model's generations under a max-tokens cap."
+  tokens: 185
+  tokens_stdev: 190
+  tokens_min: 4
+  tokens_max: 979
