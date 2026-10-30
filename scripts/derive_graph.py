@@ -31,6 +31,7 @@ config changed without re-deriving, fails.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import sys
@@ -367,6 +368,43 @@ def quantized_classes(cfg: dict[str, Any], model: str) -> dict[str, str]:
     return out
 
 
+# Architectures whose handler places each node's width under a ModelOpt quant_algo
+# checkpoint, reading the exclusion list per module (see weight_dtype()).
+MODELOPT_PER_NODE_ARCHS = frozenset({"MuseSparkForConditionalGeneration"})
+
+
+def modelopt_exclusions(quant: dict[str, Any]) -> list[str]:
+    """The module patterns a ModelOpt checkpoint leaves unquantized, as vLLM reads them.
+
+    From config.json vLLM takes `ignore`, else `exclude_modules`, and never
+    modules_to_not_convert (ModelOptQuantConfigBase.from_config,
+    model_executor/layers/quantization/modelopt.py:358-359 at vllm-project/vllm 0f6b2619;
+    v0.32.0 reads only `ignore`, :354-355). A pattern ending in `*` not preceded by `.`
+    also names the module itself (apply_vllm_mapper, :263-281@v0.32.0). The model's
+    WeightsMapper renames are not applied here; a handler that reads these patterns
+    states why its entries are untouched by them."""
+    pats = quant.get("ignore", quant.get("exclude_modules", [])) or []
+    if not isinstance(pats, list) or not all(isinstance(p, str) for p in pats):
+        raise DeriveError(f"ModelOpt exclusion list {pats!r} is not a list of names")
+    out = []
+    for p in pats:
+        if len(p) >= 2 and p[-1] == "*" and p[-2] != ".":
+            out += [p[:-1], p[:-1] + ".*"]
+        else:
+            out.append(p)
+    return out
+
+
+def modelopt_excluded(prefix: str, patterns: list[str]) -> bool:
+    """Whether vLLM's ModelOpt config leaves the module at `prefix` unquantized: a
+    pattern equal to it, a SUBSTRING of it, or a wildcard matching it
+    (is_layer_excluded, modelopt.py:187-220@v0.32.0, the same at 0f6b2619). Substring,
+    so "layers.1" excludes layers 10-19 as well as layer 1. The exact match through a
+    fused module's shard names (is_layer_skipped) is not modelled."""
+    return any(p == prefix or p in prefix or fnmatch.fnmatchcase(prefix, p)
+               for p in patterns)
+
+
 def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
     """Return the graph's dtype name for the model's parameters.
 
@@ -383,19 +421,25 @@ def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
         fmt = str(quant.get("quant_method", "")).lower()
         if "nvfp4" in fmt or "modelopt_fp4" in fmt:
             return "nvfp4"
-        # ModelOpt states its format as quant_algo beside quant_method "modelopt", and,
-        # like the mxfp4 case below, names in modules_to_not_convert what it leaves at the
-        # base width. Muse Spark's NVFP4 checkpoint excludes all attention, the latent
-        # projections, lm_head and two layers' experts, so NVFP4 is the expert width
-        # only, carried on those nodes, and the global width stays the base.
+        # ModelOpt states its format as quant_algo beside quant_method "modelopt" and
+        # quantizes every module its exclusion list does not name (modelopt_exclusions).
+        # Which modules those are is a question about the architecture's module tree, so
+        # one global width is right only where a handler answers it node by node. Muse
+        # Spark's does: its global width is the base, and it carries NVFP4 on the expert
+        # nodes the list leaves quantized. Any other architecture is refused, as it was
+        # before that handler existed, rather than priced at the base throughout.
         if fmt == "modelopt" and quant.get("quant_algo"):
             algo = QUANT_ALGOS.get(str(quant["quant_algo"]).upper())
             if algo is None:
                 raise DeriveError(f"{model}: ModelOpt quant_algo {quant['quant_algo']!r} "
                                   f"is not one this deriver maps")
-            if quant.get("modules_to_not_convert"):
-                return base_dtype(cfg, raw, model)
-            return algo
+            arch = (raw.get("architectures") or [None])[0]
+            if arch not in MODELOPT_PER_NODE_ARCHS:
+                raise DeriveError(
+                    f"{model}: a ModelOpt {algo} checkpoint quantizes every module its "
+                    f"exclusion list does not name; only a handler that places each "
+                    f"node's width prices one, and {arch} has none")
+            return base_dtype(cfg, raw, model)
         if "fp8" in fmt:
             return "fp8"
         # A per-group block states the width per tensor set rather than once. The
@@ -4161,9 +4205,10 @@ def handler_muse_spark(cfg, raw, model):
         dispatch (data parallelism), the all-to-all moves it. The unpooler's output is
         replicated, so nothing reduces at hidden width after the MoE.
 
-    The NVFP4 checkpoint (ModelOpt, quant_algo NVFP4, group 16) excludes the attention,
-    the pooler and unpooler, the router, lm_head, and the experts of layers 0 and 61,
-    which stay BF16 (modules_to_not_convert); those two layers are kinds of their own.
+    The NVFP4 checkpoint (ModelOpt, quant_algo NVFP4, group 16) leaves the attention,
+    lm_head and the experts of layers 0 and 61 at BF16 by its exclude_modules, the list
+    vLLM reads; the pooler, unpooler and router are built unquantized. Layers 0 and 61
+    are kinds of their own.
 
     KNOWN GAPS, recorded rather than priced:
       * On SM100 with dp 1 and at most 256 tokens a step, the pooler and unpooler shard
@@ -4232,10 +4277,31 @@ def handler_muse_spark(cfg, raw, model):
         expert_fmt = QUANT_ALGOS.get(str(quant.get("quant_algo", "")).upper())
         if expert_fmt is None:
             raise DeriveError(f"{model}: quant_algo {quant.get('quant_algo')!r}")
-        prefix = "model.language_model.layers."
-        for name in quant.get("modules_to_not_convert") or ():
-            if name.startswith(prefix) and name.endswith(".mlp.experts"):
-                bf16_experts.add(int(name[len(prefix):].split(".")[0]))
+        # The list vLLM reads (exclude_modules here), matched as vLLM matches it, against
+        # the module names vLLM builds: MuseSpark1xForCausalLM's "model.layers.{i}" with
+        # the MoE at ".feed_forward" (model.py:1352-1357) and its FusedMoE at ".experts"
+        # (:597-605). The checkpoint's legacy modules_to_not_convert is not read. The
+        # Omni WeightsMapper, which vLLM applies to the list (model_loader/utils.py:379),
+        # rewrites only "model.language_model." and "model.layers.N.mlp..." spellings
+        # (common/omni.py:48-80@0f6b2619), which the committed list does not use.
+        excluded = modelopt_exclusions(quant)
+        bf16_experts = {i for i in range(layers) if modelopt_excluded(
+            f"model.layers.{i}.feed_forward.experts", excluded)}
+        # The attention projections and lm_head take the quant config and are quantized
+        # unless the list names them (model.py:1062-1080; LlamaForCausalLM's
+        # ParallelLMHead), and this handler prices them at the base width, so a list that
+        # leaves them quantized is a layout it does not price. The router and the
+        # pooler/unpooler are built without a quant config (model.py:421-428, 450-463).
+        for what, where in (("attention", "model.layers.{}.self_attn.qkv_proj"),
+                            ("attention", "model.layers.{}.self_attn.o_proj")):
+            left = [i for i in range(layers)
+                    if not modelopt_excluded(where.format(i), excluded)]
+            if left:
+                raise DeriveError(f"{model}: the ModelOpt list leaves {what} quantized on "
+                                  f"layers {left}; this handler prices it at the base")
+        if not modelopt_excluded("lm_head", excluded):
+            raise DeriveError(f"{model}: the ModelOpt list leaves lm_head quantized; this "
+                              f"handler prices it at the base")
 
     def gemm_at(role, n, k, tp=None, dtype=None):
         node = gemm(role, n, k)

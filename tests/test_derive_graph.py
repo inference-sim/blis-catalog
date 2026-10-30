@@ -5755,20 +5755,79 @@ def test_muse_spark_refuses_what_it_does_not_price(tmp_path):
             _derive_raw(bad, tmp_path)
 
 
-def test_modelopt_quant_algo_names_the_expert_width_only_where_it_excludes_modules(tmp_path):
-    """A ModelOpt checkpoint that excludes modules keeps the base as the global width; one
-    that excludes none is wholly in its quant_algo."""
-    sys.path.insert(0, str(DERIVER.parent))
-    import derive_graph  # noqa: E402
+def test_modelopt_takes_the_base_width_only_where_the_handler_places_each_node(tmp_path):
+    """ModelOpt quantizes every module its exclusion list does not name, so a single
+    global width is wrong for a partial checkpoint and right only by accident for a whole
+    one. Muse Spark's handler places each node's width itself, so the global width is the
+    base there; any other architecture is refused, as before this handler existed."""
+    D = deriver()
     raw = config_of(MUSE_NVFP4)
-    cfg = text_config(raw)
-    assert derive_graph.weight_dtype(cfg, raw, "x") == "bf16"
+    assert D.weight_dtype(text_config(raw), raw, "x") == "bf16"
     whole = json.loads(json.dumps(raw))
-    whole["quantization_config"]["modules_to_not_convert"] = []
-    assert derive_graph.weight_dtype(text_config(whole), whole, "x") == "nvfp4"
     whole["quantization_config"]["quant_algo"] = "FP6"
-    with pytest.raises(derive_graph.DeriveError, match="quant_algo"):
-        derive_graph.weight_dtype(text_config(whole), whole, "x")
+    with pytest.raises(D.DeriveError, match="quant_algo"):
+        D.weight_dtype(text_config(whole), whole, "x")
+    # A non-Muse NVFP4 ModelOpt checkpoint, with each spelling of an exclusion list and
+    # with none: refused, not priced at BF16 (modules_to_not_convert) or at NVFP4
+    # throughout (exclude_modules, nothing).
+    dense = config_of(MODELS / "llama-3.1-8b-instruct")
+    for extra in ({"exclude_modules": ["lm_head"]}, {"ignore": ["lm_head"]},
+                  {"modules_to_not_convert": ["lm_head"]}, {}):
+        bad = dict(dense, quantization_config={"quant_method": "modelopt",
+                                               "quant_algo": "NVFP4", "group_size": 16,
+                                               **extra})
+        with pytest.raises(D.DeriveError, match="ModelOpt"):
+            _derive_raw(bad, tmp_path, "llama-nvfp4")
+
+
+def test_modelopt_exclusions_match_as_vllm_matches_them():
+    """vLLM's ModelOpt config reads `ignore`, else `exclude_modules`, and never
+    modules_to_not_convert (modelopt.py:358-359@0f6b2619); a module is excluded when an
+    entry equals it, is a substring of it, or matches it as a wildcard, and a trailing
+    `*` also names the module itself (modelopt.py:187-220, 263-281@v0.32.0)."""
+    D = deriver()
+    experts = "model.layers.{}.feed_forward.experts".format
+    pats = D.modelopt_exclusions({"exclude_modules": ["layers.1", "self_attn"],
+                                  "modules_to_not_convert": ["lm_head"]})
+    assert pats == ["layers.1", "self_attn"]
+    # A substring, not a component match: "layers.1" also names layers 10-19.
+    assert [i for i in range(62) if D.modelopt_excluded(experts(i), pats)] == [
+        1, *range(10, 20)]
+    assert D.modelopt_excluded("model.layers.3.self_attn.qkv_proj", pats)
+    assert not D.modelopt_excluded("lm_head", pats)
+    assert D.modelopt_exclusions({"ignore": ["a"], "exclude_modules": ["b"]}) == ["a"]
+    assert D.modelopt_exclusions({"ignore": [], "exclude_modules": ["b"]}) == []
+    assert [i for i in range(62) if D.modelopt_excluded(
+        experts(i), D.modelopt_exclusions({"exclude_modules": ["*layers.2?.*experts"]}))] == [
+        *range(20, 30)]
+    assert D.modelopt_exclusions({"exclude_modules": ["model.layers.4*"]}) == [
+        "model.layers.4", "model.layers.4.*"]
+
+
+def test_muse_spark_nvfp4_reads_the_list_vllm_reads(tmp_path):
+    """The BF16 expert layers are the ones exclude_modules names; modules_to_not_convert
+    is not read. A checkpoint that leaves attention or lm_head quantized is refused,
+    because the handler prices both at the base width."""
+    D = deriver()
+    raw = config_of(MUSE_NVFP4)
+    committed = graph_of(MUSE_NVFP4)
+    same = lambda a, b: {k: v for k, v in a.items() if k != "derived_from"} == {
+        k: v for k, v in b.items() if k != "derived_from"}
+    assert same(_derive_raw(raw, tmp_path, MUSE_NVFP4.name), committed)
+    no_legacy = json.loads(json.dumps(raw))
+    del no_legacy["quantization_config"]["modules_to_not_convert"]
+    assert same(_derive_raw(no_legacy, tmp_path, MUSE_NVFP4.name), committed)
+    moved = json.loads(json.dumps(raw))
+    moved["quantization_config"]["exclude_modules"] = [
+        "layers.1", "self_attn", "lm_head"]
+    g = _derive_raw(moved, tmp_path, MUSE_NVFP4.name)
+    bf16 = {i for i in range(62) if "weight_dtype" not in _node(_kind_of(g, i), "experts")}
+    assert bf16 == {1, *range(10, 20)}
+    for drop, why in (("self_attn", "attention"), ("lm_head", "lm_head")):
+        bad = json.loads(json.dumps(raw))
+        bad["quantization_config"]["exclude_modules"].remove(drop)
+        with pytest.raises(D.DeriveError, match=why):
+            _derive_raw(bad, tmp_path, MUSE_NVFP4.name)
 
 
 def test_muse_spark_dspark_drafter_is_its_own_speculator():
