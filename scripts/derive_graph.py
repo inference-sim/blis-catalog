@@ -31,6 +31,7 @@ config changed without re-deriving, fails.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import sys
@@ -367,6 +368,43 @@ def quantized_classes(cfg: dict[str, Any], model: str) -> dict[str, str]:
     return out
 
 
+# Architectures whose handler places each node's width under a ModelOpt quant_algo
+# checkpoint, reading the exclusion list per module (see weight_dtype()).
+MODELOPT_PER_NODE_ARCHS = frozenset({"MuseSparkForConditionalGeneration"})
+
+
+def modelopt_exclusions(quant: dict[str, Any]) -> list[str]:
+    """The module patterns a ModelOpt checkpoint leaves unquantized, as vLLM reads them.
+
+    From config.json vLLM takes `ignore`, else `exclude_modules`, and never
+    modules_to_not_convert (ModelOptQuantConfigBase.from_config,
+    model_executor/layers/quantization/modelopt.py:358-359 at vllm-project/vllm 0f6b2619;
+    v0.32.0 reads only `ignore`, :354-355). A pattern ending in `*` not preceded by `.`
+    also names the module itself (apply_vllm_mapper, :263-281@v0.32.0). The model's
+    WeightsMapper renames are not applied here; a handler that reads these patterns
+    states why its entries are untouched by them."""
+    pats = quant.get("ignore", quant.get("exclude_modules", [])) or []
+    if not isinstance(pats, list) or not all(isinstance(p, str) for p in pats):
+        raise DeriveError(f"ModelOpt exclusion list {pats!r} is not a list of names")
+    out = []
+    for p in pats:
+        if len(p) >= 2 and p[-1] == "*" and p[-2] != ".":
+            out += [p[:-1], p[:-1] + ".*"]
+        else:
+            out.append(p)
+    return out
+
+
+def modelopt_excluded(prefix: str, patterns: list[str]) -> bool:
+    """Whether vLLM's ModelOpt config leaves the module at `prefix` unquantized: a
+    pattern equal to it, a SUBSTRING of it, or a wildcard matching it
+    (is_layer_excluded, modelopt.py:187-220@v0.32.0, the same at 0f6b2619). Substring,
+    so "layers.1" excludes layers 10-19 as well as layer 1. The exact match through a
+    fused module's shard names (is_layer_skipped) is not modelled."""
+    return any(p == prefix or p in prefix or fnmatch.fnmatchcase(prefix, p)
+               for p in patterns)
+
+
 def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
     """Return the graph's dtype name for the model's parameters.
 
@@ -383,6 +421,25 @@ def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
         fmt = str(quant.get("quant_method", "")).lower()
         if "nvfp4" in fmt or "modelopt_fp4" in fmt:
             return "nvfp4"
+        # ModelOpt states its format as quant_algo beside quant_method "modelopt" and
+        # quantizes every module its exclusion list does not name (modelopt_exclusions).
+        # Which modules those are is a question about the architecture's module tree, so
+        # one global width is right only where a handler answers it node by node. Muse
+        # Spark's does: its global width is the base, and it carries NVFP4 on the expert
+        # nodes the list leaves quantized. Any other architecture is refused, as it was
+        # before that handler existed, rather than priced at the base throughout.
+        if fmt == "modelopt" and quant.get("quant_algo"):
+            algo = QUANT_ALGOS.get(str(quant["quant_algo"]).upper())
+            if algo is None:
+                raise DeriveError(f"{model}: ModelOpt quant_algo {quant['quant_algo']!r} "
+                                  f"is not one this deriver maps")
+            arch = (raw.get("architectures") or [None])[0]
+            if arch not in MODELOPT_PER_NODE_ARCHS:
+                raise DeriveError(
+                    f"{model}: a ModelOpt {algo} checkpoint quantizes every module its "
+                    f"exclusion list does not name; only a handler that places each "
+                    f"node's width prices one, and {arch} has none")
+            return base_dtype(cfg, raw, model)
         if "fp8" in fmt:
             return "fp8"
         # A per-group block states the width per tensor set rather than once. The
@@ -526,6 +583,71 @@ def base_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
     if name is None:
         raise DeriveError(f"{model}: unrecognized dtype {declared!r}")
     return name
+
+
+def draft_aux_hidden_state_layers(hf: dict[str, Any], model: str, target_layers: int,
+                                  states: int | None = None) -> list[int]:
+    """The target layers a drafter reads, as the engine resolves them from its config.
+
+    The ids are in the engine's capture convention, which the graph's
+    speculator.aux_hidden_state_layers states: L is the state entering decoder layer L, 0
+    the embedding output, the layer count the last layer's output. vLLM reads, in order,
+    eagle_aux_hidden_state_layer_ids as-is; dflash_config.target_layer_ids plus one;
+    dspark_target_layer_ids as-is for model_type deepseek_v41 and plus one otherwise; the
+    dense-DSpark top-level target_layer_ids plus one; then dflash_config or eagle_config
+    layer_ids as-is (get_eagle3_aux_layers_from_config,
+    vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py:100-137@v0.32.0, unchanged at
+    vllm-project/vllm 0f6b2619). A config naming none of them falls back to a per-model
+    default, which no graph can read from a config, so that is refused.
+
+    The engine sorts and deduplicates the ids (_set_aux_hidden_state_layers,
+    model_executor/models/interfaces.py:1577-1578@v0.32.0); a repeat would leave the
+    drafter's input projection, sized for one state per listed layer, a state short, so
+    a repeat is refused rather than collapsed. `hf` is the drafter's config as the engine
+    sees it, flattened; `states`, where given, is how many states the drafter consumes.
+    The upper bound is checked here because the schema cannot check it on a drafter
+    graph, which does not hold its target's layer count."""
+    def entries(key, ids):
+        out = []
+        for i in ids:
+            if isinstance(i, bool) or not isinstance(i, int):
+                raise DeriveError(f"{model}: {key} entry {i!r} is not a layer id")
+            out.append(i)
+        return out
+
+    ids: list[int] | None = None
+    if hf.get("eagle_aux_hidden_state_layer_ids"):
+        ids = entries("eagle_aux_hidden_state_layer_ids",
+                      hf["eagle_aux_hidden_state_layer_ids"])
+    dflash = hf.get("dflash_config")
+    if not ids and isinstance(dflash, dict) and dflash:
+        ids = [i + 1 for i in entries("dflash_config.target_layer_ids",
+                                      dflash.get("target_layer_ids") or ())]
+    if not ids and hf.get("dspark_target_layer_ids"):
+        ds = entries("dspark_target_layer_ids", hf["dspark_target_layer_ids"])
+        ids = ds if hf.get("model_type") == "deepseek_v41" else [i + 1 for i in ds]
+    if not ids and hf.get("target_layer_ids"):
+        ids = [i + 1 for i in entries("target_layer_ids", hf["target_layer_ids"])]
+    if not ids:
+        for name in ("dflash_config", "eagle_config"):
+            sub = hf.get(name)
+            if isinstance(sub, dict) and sub.get("layer_ids"):
+                ids = entries(f"{name}.layer_ids", sub["layer_ids"])
+                break
+    if not ids:
+        raise DeriveError(f"{model}: the drafter names no target layers to read; the "
+                          f"engine would fall back to a per-model default")
+    ids = sorted(ids)
+    if len(set(ids)) != len(ids):
+        raise DeriveError(f"{model}: aux hidden-state layers {ids} repeat a capture point; "
+                          f"the ids must be strictly increasing")
+    if ids[0] < 0 or ids[-1] > target_layers:
+        raise DeriveError(f"{model}: aux hidden-state layers {ids} reach past the target's "
+                          f"{target_layers} layers")
+    if states is not None and len(ids) != states:
+        raise DeriveError(f"{model}: the engine captures {len(ids)} states {ids}, and the "
+                          f"drafter's input projection takes {states}")
+    return ids
 
 
 def head_dim(cfg: dict[str, Any], model: str) -> int:
@@ -805,6 +927,12 @@ EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE = "tensor_parallel_unless_sp_moe"
 # global.architecture names (blis-schemas#55); DeepSeek-V4.1 is the family that needs it.
 EMIT_SEQUENCE_PARALLEL = "sequence_parallel"
 EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL = "tensor_parallel_unless_sequence_parallel"
+# An MoE that reduces a different tensor in each mode states one collective per mode
+# (blis-schemas emit conditions): the TP-sharded experts' own reduction, and the combine
+# of expert-parallel partials when every rank holds every token. Muse Spark is the family
+# that needs them (handler_muse_spark).
+EMIT_TENSOR_PARALLEL_WITHOUT_EXPERT_PARALLEL = "tensor_parallel_without_expert_parallel"
+EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH = "expert_parallel_without_dispatch"
 
 
 def collective(op: str, role: str, emit: str) -> dict[str, Any]:
@@ -1616,7 +1744,16 @@ def handler_moe(cfg, raw, model):
         ]
         local = set(int(i) for i in local_ids)
         sequence = ["swa_moe" if i in local else "full_moe" for i in range(layers)]
-        return kinds, compress(sequence)
+        if raw.get("architectures", [None])[0] != "InklingForConditionalGeneration":
+            return kinds, compress(sequence)
+        # Inkling's stage boundary carries hidden_states alone at the model dtype, not
+        # vLLM's standard hidden_states + residual pair: the pending short-conv residual
+        # add is applied before the send (make_empty_intermediate_tensors_factory(
+        # ["hidden_states"]), inkling/nvidia/model.py:294-296, 354-359@v0.32.0; add_rmsnorm
+        # allocates its output like the residual, nvidia/ops/norm.py:160-161).
+        boundary = hidden * DTYPE_WIDTHS[base_dtype(cfg, raw, model)]
+        return kinds, compress(sequence), {
+            "global": {"pipeline_boundary_bytes_per_token": boundary}}
 
     # A per-layer MLP type vector marks which layers are sparse.
     mlp_types = cfg.get("mlp_layer_types")
@@ -2253,6 +2390,12 @@ def handler_deepseek_v4(cfg, raw, model):
         "global": {
             "architecture": "DeepseekV4ForCausalLM",
             "context_window": positive("max_position_embeddings"),
+            # A stage hands the next the hc_mult-stream bundle alone, (tokens, hc_mult,
+            # hidden) at the activation dtype, and no residual: the streams ARE the
+            # residual (make_empty_intermediate_tensors, nvidia/model.py:1406-1424@v0.32.0;
+            # the send, :1501-1507). Sequence parallelism is off under PP
+            # (_use_sequence_parallel, :1047-1058), so every boundary moves this much.
+            "pipeline_boundary_bytes_per_token": bundle,
         },
         "embedding": [embed, collective("AllReduce", "embed_out", EMIT_TENSOR_PARALLEL)],
         "head": head,
@@ -3134,6 +3277,20 @@ def handler_deepseek_v41(cfg, raw, model):
         # main_proj's input is one hidden-wide state per target layer, so the ids are
         # checked as layers of this stack, not just counted.
         targets = layer_ids("dspark_target_layer_ids", 0, layers, nonempty=True)
+        # The capture points. The draft config is the target's, with model_type set to
+        # deepseek_v41 where the target's is (config/speculative.py:1439-1447@v0.32.0),
+        # and for that model_type vLLM takes the ids as-is: V4.1 reads the stream
+        # entering each named layer (eagle3_utils.py:112-122). Each captured state is the
+        # mean over the hc_mult bf16 streams, (tokens, hidden) -- one hidden-width
+        # activation, which is the schema's default width, so none is stated
+        # (mhc_shifted_post_pre's aux, nvidia/ops/mhc.py:260-264; tilelang.py:313-323;
+        # previous_post.mean(dim=1), nvidia/model.py:541-542; _collapse, :1153-1157).
+        # V4.1's decoder does not relay aux states over pipeline stages (it sets no
+        # supports_aux_hidden_states_over_pp, and its boundary carries none,
+        # nvidia/model.py:1052-1055), so DSpark runs without PP.
+        spec_type = "deepseek_v41" if raw.get("model_type") == "deepseek_v41" else "deepseek_v4"
+        aux_layers = draft_aux_hidden_state_layers({**cfg, "model_type": spec_type}, model,
+                                                   layers, states=len(targets))
         draft_experts = positive("dspark_n_routed_experts")
         draft_top_k = positive("dspark_num_experts_per_tok")
         if draft_top_k > draft_experts:
@@ -3191,6 +3348,13 @@ def handler_deepseek_v41(cfg, raw, model):
             # (config/model.py:2496-2501), and at 1,048,576 at the pinned revision it
             # equals max_position_embeddings, so it does not lower it.
             "context_window": positive("max_position_embeddings"),
+            # A stage hands the next the hc_mult-stream bundle at the activation dtype and
+            # the (tokens, hc_mult) fp32 pre-mix the next stage's first layer collapses
+            # with, and no separate residual (make_empty_intermediate_tensors,
+            # nvidia/model.py:885-910@v0.32.0; the send, :1052-1055). Sequence parallelism
+            # is off under PP (_use_sequence_parallel, :246-256), so every boundary moves
+            # this much.
+            "pipeline_boundary_bytes_per_token": bundle + hc_mult * fp32,
         },
         # BF16, not FP8: vLLM passes the quant config, but it returns no method for an
         # embedding (quantization/fp8.py:177-209), so the table falls back to
@@ -3251,6 +3415,7 @@ def handler_deepseek_v41(cfg, raw, model):
                  "out_bytes_per_token": markov * act},
                 with_tp(base_gemm("markov_w2", vocab, markov), "replicated"),
             ],
+            "aux_hidden_state_layers": aux_layers,
         }
     # With no draft layers there is no speculator to state: derive()'s fallback reads
     # the same num_nextn_predict_layers and emits none at zero.
@@ -3994,6 +4159,437 @@ def handler_glm5_next(cfg, raw, model):
     return kinds, compress(sequence)
 
 
+# --- Muse Spark -------------------------------------------------------------------
+# Every fact below is read from vLLM's Muse Spark model code as merged in
+# vllm-project/vllm#61879 (merge commit 0f6b26191064384aa35060c87f4ed570c7875e66, cited
+# as @0f6b2619), the code the vLLM recipe serves the model with. Muse Spark support
+# landed after vLLM v0.32.0, so these are model-code facts at that commit, not v0.32.0
+# behaviour.
+MUSE_SPARK_SOURCE = "vllm/models/muse_spark/nvidia/model.py@0f6b2619"
+
+# When Muse Spark splits its replicated MoE pooler and unpooler over TP: on a device of
+# capability 10.0 or later (has_device_capability(100), tep_default, model.py:516-520) and
+# a step of at most _SHARDED_PROJECTION_MAX_TOKENS = 256 tokens (model.py:151). Whether the
+# model's other conditions hold -- tp > 1, no DP, no mega-MoE or sequence parallelism
+# (replicated_tokens, :505-512) -- is the consumer's to read from the layout.
+MUSE_SHARDED_PROJECTION = {"capability_family": 10, "max_tokens": 256}
+
+# Per token, a fused residual boundary reads the branch (activation width) and the fp32
+# residual stream, writes the stream back and the normalized activation for the next
+# block: post-norm, residual add and pre-norm in one pass (norm_residual_then_norm,
+# model.py:1425-1500). The stream is carried in fp32 (residual_dtype, model.py:1396).
+def _muse_boundary_bytes(hidden: int, act: int) -> int:
+    fp32 = DTYPE_WIDTHS["fp32"]
+    return hidden * act + 2 * hidden * fp32 + hidden * act
+
+
+def handler_muse_spark(cfg, raw, model):
+    """Muse Spark: GQA with a hybrid sliding-window/full pattern, an MoE on every layer
+    whose experts run at a narrower latent width, and an fp32 residual stream.
+
+    The layer (MuseSpark1xDecoderLayer and its attention and MoE, model.py@0f6b2619):
+
+      * attention: a fused [Q, K, V, O-gate] projection of 2 (nq + nkv) d_h rows
+        (MuseSpark1xQKVOGateParallelLinear, common/layers.py:339-369), QK-norm and RoPE
+        fused with the KV-cache insert (model.py:1167-1222), GQA over a 2048-token window
+        on the sliding layers and the whole context on the full ones (layer_types,
+        model.py:1101-1110), the per-head output norm fused with its sigmoid gate
+        (model.py:1240-1262), the row-parallel o_proj and its TP all-reduce;
+      * the MoE (MuseSpark1xMoE, model.py:373-940): an fp32 router over the hidden state
+        before the squeeze (GateLinear with fp32 params and fp32 input, :413-428), the
+        replicated pooler hidden -> moe_hidden_size and its norm, 256 experts at top-8
+        whose GEMMs run at the latent width (latent_size), the post-expert finalize
+        (a per-route RMSNorm, then the fp32 weighted sum, muse_moe_runner.py:160-330),
+        and the replicated unpooler back to hidden. No shared expert.
+      * the reductions an MoE layer runs depend on the mode, so each states its own
+        condition. Under tensor parallelism without expert parallelism the experts'
+        GEMM2 rows are partial sums and RMS is not linear in them, so the top_k
+        per-route rows are all-reduced BEFORE the norm (needs_pre_norm_all_reduce,
+        common/moe.py:114-120; muse_moe_runner.py:288-290). Under expert parallelism
+        with every token on every rank (no dispatch: dp 1, no sequence parallelism),
+        each rank's combined latent output is partial over its experts and is
+        all-reduced once (_create_all_reduce, muse_moe_runner.py:200-215). With a
+        dispatch (data parallelism), the all-to-all moves it. The unpooler's output is
+        replicated, so nothing reduces at hidden width after the MoE.
+
+    The NVFP4 checkpoint (ModelOpt, quant_algo NVFP4, group 16) leaves the attention,
+    lm_head and the experts of layers 0 and 61 at BF16 by its exclude_modules, the list
+    vLLM reads; the pooler, unpooler and router are built unquantized. Layers 0 and 61
+    are kinds of their own.
+
+    The pooler and unpooler state sharded_at_decode: on SM100 with TP, dp 1 and at most
+    256 tokens a step they shard their output columns over TP and all-gather
+    (shard_pooler/shard_unpooler, model.py:502-541, 638-660), which the consumer prices.
+
+    KNOWN GAPS, recorded rather than priced:
+      * Under PP the residual stream is not fused across layers (fuse_across_layers is
+        pp == 1, model.py:1533): every layer's output runs norm_then_gated_residual
+        (model.py:1711-1712) and the next layer's input norm runs on its own, one extra
+        fp32 stream pass, hidden x 4 B a token a layer, against the fused boundary priced
+        here. No emit condition names pipeline parallelism, so it is not priced (about
+        +9% of a layer's elementwise traffic under PP).
+      * The token-embedding norm (tok_embeddings_norm, model.py:1662-1664) reads the bf16
+        lookup and writes the fp32 stream, hidden x (2 + 4) B a token, and layer 0's input
+        norm then runs on its own (model.py:1431-1435), hidden x (4 + 2) B, where the
+        layer kind prices the fused boundary, hidden x (2 + 8 + 2) B. The two offset
+        exactly in bytes; one launch is unpriced.
+      * The fp32 router input for 32 < tokens <= 128 (wants_fp32_router_input,
+        model.py:670-677, 1451-1455) is on only where torch allows TF32 matmuls
+        (model.py:413-416), which VLLM_FLOAT32_MATMUL_PRECISION's default "highest" does
+        not; no node can scope bytes to a token range, so it is not priced.
+      * Under EP the finalize reads only the rank's local routes (fused_finalize.py
+        masks remote experts, muse_moe_runner.py:340-342), where post_expert_norm charges
+        every rank all top_k rows; no node scales its bytes by the expert-parallel width.
+      * The native finalize (_finalize_chunk, muse_moe_runner.py:433-439) materialises a
+        (tokens x top_k x moe_hidden_size) fp32 intermediate; it runs only on Blackwell at
+        TP > 1 above 8192 tokens or where FlashInfer's TP finalize is unavailable.
+      * The final logit soft-cap (final_logit_softcapping) runs on the sampled rows'
+        vocabulary-wide logits, which no node of a head can scope to sampled rows, so it
+        is not priced.
+      * Under sequence-parallel MoE the gathered unpooler output (model.py:936-938) is
+        not stated; Muse runs data parallelism only on Blackwell's TRT-LLM experts.
+    """
+    def whole(v, key):
+        if isinstance(v, bool) or int(v) != v:
+            raise DeriveError(f"{model}: {key} is {v!r}, not a whole number")
+        return int(v)
+
+    hidden = whole(require(cfg, "hidden_size", model), "hidden_size")
+    layers = whole(require(cfg, "num_layers", model), "num_hidden_layers")
+    nq = whole(require(cfg, "num_q_heads", model), "num_attention_heads")
+    nkv = whole(require(cfg, "num_kv_heads", model), "num_key_value_heads")
+    dh = head_dim(cfg, model)
+    vocab = whole(require(cfg, "vocab_size", model), "vocab_size")
+    experts = whole(require(cfg, "num_experts", model), "num_local_experts")
+    top_k = whole(require(cfg, "top_k", model), "num_experts_per_tok")
+    inner = whole(require_key(cfg, "moe_intermediate_size", model), "moe_intermediate_size")
+    latent = whole(require_key(cfg, "moe_hidden_size", model), "moe_hidden_size")
+    window = pick(cfg, "sliding_window")
+    if top_k > experts:
+        raise DeriveError(f"{model}: top-{top_k} routing over {experts} experts")
+    if int(pick(cfg, "num_shared_experts") or 0):
+        raise DeriveError(f"{model}: a shared expert, which this architecture's MoE never "
+                          f"builds (model.py:373-470)")
+    if not 0 < latent <= hidden:
+        raise DeriveError(f"{model}: moe_hidden_size {latent} is not a narrowing of "
+                          f"hidden_size {hidden}")
+    attn_types = require_key(cfg, "layer_types", model)
+    mlp_types = require_key(cfg, "mlp_layer_types", model)
+    for key, vec in (("layer_types", attn_types), ("mlp_layer_types", mlp_types)):
+        if len(vec) != layers:
+            raise DeriveError(f"{model}: {key} has {len(vec)} entries for {layers} layers")
+    unknown = set(attn_types) - {"sliding_attention", "full_attention"}
+    if unknown:
+        raise DeriveError(f"{model}: layer_types names {sorted(unknown)}")
+    if set(mlp_types) != {"sparse"}:
+        raise DeriveError(f"{model}: mlp_layer_types {sorted(set(mlp_types))}; every Muse "
+                          f"Spark layer is an MoE, and a dense one is not priced here")
+    if "sliding_attention" in attn_types and not window:
+        raise DeriveError(f"{model}: sliding layers with no sliding_window")
+
+    base = base_dtype(cfg, raw, model)
+    act = DTYPE_WIDTHS[base]
+    fp32 = DTYPE_WIDTHS["fp32"]
+
+    # Which layers' experts the checkpoint quantizes. A layer the exclusion list names
+    # keeps the base width; the rest carry the method's.
+    quant = raw.get("quantization_config") or {}
+    expert_fmt = None
+    bf16_experts: set[int] = set()
+    if quant:
+        if str(quant.get("quant_method", "")).lower() != "modelopt":
+            raise DeriveError(f"{model}: quant_method {quant.get('quant_method')!r}; this "
+                              f"handler reads ModelOpt's layout")
+        expert_fmt = QUANT_ALGOS.get(str(quant.get("quant_algo", "")).upper())
+        if expert_fmt is None:
+            raise DeriveError(f"{model}: quant_algo {quant.get('quant_algo')!r}")
+        # The list vLLM reads (exclude_modules here), matched as vLLM matches it, against
+        # the module names vLLM builds: MuseSpark1xForCausalLM's "model.layers.{i}" with
+        # the MoE at ".feed_forward" (model.py:1352-1357) and its FusedMoE at ".experts"
+        # (:597-605). The checkpoint's legacy modules_to_not_convert is not read. The
+        # Omni WeightsMapper, which vLLM applies to the list (model_loader/utils.py:379),
+        # rewrites only "model.language_model." and "model.layers.N.mlp..." spellings
+        # (common/omni.py:48-80@0f6b2619), which the committed list does not use.
+        excluded = modelopt_exclusions(quant)
+        bf16_experts = {i for i in range(layers) if modelopt_excluded(
+            f"model.layers.{i}.feed_forward.experts", excluded)}
+        # The attention projections and lm_head take the quant config and are quantized
+        # unless the list names them (model.py:1062-1080; LlamaForCausalLM's
+        # ParallelLMHead), and this handler prices them at the base width, so a list that
+        # leaves them quantized is a layout it does not price. The router and the
+        # pooler/unpooler are built without a quant config (model.py:421-428, 450-463).
+        for what, where in (("attention", "model.layers.{}.self_attn.qkv_proj"),
+                            ("attention", "model.layers.{}.self_attn.o_proj")):
+            left = [i for i in range(layers)
+                    if not modelopt_excluded(where.format(i), excluded)]
+            if left:
+                raise DeriveError(f"{model}: the ModelOpt list leaves {what} quantized on "
+                                  f"layers {left}; this handler prices it at the base")
+        if not modelopt_excluded("lm_head", excluded):
+            raise DeriveError(f"{model}: the ModelOpt list leaves lm_head quantized; this "
+                              f"handler prices it at the base")
+
+    def gemm_at(role, n, k, tp=None, dtype=None):
+        node = gemm(role, n, k)
+        if tp:
+            node["tp"] = tp
+        if dtype:
+            node["weight_dtype"] = dtype
+        return node
+
+    def traffic(role, nbytes, tp=None):
+        node = dict(norm(role), bytes_per_token=int(nbytes))
+        if tp:
+            node["tp"] = tp
+        return node
+
+    def attention_nodes(win):
+        # The target always projects Q, K, V and the output gate in one fused linear that
+        # slices by head group and cannot replicate a KV head (use_o_gate is True off the
+        # drafter, model.py:977; MuseSpark1xQKVOGateParallelLinear asserts
+        # total_num_kv_heads % tp_size == 0, common/layers.py:368-371@0f6b2619).
+        attn = {"op": "Attention", "kind": "swa" if win else "gqa", "n_q": nq,
+                "n_kv": nkv, "d_h": dh, "kv_heads_not_replicated": True}
+        if win:
+            attn["window"] = int(win)
+        # Unquantized in both checkpoints: ModelOpt excludes self_attn, so the attention
+        # GEMMs carry the base width explicitly where the global width is the base anyway.
+        return [
+            traffic("input_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+            gemm_at("qkv_gate_proj", 2 * (nq + nkv) * dh, hidden),
+            # QK-norm and RoPE read and write Q and K once, fused with the cache insert,
+            # whose record the attention's cache accounts for.
+            traffic("qk_norm_rope", 2 * (nq + nkv) * dh * act),
+            attn,
+            # The per-head output norm and its sigmoid gate: read the output and the gate,
+            # write the gated output.
+            traffic("o_norm_gate", 3 * nq * dh * act),
+            gemm_at("o_proj", hidden, nq * dh),
+            collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
+        ]
+
+    def moe_nodes(expert_dtype):
+        node = {"op": "GroupedGEMM", "role": "experts", "n": inner, "k": hidden,
+                "experts": experts, "top_k": top_k, "latent_size": latent}
+        if expert_dtype and expert_dtype != base:
+            node["weight_dtype"] = expert_dtype
+        rows = top_k * latent * act
+        return [
+            traffic("post_attn_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+            gemm_at("router", experts, hidden, tp="replicated", dtype="fp32"),
+            # The pooler: the catalog's name for the projection into a latent MoE. On SM100
+            # and later with TP and no DP, a step of at most 256 tokens splits its output
+            # columns over TP and all-gathers them (shard_pooler, shards_pooler,
+            # model.py:151, 505-523, 635-636, 658-664@0f6b2619).
+            dict(gemm_at("routed_expert_down_proj", latent, hidden, tp="replicated"),
+                 sharded_at_decode=MUSE_SHARDED_PROJECTION),
+            traffic("pre_expert_norm", 2 * latent * act, tp="replicated"),
+            node,
+            collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+            dict(collective("AllReduce", "moe_route_rows",
+                            EMIT_TENSOR_PARALLEL_WITHOUT_EXPERT_PARALLEL),
+                 bytes_per_token=rows),
+            # The finalize: read each route's row, norm and weight it, and write the sum.
+            # It accumulates in fp32 but stores its output buffer's dtype
+            # (fused_finalize.py:142-143@0f6b2619), and that buffer is allocated like the
+            # GEMM2 rows, at the activation width (_run_post_gemm2_hook,
+            # model_executor/layers/fused_moe/modular_kernel.py:543-548@0f6b2619).
+            traffic("post_expert_norm", rows + latent * act, tp="replicated"),
+            dict(collective("AllReduce", "moe_combine", EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH),
+                 bytes_per_token=latent * act),
+            # The unpooler, back out of it; split the same way, from 32 tokens where the TP
+            # group spans nodes (shards_unpooler, min_sharded_unpooler_tokens,
+            # model.py:154, 535-539, 638-644, 932-936).
+            dict(gemm_at("routed_expert_up_proj", hidden, latent, tp="replicated"),
+                 sharded_at_decode=dict(MUSE_SHARDED_PROJECTION, min_tokens_across_nodes=32)),
+        ]
+
+    kinds, sequence, seen = [], [], set()
+    for i, t in enumerate(attn_types):
+        win = window if t == "sliding_attention" else None
+        dtype = base if i in bf16_experts else expert_fmt
+        kid = ("swa" if win else "full") + "_moe" + (
+            "_" + base if expert_fmt and i in bf16_experts else "")
+        sequence.append(kid)
+        if kid in seen:
+            continue
+        seen.add(kid)
+        nodes = attention_nodes(win) + moe_nodes(dtype)
+        kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+
+    embed = {"op": "Gather", "role": "embed_tokens", "rows": vocab,
+             "row_bytes": hidden * act, "rows_per_token": 1,
+             "out_bytes_per_token": hidden * act, "shard": "rows"}
+    head = [traffic("final_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+            gemm_at("lm_head", vocab, hidden, tp="column")]
+    extras = {
+        "global": {
+            "architecture": raw["architectures"][0],
+            # max_position_embeddings with no RoPE scaling factor (rope_type default), so
+            # vLLM's derived max_model_len is that value.
+            "context_window": whole(require_key(cfg, "max_position_embeddings", model),
+                                    "max_position_embeddings"),
+            # What a pipeline stage hands the next: the fp32 residual stream alone, with
+            # the residual folded into it and no separate residual tensor
+            # (_make_empty_intermediate_tensors, model.py:1639-1650; the send carries
+            # hidden_states and any captured aux states only, :1724-1731).
+            "pipeline_boundary_bytes_per_token": hidden * fp32,
+        },
+        # A vocabulary-parallel lookup whose partials are all-reduced.
+        "embedding": [embed, collective("AllReduce", "embed_out", EMIT_TENSOR_PARALLEL)],
+        "head": head,
+    }
+    return kinds, compress(sequence), extras
+
+
+def handler_muse_spark_dspark(cfg, raw, model):
+    """Muse Spark's DSpark drafter, a checkpoint of its own (MuseSparkDSparkModel,
+    vllm/models/muse_spark/common/dspark.py@0f6b2619), which a deployment names as its
+    speculative draft_model.
+
+    The graph is the drafter, and states itself as the speculator a kernel prices beside
+    the target: num_hidden_layers dense Muse layers, each sliding-window only
+    (global_attn_cfg, model.py:1101-1108), that draft block_size tokens in ONE pass;
+    before it, the context stack over the target's scheduled tokens (the fc projection of
+    the target's hidden states at target_layer_ids and its norm, then each layer's
+    pre-norm and K/V projection and cache insert, _project_muse_context_kv and
+    precompute_and_store_context_kv, dspark.py:205-250); after it, the final norm and the
+    drafter's own lm_head (has_own_lm_head, dspark.py:281, 305-309); then the Markov head once
+    per draft position (DSparkMarkovHead, qwen3_dspark.py:48-93), both of whose weights
+    are replicated.
+
+    NOT PRICED, each small: the drafter's token embedding, which it does not load and so
+    reads from the target's table (load_weights drops model.embed_tokens, dspark.py:
+    360-368); the confidence head, which adaptive verification alone consults; the
+    output soft-cap. The context K/V projection reads a slice of each layer's
+    qkv_gate_proj rows, which a separate node cannot alias at a different shape, so those
+    rows' bytes are resident twice: 2 nkv d_h hidden per layer, 21 MiB a rank at TP8."""
+    def whole(v, key):
+        if isinstance(v, bool) or int(v) != v:
+            raise DeriveError(f"{model}: {key} is {v!r}, not a whole number")
+        return int(v)
+
+    hidden = whole(require(cfg, "hidden_size", model), "hidden_size")
+    layers = whole(require(cfg, "num_layers", model), "num_hidden_layers")
+    nq = whole(require(cfg, "num_q_heads", model), "num_attention_heads")
+    nkv = whole(require(cfg, "num_kv_heads", model), "num_key_value_heads")
+    dh = head_dim(cfg, model)
+    vocab = whole(require(cfg, "vocab_size", model), "vocab_size")
+    # The draft MLP's width is intermediate_size_mlp, which vLLM's config computes from
+    # the multiplier and does not read from the file (int(ffn_dim_multiplier *
+    # hidden_size), configs/muse_spark.py:247@0f6b2619, default multiplier 1.0 at :116;
+    # LlamaMLP(intermediate_size=config.intermediate_size_mlp), model.py:1360-1366).
+    mult = cfg.get("ffn_dim_multiplier", 1.0)
+    if isinstance(mult, bool) or not isinstance(mult, (int, float)) or mult <= 0:
+        raise DeriveError(f"{model}: ffn_dim_multiplier is {mult!r}")
+    ffn = int(mult * hidden)
+    window = whole(require(cfg, "sliding_window", model), "sliding_window")
+    block = whole(require_key(cfg, "block_size", model), "block_size")
+    markov = whole(require_key(cfg, "markov_rank", model), "markov_rank")
+    targets = require_key(cfg, "target_layer_ids", model)
+    target_hidden = whole(require_key(cfg, "target_hidden_size", model), "target_hidden_size")
+    target_layers = whole(require_key(cfg, "target_num_hidden_layers", model),
+                          "target_num_hidden_layers")
+    if (cfg.get("moe") or {}).get("is_enabled"):
+        raise DeriveError(f"{model}: an MoE drafter; this handler prices the dense one")
+    if not targets or any(not 0 <= int(t) < target_layers for t in targets):
+        raise DeriveError(f"{model}: target_layer_ids {targets} outside the target's "
+                          f"{target_layers} layers")
+    # The capture points the engine resolves for this drafter. Its config states the ids
+    # twice, in dflash_config and at the top level, and vLLM reads dflash_config first and
+    # adds one: target_layer_ids 13, 29, 45, 57, 61 are captured as 14, 30, 46, 58, 62, the
+    # last being the final layer's output (eagle3_utils.py:107-111@v0.32.0). The drafter
+    # concatenates one state per top-level id into its fc (dspark.py:106, 125@0f6b2619), so
+    # the engine must capture exactly that many.
+    aux_layers = draft_aux_hidden_state_layers(cfg, model, target_layers,
+                                               states=len(targets))
+    if set(cfg.get("layer_types") or ["sliding_attention"]) != {"sliding_attention"}:
+        raise DeriveError(f"{model}: a full-attention draft layer")
+    base = base_dtype(cfg, raw, model)
+    act = DTYPE_WIDTHS[base]
+    fp32 = DTYPE_WIDTHS["fp32"]
+
+    def traffic(role, nbytes, tp=None):
+        node = dict(norm(role), bytes_per_token=int(nbytes))
+        if tp:
+            node["tp"] = tp
+        return node
+
+    def with_tp(node, tp):
+        node["tp"] = tp
+        return node
+
+    # A draft layer's attention projects through the fused [Q, K, V, O-gate] linear when its
+    # configuration turns the output gate on (use_o_gate = config.use_attn_o_gate on the
+    # drafter, model.py:977@0f6b2619), which cannot replicate a KV head across ranks
+    # (MuseSpark1xQKVOGateParallelLinear, common/layers.py:368-371); the qkv_gate_proj and
+    # o_norm_gate nodes below price that gate, so the handler requires it.
+    if not cfg.get("use_attn_o_gate", False):
+        raise DeriveError(f"{model}: use_attn_o_gate is off, so the draft layers run the plain "
+                          f"QKV projection and no output gate, which this handler does not price")
+    attention = {"op": "Attention", "kind": "swa", "n_q": nq, "n_kv": nkv, "d_h": dh,
+                 "window": window, "kv_heads_not_replicated": True}
+
+    layer = [
+        traffic("input_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+        gemm("qkv_gate_proj", 2 * (nq + nkv) * dh, hidden),
+        traffic("qk_norm_rope", 2 * (nq + nkv) * dh * act),
+        attention,
+        traffic("o_norm_gate", 3 * nq * dh * act),
+        gemm("o_proj", hidden, nq * dh),
+        collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
+        traffic("post_attn_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+        gemm("mlp_gate_up", 2 * ffn, hidden),
+        gemm("mlp_down", hidden, ffn),
+        collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL),
+    ]
+    context = [
+        with_tp(gemm("dspark_fc", hidden, target_hidden * len(targets)), "replicated"),
+        traffic("dspark_hidden_norm", 2 * hidden * act, tp="replicated"),
+    ]
+    for d in range(layers):
+        context += [
+            traffic(f"dspark_context_norm_{d}", 2 * hidden * act, tp="replicated"),
+            gemm(f"dspark_context_kv_{d}", 2 * nkv * dh, hidden),
+            # The K norm, RoPE and the cache insert over the projected K and V.
+            traffic(f"dspark_context_kv_insert_{d}", 2 * 2 * nkv * dh * act),
+        ]
+    kinds = [{"id": "dspark_layer", "nodes": layer, "edges": chain(layer)},
+             {"id": "dspark_context", "nodes": context, "edges": chain(context)}]
+    head = [traffic("final_norm", hidden * fp32 + hidden * act, tp="replicated"),
+            with_tp(gemm("lm_head", vocab, hidden), "column")]
+    extras = {
+        "global": {"architecture": raw["architectures"][0]},
+        "head": head,
+        "speculator": {
+            "method": "dspark",
+            "num_spec_tokens": block,
+            "drafting": "parallel_block",
+            "stack": {"pattern": ["dspark_layer"], "repeat": layers},
+            "context_stack": {"pattern": ["dspark_context"], "repeat": 1},
+            "head": [traffic("dspark_final_norm", hidden * fp32 + hidden * act,
+                             tp="replicated"),
+                     {**with_tp(gemm("dspark_lm_head", vocab, hidden), "column"),
+                      "aliases": "head.lm_head"}],
+            "sequential_head": [
+                {"op": "Gather", "role": "markov_w1", "rows": vocab,
+                 "row_bytes": markov * act, "rows_per_token": 1,
+                 "out_bytes_per_token": markov * act},
+                with_tp(gemm("markov_w2", vocab, markov), "replicated"),
+            ],
+            "aux_hidden_state_layers": aux_layers,
+            # Each captured state is the target's fp32 residual stream, not one bf16
+            # activation: the target keeps the stream in fp32 (residual_dtype,
+            # model.py:1531@0f6b2619) and, at a capture point, appends either the stream
+            # itself or norm_then_gated_residual of it (model.py:1713-1722), which returns
+            # the stream's dtype (common/layers.py:276-286, 299-322; the fused kernel
+            # allocates its output like the stream, common/ops/fused_rmsnorm.py:295-296).
+            "aux_hidden_state_bytes_per_token": target_hidden * fp32,
+        },
+    }
+    return kinds, {"pattern": ["dspark_layer"], "repeat": layers}, extras
+
+
 HANDLERS = {
     "LlamaForCausalLM": handler_dense,
     "MistralForCausalLM": handler_dense,
@@ -4034,6 +4630,10 @@ HANDLERS = {
     "Qwen3_5MoeForConditionalGeneration": handler_qwen3_5_moe,
     "KimiK3ForConditionalGeneration": handler_kimi_k3,
     "Glm5NextForConditionalGeneration": handler_glm5_next,
+    # Muse Spark's language model is the text decoder of a multimodal checkpoint; the
+    # vision and audio towers are not priced (modality text_decoder_of_multimodal).
+    "MuseSparkForConditionalGeneration": handler_muse_spark,
+    "MuseSparkDSparkModel": handler_muse_spark_dspark,
     # Kimi-K2.5 is a vision-language model whose TEXT decoder vLLM instantiates as
     # DeepseekV2ForCausalLM over config.text_config
     # (model_executor/models/kimi_k25.py:371-376, architectures=["DeepseekV2ForCausalLM"]),
@@ -4053,7 +4653,8 @@ EXTRAS_KEYS = frozenset({"global", "embedding", "head", "speculator",
                          "base_capability_families", "arch_overrides"})
 # The global shapes a handler may add; the rest derive() computes itself.
 EXTRA_GLOBAL_KEYS = frozenset({"architecture", "weight_scale", "context_window",
-                               "default_context_window"})
+                               "default_context_window",
+                               "pipeline_boundary_bytes_per_token"})
 
 
 def derive(config_path: Path, model: str) -> dict[str, Any]:

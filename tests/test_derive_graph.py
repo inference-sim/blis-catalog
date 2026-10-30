@@ -2633,7 +2633,13 @@ def test_collectives_land_where_the_parallelism_needs_them():
                 assert all2all[0]["emit"] == "expert_parallel", (
                     f"{where}: All2All emits on {all2all[0]['emit']!r}, but expert "
                     f"dispatch is what expert parallelism conditions")
-                assert any(n["emit"] == mlp_reduction for n in allreduce), (
+                # A family whose MoE reduces a different tensor per mode states one
+                # reduction per mode instead; neither fires under a dispatch, which every
+                # sequence-parallel MoE has, so both stand down there too.
+                per_mode = {n["emit"] for n in allreduce} >= {
+                    "tensor_parallel_without_expert_parallel",
+                    "expert_parallel_without_dispatch"}
+                assert per_mode or any(n["emit"] == mlp_reduction for n in allreduce), (
                     f"{where}: a routed layer's MLP reduction must stand down under "
                     f"sequence parallelism, which is what {mlp_reduction!r} says")
                 checked_moe += 1
@@ -2656,7 +2662,9 @@ def test_every_emit_condition_is_one_a_resolver_knows():
     since that is what a rules pack decides them by (blis-schemas#55)."""
     dg = _dg()
     known = {dg.EMIT_TENSOR_PARALLEL, dg.EMIT_EXPERT_PARALLEL,
-             dg.EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE}
+             dg.EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE,
+             dg.EMIT_TENSOR_PARALLEL_WITHOUT_EXPERT_PARALLEL,
+             dg.EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH}
     own = {dg.EMIT_SEQUENCE_PARALLEL, dg.EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL}
     for d in model_dirs():
         g = graph_of(d)
@@ -5601,3 +5609,394 @@ def test_w4a16_group_scales_are_resident():
         g = graph_of(d)
         assert g["global"]["weight_dtype"] == "int4"
         assert g["global"].get("weight_scale") == {"elements": 32, "bytes": 2}, name
+
+
+# --- Muse Spark ------------------------------------------------------------------------
+
+MUSE = MODELS / "muse-spark-open-816b-a42b"
+MUSE_NVFP4 = MODELS / "muse-spark-open-816b-a42b-nvfp4"
+MUSE_DSPARK = MODELS / "muse-spark-open-dspark"
+
+
+def _derive_raw(raw: dict, tmp_path: Path, name: str = "muse-test") -> dict:
+    sys.path.insert(0, str(DERIVER.parent))
+    import derive_graph  # noqa: E402
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(raw))
+    return derive_graph.derive(p, name)
+
+
+def _kind_of(g: dict, layer: int) -> dict:
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    return kinds[layer_sequence(g["stack"])[layer]]
+
+
+def _node(kind: dict, role: str) -> dict:
+    found = [n for n in kind["nodes"] if n.get("role") == role]
+    assert len(found) == 1, f"{kind['id']}: {len(found)} nodes with role {role!r}"
+    return found[0]
+
+
+def test_muse_spark_layers_follow_layer_types():
+    """The 16 full-attention layers (1, 5, ..., 61) read the whole context; the other 46 a
+    2048-token window. Read per layer from layer_types, never from a period."""
+    raw = config_of(MUSE)
+    t = text_config(raw)
+    g = graph_of(MUSE)
+    seq = layer_sequence(g["stack"])
+    assert len(seq) == t["num_hidden_layers"] == 62
+    for i, lt in enumerate(t["layer_types"]):
+        attn = [
+            n for n in _kind_of(g, i)["nodes"] if n["op"] == "Attention"][0]
+        if lt == "full_attention":
+            assert attn["kind"] == "gqa" and "window" not in attn, i
+        else:
+            assert attn["kind"] == "swa" and attn["window"] == t["sliding_window"], i
+        assert (attn["n_q"], attn["n_kv"], attn["d_h"]) == (128, 16, 64)
+    assert sum(lt == "full_attention" for lt in t["layer_types"]) == 16
+
+
+def test_muse_spark_experts_run_at_the_latent_width():
+    """Every layer is an MoE of 256 experts at top-8 whose GEMMs run at moe_hidden_size,
+    between a pooler and an unpooler that run every token, with no shared expert."""
+    g = graph_of(MUSE)
+    for k in g["layer_kinds"]:
+        e = _node(k, "experts")
+        assert (e["experts"], e["top_k"], e["n"], e["k"], e["latent_size"]) == (
+            256, 8, 4096, 8192, 4096)
+        assert "shared_experts" not in e
+        down, up = _node(k, "routed_expert_down_proj"), _node(k, "routed_expert_up_proj")
+        assert (down["n"], down["k"]) == (4096, 8192)
+        assert (up["n"], up["k"]) == (8192, 4096)
+        assert down["tp"] == up["tp"] == "replicated"
+        router = _node(k, "router")
+        assert (router["n"], router["k"], router["weight_dtype"]) == (256, 8192, "fp32")
+
+
+def test_muse_spark_parameters_match_the_checkpoint():
+    """820.0 B parameters, the vLLM recipe's own count from this config (experts 798.9 B,
+    attention 13.5 B, squeeze/expand 4.2 B, router + embed + lm_head 3.4 B), and 42.8 B
+    active in the layers."""
+    g = graph_of(MUSE)
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    total = active = 0
+    for kid in layer_sequence(g["stack"]):
+        for n in kinds[kid]["nodes"]:
+            if n["op"] == "GEMM":
+                total += n["n"] * n["k"]
+                active += n["n"] * n["k"]
+            elif n["op"] == "GroupedGEMM":
+                per = 3 * n["n"] * n.get("latent_size", n["k"])
+                total += per * n["experts"]
+                active += per * n["top_k"]
+    total += sum(n["n"] * n["k"] for n in g["head"] if n["op"] == "GEMM")
+    total += sum(n["rows"] * n["row_bytes"] // 2 for n in g["embedding"] if n["op"] == "Gather")
+    assert round(total / 1e9, 1) == 820.0
+    assert round(active / 1e9, 1) == 42.8
+
+
+def test_muse_spark_moe_reduces_one_tensor_per_mode():
+    """Under TP the top_k per-route rows reduce before the post-expert norm; under EP with
+    every token on every rank only the latent-width combine does; with a dispatch the
+    all-to-all moves it. No hidden-width MoE all-reduce exists in any mode."""
+    g = graph_of(MUSE)
+    for k in g["layer_kinds"]:
+        rows = _node(k, "moe_route_rows")
+        combine = _node(k, "moe_combine")
+        assert rows["emit"] == "tensor_parallel_without_expert_parallel"
+        assert rows["bytes_per_token"] == 8 * 4096 * 2
+        assert combine["emit"] == "expert_parallel_without_dispatch"
+        assert combine["bytes_per_token"] == 4096 * 2
+        assert _node(k, "moe_dispatch_combine")["emit"] == "expert_parallel"
+        assert not any(n.get("role") == "mlp_out" for n in k["nodes"])
+
+
+def test_muse_spark_hands_an_fp32_stream_between_pipeline_stages():
+    g = graph_of(MUSE)
+    assert g["global"]["pipeline_boundary_bytes_per_token"] == 8192 * 4
+    assert g["global"]["architecture"] == "MuseSparkForConditionalGeneration"
+    assert g["global"]["context_window"] == 1048576
+    assert g["modality"] == "text_decoder_of_multimodal"
+
+
+def test_muse_spark_nvfp4_quantizes_only_the_experts_it_names():
+    """ModelOpt NVFP4 leaves attention, the pooler/unpooler, the router, lm_head and the
+    experts of layers 0 and 61 at BF16: those two layers are kinds of their own, and every
+    other expert node is NVFP4."""
+    raw = config_of(MUSE_NVFP4)
+    excluded = raw["quantization_config"]["modules_to_not_convert"]
+    g = graph_of(MUSE_NVFP4)
+    assert g["global"]["weight_dtype"] == "bf16"
+    for i in range(62):
+        e = _node(_kind_of(g, i), "experts")
+        named = f"model.language_model.layers.{i}.mlp.experts" in excluded
+        assert e.get("weight_dtype", "bf16") == ("bf16" if named else "nvfp4"), i
+    assert {i for i in range(62) if "weight_dtype" not in _node(_kind_of(g, i), "experts")} == {0, 61}
+    for k in g["layer_kinds"]:
+        for n in k["nodes"]:
+            if n["op"] == "GEMM":
+                assert n.get("weight_dtype") in (None, "bf16", "fp32"), (k["id"], n["role"])
+
+
+def test_muse_spark_refuses_what_it_does_not_price(tmp_path):
+    raw = config_of(MUSE)
+    for mutate, why in [
+        (lambda t: t.update(num_shared_experts=1), "shared expert"),
+        (lambda t: t["mlp_layer_types"].__setitem__(3, "dense"), "mlp_layer_types"),
+        (lambda t: t["layer_types"].__setitem__(3, "chunked_attention"), "layer_types"),
+        (lambda t: t.update(moe_hidden_size=16384), "moe_hidden_size"),
+        (lambda t: t["layer_types"].pop(), "entries"),
+    ]:
+        bad = json.loads(json.dumps(raw))
+        mutate(bad["text_config"])
+        sys.path.insert(0, str(DERIVER.parent))
+        import derive_graph  # noqa: E402
+        with pytest.raises(derive_graph.DeriveError, match=why):
+            _derive_raw(bad, tmp_path)
+
+
+def test_modelopt_takes_the_base_width_only_where_the_handler_places_each_node(tmp_path):
+    """ModelOpt quantizes every module its exclusion list does not name, so a single
+    global width is wrong for a partial checkpoint and right only by accident for a whole
+    one. Muse Spark's handler places each node's width itself, so the global width is the
+    base there; any other architecture is refused, as before this handler existed."""
+    D = deriver()
+    raw = config_of(MUSE_NVFP4)
+    assert D.weight_dtype(text_config(raw), raw, "x") == "bf16"
+    whole = json.loads(json.dumps(raw))
+    whole["quantization_config"]["quant_algo"] = "FP6"
+    with pytest.raises(D.DeriveError, match="quant_algo"):
+        D.weight_dtype(text_config(whole), whole, "x")
+    # A non-Muse NVFP4 ModelOpt checkpoint, with each spelling of an exclusion list and
+    # with none: refused, not priced at BF16 (modules_to_not_convert) or at NVFP4
+    # throughout (exclude_modules, nothing).
+    dense = config_of(MODELS / "llama-3.1-8b-instruct")
+    for extra in ({"exclude_modules": ["lm_head"]}, {"ignore": ["lm_head"]},
+                  {"modules_to_not_convert": ["lm_head"]}, {}):
+        bad = dict(dense, quantization_config={"quant_method": "modelopt",
+                                               "quant_algo": "NVFP4", "group_size": 16,
+                                               **extra})
+        with pytest.raises(D.DeriveError, match="ModelOpt"):
+            _derive_raw(bad, tmp_path, "llama-nvfp4")
+
+
+def test_modelopt_exclusions_match_as_vllm_matches_them():
+    """vLLM's ModelOpt config reads `ignore`, else `exclude_modules`, and never
+    modules_to_not_convert (modelopt.py:358-359@0f6b2619); a module is excluded when an
+    entry equals it, is a substring of it, or matches it as a wildcard, and a trailing
+    `*` also names the module itself (modelopt.py:187-220, 263-281@v0.32.0)."""
+    D = deriver()
+    experts = "model.layers.{}.feed_forward.experts".format
+    pats = D.modelopt_exclusions({"exclude_modules": ["layers.1", "self_attn"],
+                                  "modules_to_not_convert": ["lm_head"]})
+    assert pats == ["layers.1", "self_attn"]
+    # A substring, not a component match: "layers.1" also names layers 10-19.
+    assert [i for i in range(62) if D.modelopt_excluded(experts(i), pats)] == [
+        1, *range(10, 20)]
+    assert D.modelopt_excluded("model.layers.3.self_attn.qkv_proj", pats)
+    assert not D.modelopt_excluded("lm_head", pats)
+    assert D.modelopt_exclusions({"ignore": ["a"], "exclude_modules": ["b"]}) == ["a"]
+    assert D.modelopt_exclusions({"ignore": [], "exclude_modules": ["b"]}) == []
+    assert [i for i in range(62) if D.modelopt_excluded(
+        experts(i), D.modelopt_exclusions({"exclude_modules": ["*layers.2?.*experts"]}))] == [
+        *range(20, 30)]
+    assert D.modelopt_exclusions({"exclude_modules": ["model.layers.4*"]}) == [
+        "model.layers.4", "model.layers.4.*"]
+
+
+def test_muse_spark_nvfp4_reads_the_list_vllm_reads(tmp_path):
+    """The BF16 expert layers are the ones exclude_modules names; modules_to_not_convert
+    is not read. A checkpoint that leaves attention or lm_head quantized is refused,
+    because the handler prices both at the base width."""
+    D = deriver()
+    raw = config_of(MUSE_NVFP4)
+    committed = graph_of(MUSE_NVFP4)
+    same = lambda a, b: {k: v for k, v in a.items() if k != "derived_from"} == {
+        k: v for k, v in b.items() if k != "derived_from"}
+    assert same(_derive_raw(raw, tmp_path, MUSE_NVFP4.name), committed)
+    no_legacy = json.loads(json.dumps(raw))
+    del no_legacy["quantization_config"]["modules_to_not_convert"]
+    assert same(_derive_raw(no_legacy, tmp_path, MUSE_NVFP4.name), committed)
+    moved = json.loads(json.dumps(raw))
+    moved["quantization_config"]["exclude_modules"] = [
+        "layers.1", "self_attn", "lm_head"]
+    g = _derive_raw(moved, tmp_path, MUSE_NVFP4.name)
+    bf16 = {i for i in range(62) if "weight_dtype" not in _node(_kind_of(g, i), "experts")}
+    assert bf16 == {1, *range(10, 20)}
+    for drop, why in (("self_attn", "attention"), ("lm_head", "lm_head")):
+        bad = json.loads(json.dumps(raw))
+        bad["quantization_config"]["exclude_modules"].remove(drop)
+        with pytest.raises(D.DeriveError, match=why):
+            _derive_raw(bad, tmp_path, MUSE_NVFP4.name)
+
+
+def test_muse_spark_dspark_drafter_is_its_own_speculator():
+    """Five dense sliding-window layers draft block_size tokens in one pass; the context
+    stack projects the five target layers' hidden states; the Markov head runs per
+    position over replicated weights."""
+    raw = config_of(MUSE_DSPARK)
+    g = graph_of(MUSE_DSPARK)
+    sp = g["speculator"]
+    assert (sp["method"], sp["num_spec_tokens"], sp["drafting"]) == ("dspark", 7, "parallel_block")
+    assert sp["stack"] == {"pattern": ["dspark_layer"], "repeat": 5}
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    attn = [n for n in kinds["dspark_layer"]["nodes"] if n["op"] == "Attention"][0]
+    assert (attn["kind"], attn["window"]) == ("swa", 2048)
+    fc = _node(kinds["dspark_context"], "dspark_fc")
+    assert (fc["n"], fc["k"]) == (8192, 8192 * len(raw["target_layer_ids"]))
+    assert [n["role"] for n in sp["sequential_head"]] == ["markov_w1", "markov_w2"]
+    assert _node({"id": "h", "nodes": sp["sequential_head"]}, "markov_w2")["tp"] == "replicated"
+
+
+# --- Auxiliary hidden states and the pipeline boundary --------------------------------
+
+def test_muse_spark_dspark_states_the_target_layers_it_reads():
+    """vLLM resolves the drafter's capture points from dflash_config.target_layer_ids,
+    adding one (get_eagle3_aux_layers_from_config, eagle3_utils.py:107-111@v0.32.0), and
+    the target captures its fp32 residual stream there (model.py:1713-1722@0f6b2619)."""
+    raw = config_of(MUSE_DSPARK)
+    sp = graph_of(MUSE_DSPARK)["speculator"]
+    assert raw["dflash_config"]["target_layer_ids"] == [13, 29, 45, 57, 61]
+    assert sp["aux_hidden_state_layers"] == [14, 30, 46, 58, 62]
+    assert sp["aux_hidden_state_bytes_per_token"] == 8192 * 4
+
+
+def test_draft_aux_layers_follow_the_engine_resolution_order(tmp_path):
+    """Each source vLLM consults, in its order, with its own offset; an id past the
+    target's last layer, or a count the drafter's fc cannot take, is refused."""
+    D = deriver()
+    raw = config_of(MUSE_DSPARK)
+
+    def aux(mutate):
+        bad = json.loads(json.dumps(raw))
+        mutate(bad)
+        return _derive_raw(bad, tmp_path)["speculator"]["aux_hidden_state_layers"]
+
+    # dflash_config wins over the top-level ids, and adds one.
+    assert aux(lambda c: c["dflash_config"].update(target_layer_ids=[0, 1, 2, 3, 4])) == [
+        1, 2, 3, 4, 5]
+    # Without it, the dense-DSpark top-level ids, plus one.
+    assert aux(lambda c: c.pop("dflash_config")) == [14, 30, 46, 58, 62]
+    # An explicit eagle list is taken as-is, ahead of everything else.
+    assert aux(lambda c: c.update(eagle_aux_hidden_state_layer_ids=[2, 4, 6, 8, 10])) == [
+        2, 4, 6, 8, 10]
+    for mutate, why in [
+        # 61 + 1 is the last layer's output; 62 + 1 is past it.
+        (lambda c: c["dflash_config"].update(target_layer_ids=[13, 29, 45, 57, 62]),
+         "past the target's 62 layers"),
+        (lambda c: c["dflash_config"].update(target_layer_ids=[13, 29, 45, 57]),
+         "captures 4 states"),
+        (lambda c: c["dflash_config"].update(target_layer_ids=[13, 13, 45, 57, 61]),
+         "strictly increasing"),
+    ]:
+        bad = json.loads(json.dumps(raw))
+        mutate(bad)
+        with pytest.raises(D.DeriveError, match=why):
+            _derive_raw(bad, tmp_path)
+
+
+def test_v41_dspark_reads_its_target_layer_ids_as_is():
+    """For model_type deepseek_v41 vLLM uses dspark_target_layer_ids without the +1
+    (eagle3_utils.py:115-120@v0.32.0), and each captured state is the bf16 mean of the
+    hc_mult streams, one hidden-width activation (tilelang.py:313-323, mhc.py:260-264), so
+    the default width stands."""
+    raw = config_of(V41)
+    sp = v41_graph()["speculator"]
+    assert raw["model_type"] == "deepseek_v41"
+    assert sp["aux_hidden_state_layers"] == text_config(raw)["dspark_target_layer_ids"]
+    assert sp["aux_hidden_state_layers"] == [37, 38, 39]
+    assert "aux_hidden_state_bytes_per_token" not in sp
+
+
+def test_an_mtp_speculator_reads_no_aux_layers():
+    assert "aux_hidden_state_layers" not in v4_graph()["speculator"]
+
+
+# What each architecture's stage boundary carries where it is not vLLM's standard
+# hidden_states + residual pair (the schema's default, 2 x hidden x 2 bytes).
+BOUNDARY_BYTES = {
+    # One fp32 stream (_make_empty_intermediate_tensors, model.py:1639-1650@0f6b2619).
+    "muse-spark-open-816b-a42b": 8192 * 4,
+    "muse-spark-open-816b-a42b-nvfp4": 8192 * 4,
+    # The (hc_mult, hidden) bundle at the activation dtype (deepseek_v4/nvidia/
+    # model.py:1406-1424@v0.32.0).
+    "deepseek-v4-pro": 4 * 7168 * 2,
+    # That bundle plus the (hc_mult,) fp32 pre-mix (deepseek_v41/nvidia/
+    # model.py:885-910@v0.32.0).
+    "deepseek-v4.1-flash": 4 * 5120 * 2 + 4 * 4,
+    # hidden_states alone (inkling/nvidia/model.py:294-296, 354-359@v0.32.0).
+    "inkling": 6144 * 2,
+}
+
+
+@pytest.mark.parametrize("d", model_dirs(), ids=lambda d: d.name)
+def test_pipeline_boundary_bytes_follow_the_intermediate_tensors(d: Path):
+    """A graph states its boundary only where vLLM sends something other than the
+    standard pair; every other committed architecture sends the pair and omits it.
+    Kimi-K3's attention-residual blocks make its residual stage-dependent
+    (kimi_k3/nvidia/model.py:1201-1222@v0.32.0), which one figure cannot state."""
+    g = graph_of(d)
+    assert g["global"].get("pipeline_boundary_bytes_per_token") == BOUNDARY_BYTES.get(d.name)
+
+
+def test_muse_spark_post_expert_finalize_writes_the_activation_dtype():
+    """The finalize reads each route's bf16 GEMM2 row and accumulates in fp32, but writes
+    its output buffer's dtype (fused_finalize.py:142-143@0f6b2619), which is allocated in
+    the GEMM2 rows' dtype (modular_kernel.py:543-548), the activation width:
+    8 x 4096 x 2 read + 4096 x 2 written."""
+    for d in (MUSE, MUSE_NVFP4):
+        for k in graph_of(d)["layer_kinds"]:
+            assert _node(k, "post_expert_norm")["bytes_per_token"] == 8 * 4096 * 2 + 4096 * 2
+    assert 8 * 4096 * 2 + 4096 * 2 == 73728
+
+
+def test_muse_spark_dspark_ffn_width_is_the_multiplier_times_hidden(tmp_path):
+    """The draft layer's MLP is intermediate_size_mlp, which vLLM's config computes as
+    int(ffn_dim_multiplier * hidden_size) and does not read from the file
+    (configs/muse_spark.py:247@0f6b2619; model.py:1360-1366), not intermediate_size."""
+    raw = config_of(MUSE_DSPARK)
+    bad = json.loads(json.dumps(raw))
+    bad.update(ffn_dim_multiplier=1.5, intermediate_size=12345, intermediate_size_mlp=999)
+    kinds = {k["id"]: k for k in _derive_raw(bad, tmp_path, MUSE_DSPARK.name)["layer_kinds"]}
+    layer = kinds["dspark_layer"]
+    assert (_node(layer, "mlp_gate_up")["n"], _node(layer, "mlp_down")["k"]) == (
+        2 * 12288, 12288)
+    committed = {k["id"]: k for k in graph_of(MUSE_DSPARK)["layer_kinds"]}["dspark_layer"]
+    assert _node(committed, "mlp_down")["k"] == int(raw["ffn_dim_multiplier"] * 8192) == 16384
+    bad.pop("ffn_dim_multiplier")
+    # vLLM's default multiplier is 1.0 (configs/muse_spark.py:116).
+    kinds = {k["id"]: k for k in _derive_raw(bad, tmp_path, MUSE_DSPARK.name)["layer_kinds"]}
+    assert _node(kinds["dspark_layer"], "mlp_down")["k"] == 8192
+
+
+def test_muse_spark_attention_cannot_replicate_a_kv_head(tmp_path):
+    """Muse Spark projects Q, K, V and the output gate through one fused linear that slices by
+    head group and asserts total_num_kv_heads % tp_size == 0 (MuseSpark1xQKVOGateParallelLinear,
+    vllm/models/muse_spark/common/layers.py:368-371@0f6b2619): the target always uses it
+    (use_o_gate True off the drafter, nvidia/model.py:977), the drafter where its configuration
+    turns the gate on. Every attention node says so, and a drafter without the gate is refused."""
+    for m in (MUSE, MUSE_NVFP4, MUSE_DSPARK):
+        for k in graph_of(m)["layer_kinds"]:
+            for n in k["nodes"]:
+                if n["op"] == "Attention":
+                    assert n.get("kv_heads_not_replicated") is True, (m.name, k["id"])
+    raw = config_of(MUSE_DSPARK)
+    bad = json.loads(json.dumps(raw))
+    bad["use_attn_o_gate"] = False
+    with pytest.raises(deriver().DeriveError, match="use_attn_o_gate"):
+        _derive_raw(bad, tmp_path, MUSE_DSPARK.name)
+
+
+def test_muse_spark_pooler_and_unpooler_shard_at_decode_on_blackwell():
+    """On SM100 and later with TP and no DP, a step of at most 256 tokens computes the MoE
+    pooler's and unpooler's output columns a TP slice at a time and all-gathers them
+    (shard_pooler / shard_unpooler, _SHARDED_PROJECTION_MAX_TOKENS,
+    vllm/models/muse_spark/nvidia/model.py:151, 505-523, 635-660@0f6b2619); the unpooler only
+    from 32 tokens when the TP group spans nodes (:154, 535-539). Both stay replicated GEMMs."""
+    for m in (MUSE, MUSE_NVFP4):
+        for k in graph_of(m)["layer_kinds"]:
+            pool, unpool = _node(k, "routed_expert_down_proj"), _node(k, "routed_expert_up_proj")
+            assert pool["tp"] == unpool["tp"] == "replicated"
+            assert pool["sharded_at_decode"] == {"capability_family": 10, "max_tokens": 256}
+            assert unpool["sharded_at_decode"] == {"capability_family": 10, "max_tokens": 256,
+                                                   "min_tokens_across_nodes": 32}
