@@ -5967,3 +5967,21 @@ def test_muse_spark_dspark_ffn_width_is_the_multiplier_times_hidden(tmp_path):
     # vLLM's default multiplier is 1.0 (configs/muse_spark.py:116).
     kinds = {k["id"]: k for k in _derive_raw(bad, tmp_path, MUSE_DSPARK.name)["layer_kinds"]}
     assert _node(kinds["dspark_layer"], "mlp_down")["k"] == 8192
+
+
+def test_muse_spark_attention_cannot_replicate_a_kv_head(tmp_path):
+    """Muse Spark projects Q, K, V and the output gate through one fused linear that slices by
+    head group and asserts total_num_kv_heads % tp_size == 0 (MuseSpark1xQKVOGateParallelLinear,
+    vllm/models/muse_spark/common/layers.py:368-371@0f6b2619): the target always uses it
+    (use_o_gate True off the drafter, nvidia/model.py:977), the drafter where its configuration
+    turns the gate on. Every attention node says so, and a drafter without the gate is refused."""
+    for m in (MUSE, MUSE_NVFP4, MUSE_DSPARK):
+        for k in graph_of(m)["layer_kinds"]:
+            for n in k["nodes"]:
+                if n["op"] == "Attention":
+                    assert n.get("kv_heads_not_replicated") is True, (m.name, k["id"])
+    raw = config_of(MUSE_DSPARK)
+    bad = json.loads(json.dumps(raw))
+    bad["use_attn_o_gate"] = False
+    with pytest.raises(deriver().DeriveError, match="use_attn_o_gate"):
+        _derive_raw(bad, tmp_path, MUSE_DSPARK.name)

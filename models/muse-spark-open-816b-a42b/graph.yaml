@@ -32,6 +32,7 @@ layer_kinds:
     n_q: 128
     n_kv: 16
     d_h: 64
+    kv_heads_not_replicated: true
     window: 2048
   - op: Elementwise
     role: o_norm_gate
@@ -140,6 +141,7 @@ layer_kinds:
     n_q: 128
     n_kv: 16
     d_h: 64
+    kv_heads_not_replicated: true
   - op: Elementwise
     role: o_norm_gate
     bytes_per_token: 49152

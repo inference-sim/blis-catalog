@@ -4318,8 +4318,12 @@ def handler_muse_spark(cfg, raw, model):
         return node
 
     def attention_nodes(win):
+        # The target always projects Q, K, V and the output gate in one fused linear that
+        # slices by head group and cannot replicate a KV head (use_o_gate is True off the
+        # drafter, model.py:977; MuseSpark1xQKVOGateParallelLinear asserts
+        # total_num_kv_heads % tp_size == 0, common/layers.py:368-371@0f6b2619).
         attn = {"op": "Attention", "kind": "swa" if win else "gqa", "n_q": nq,
-                "n_kv": nkv, "d_h": dh}
+                "n_kv": nkv, "d_h": dh, "kv_heads_not_replicated": True}
         if win:
             attn["window"] = int(win)
         # Unquantized in both checkpoints: ModelOpt excludes self_attn, so the attention
@@ -4482,12 +4486,22 @@ def handler_muse_spark_dspark(cfg, raw, model):
         node["tp"] = tp
         return node
 
+    # A draft layer's attention projects through the fused [Q, K, V, O-gate] linear when its
+    # configuration turns the output gate on (use_o_gate = config.use_attn_o_gate on the
+    # drafter, model.py:977@0f6b2619), which cannot replicate a KV head across ranks
+    # (MuseSpark1xQKVOGateParallelLinear, common/layers.py:368-371); the qkv_gate_proj and
+    # o_norm_gate nodes below price that gate, so the handler requires it.
+    if not cfg.get("use_attn_o_gate", False):
+        raise DeriveError(f"{model}: use_attn_o_gate is off, so the draft layers run the plain "
+                          f"QKV projection and no output gate, which this handler does not price")
+    attention = {"op": "Attention", "kind": "swa", "n_q": nq, "n_kv": nkv, "d_h": dh,
+                 "window": window, "kv_heads_not_replicated": True}
+
     layer = [
         traffic("input_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
         gemm("qkv_gate_proj", 2 * (nq + nkv) * dh, hidden),
         traffic("qk_norm_rope", 2 * (nq + nkv) * dh * act),
-        {"op": "Attention", "kind": "swa", "n_q": nq, "n_kv": nkv, "d_h": dh,
-         "window": window},
+        attention,
         traffic("o_norm_gate", 3 * nq * dh * act),
         gemm("o_proj", hidden, nq * dh),
         collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
