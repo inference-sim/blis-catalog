@@ -33,7 +33,7 @@ jobs:
         # one-line change.
         # TEMPORARY: the pushed head of inference-sim/blis-schemas#112 (the fabric scope key
         # and the Muse Spark graph vocabulary), until that pull request is released.
-        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.8.1-0.20261030134601-9f0c06989492 .
+        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.8.1-0.20261030142930-ecfc6a8f8656 .
 
   derive-graph:
     name: check derived graphs
