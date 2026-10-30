@@ -78,7 +78,7 @@ layer_kinds:
     bytes_per_token: 65536
   - op: Elementwise
     role: post_expert_norm
-    bytes_per_token: 81920
+    bytes_per_token: 73728
     tp: replicated
   - op: AllReduce
     role: moe_combine
@@ -186,7 +186,7 @@ layer_kinds:
     bytes_per_token: 65536
   - op: Elementwise
     role: post_expert_norm
-    bytes_per_token: 81920
+    bytes_per_token: 73728
     tp: replicated
   - op: AllReduce
     role: moe_combine
@@ -295,7 +295,7 @@ layer_kinds:
     bytes_per_token: 65536
   - op: Elementwise
     role: post_expert_norm
-    bytes_per_token: 81920
+    bytes_per_token: 73728
     tp: replicated
   - op: AllReduce
     role: moe_combine
@@ -402,7 +402,7 @@ layer_kinds:
     bytes_per_token: 65536
   - op: Elementwise
     role: post_expert_norm
-    bytes_per_token: 81920
+    bytes_per_token: 73728
     tp: replicated
   - op: AllReduce
     role: moe_combine

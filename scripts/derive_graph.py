@@ -4355,8 +4355,12 @@ def handler_muse_spark(cfg, raw, model):
             dict(collective("AllReduce", "moe_route_rows",
                             EMIT_TENSOR_PARALLEL_WITHOUT_EXPERT_PARALLEL),
                  bytes_per_token=rows),
-            # The finalize: read each route's row, write the fp32 weighted sum.
-            traffic("post_expert_norm", rows + latent * fp32, tp="replicated"),
+            # The finalize: read each route's row, norm and weight it, and write the sum.
+            # It accumulates in fp32 but stores its output buffer's dtype
+            # (fused_finalize.py:142-143@0f6b2619), and that buffer is allocated like the
+            # GEMM2 rows, at the activation width (_run_post_gemm2_hook,
+            # model_executor/layers/fused_moe/modular_kernel.py:543-548@0f6b2619).
+            traffic("post_expert_norm", rows + latent * act, tp="replicated"),
             dict(collective("AllReduce", "moe_combine", EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH),
                  bytes_per_token=latent * act),
             # The unpooler, back out of it.
@@ -4434,7 +4438,14 @@ def handler_muse_spark_dspark(cfg, raw, model):
     nkv = whole(require(cfg, "num_kv_heads", model), "num_key_value_heads")
     dh = head_dim(cfg, model)
     vocab = whole(require(cfg, "vocab_size", model), "vocab_size")
-    ffn = whole(require(cfg, "ffn_size", model), "intermediate_size")
+    # The draft MLP's width is intermediate_size_mlp, which vLLM's config computes from
+    # the multiplier and does not read from the file (int(ffn_dim_multiplier *
+    # hidden_size), configs/muse_spark.py:247@0f6b2619, default multiplier 1.0 at :116;
+    # LlamaMLP(intermediate_size=config.intermediate_size_mlp), model.py:1360-1366).
+    mult = cfg.get("ffn_dim_multiplier", 1.0)
+    if isinstance(mult, bool) or not isinstance(mult, (int, float)) or mult <= 0:
+        raise DeriveError(f"{model}: ffn_dim_multiplier is {mult!r}")
+    ffn = int(mult * hidden)
     window = whole(require(cfg, "sliding_window", model), "sliding_window")
     block = whole(require_key(cfg, "block_size", model), "block_size")
     markov = whole(require_key(cfg, "markov_rank", model), "markov_rank")

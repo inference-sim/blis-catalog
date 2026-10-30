@@ -5937,3 +5937,33 @@ def test_pipeline_boundary_bytes_follow_the_intermediate_tensors(d: Path):
     (kimi_k3/nvidia/model.py:1201-1222@v0.32.0), which one figure cannot state."""
     g = graph_of(d)
     assert g["global"].get("pipeline_boundary_bytes_per_token") == BOUNDARY_BYTES.get(d.name)
+
+
+def test_muse_spark_post_expert_finalize_writes_the_activation_dtype():
+    """The finalize reads each route's bf16 GEMM2 row and accumulates in fp32, but writes
+    its output buffer's dtype (fused_finalize.py:142-143@0f6b2619), which is allocated in
+    the GEMM2 rows' dtype (modular_kernel.py:543-548), the activation width:
+    8 x 4096 x 2 read + 4096 x 2 written."""
+    for d in (MUSE, MUSE_NVFP4):
+        for k in graph_of(d)["layer_kinds"]:
+            assert _node(k, "post_expert_norm")["bytes_per_token"] == 8 * 4096 * 2 + 4096 * 2
+    assert 8 * 4096 * 2 + 4096 * 2 == 73728
+
+
+def test_muse_spark_dspark_ffn_width_is_the_multiplier_times_hidden(tmp_path):
+    """The draft layer's MLP is intermediate_size_mlp, which vLLM's config computes as
+    int(ffn_dim_multiplier * hidden_size) and does not read from the file
+    (configs/muse_spark.py:247@0f6b2619; model.py:1360-1366), not intermediate_size."""
+    raw = config_of(MUSE_DSPARK)
+    bad = json.loads(json.dumps(raw))
+    bad.update(ffn_dim_multiplier=1.5, intermediate_size=12345, intermediate_size_mlp=999)
+    kinds = {k["id"]: k for k in _derive_raw(bad, tmp_path, MUSE_DSPARK.name)["layer_kinds"]}
+    layer = kinds["dspark_layer"]
+    assert (_node(layer, "mlp_gate_up")["n"], _node(layer, "mlp_down")["k"]) == (
+        2 * 12288, 12288)
+    committed = {k["id"]: k for k in graph_of(MUSE_DSPARK)["layer_kinds"]}["dspark_layer"]
+    assert _node(committed, "mlp_down")["k"] == int(raw["ffn_dim_multiplier"] * 8192) == 16384
+    bad.pop("ffn_dim_multiplier")
+    # vLLM's default multiplier is 1.0 (configs/muse_spark.py:116).
+    kinds = {k["id"]: k for k in _derive_raw(bad, tmp_path, MUSE_DSPARK.name)["layer_kinds"]}
+    assert _node(kinds["dspark_layer"], "mlp_down")["k"] == 8192
