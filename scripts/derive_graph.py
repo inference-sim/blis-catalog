@@ -4167,6 +4167,13 @@ def handler_glm5_next(cfg, raw, model):
 # behaviour.
 MUSE_SPARK_SOURCE = "vllm/models/muse_spark/nvidia/model.py@0f6b2619"
 
+# When Muse Spark splits its replicated MoE pooler and unpooler over TP: on a device of
+# capability 10.0 or later (has_device_capability(100), tep_default, model.py:516-520) and
+# a step of at most _SHARDED_PROJECTION_MAX_TOKENS = 256 tokens (model.py:151). Whether the
+# model's other conditions hold -- tp > 1, no DP, no mega-MoE or sequence parallelism
+# (replicated_tokens, :505-512) -- is the consumer's to read from the layout.
+MUSE_SHARDED_PROJECTION = {"capability_family": 10, "max_tokens": 256}
+
 # Per token, a fused residual boundary reads the branch (activation width) and the fp32
 # residual stream, writes the stream back and the normalized activation for the next
 # block: post-norm, residual add and pre-norm in one pass (norm_residual_then_norm,
@@ -4351,8 +4358,12 @@ def handler_muse_spark(cfg, raw, model):
         return [
             traffic("post_attn_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
             gemm_at("router", experts, hidden, tp="replicated", dtype="fp32"),
-            # The pooler: the catalog's name for the projection into a latent MoE.
-            gemm_at("routed_expert_down_proj", latent, hidden, tp="replicated"),
+            # The pooler: the catalog's name for the projection into a latent MoE. On SM100
+            # and later with TP and no DP, a step of at most 256 tokens splits its output
+            # columns over TP and all-gathers them (shard_pooler, shards_pooler,
+            # model.py:151, 505-523, 635-636, 658-664@0f6b2619).
+            dict(gemm_at("routed_expert_down_proj", latent, hidden, tp="replicated"),
+                 sharded_at_decode=MUSE_SHARDED_PROJECTION),
             traffic("pre_expert_norm", 2 * latent * act, tp="replicated"),
             node,
             collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
@@ -4367,8 +4378,11 @@ def handler_muse_spark(cfg, raw, model):
             traffic("post_expert_norm", rows + latent * act, tp="replicated"),
             dict(collective("AllReduce", "moe_combine", EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH),
                  bytes_per_token=latent * act),
-            # The unpooler, back out of it.
-            gemm_at("routed_expert_up_proj", hidden, latent, tp="replicated"),
+            # The unpooler, back out of it; split the same way, from 32 tokens where the TP
+            # group spans nodes (shards_unpooler, min_sharded_unpooler_tokens,
+            # model.py:154, 535-539, 638-644, 932-936).
+            dict(gemm_at("routed_expert_up_proj", hidden, latent, tp="replicated"),
+                 sharded_at_decode=dict(MUSE_SHARDED_PROJECTION, min_tokens_across_nodes=32)),
         ]
 
     kinds, sequence, seen = [], [], set()
