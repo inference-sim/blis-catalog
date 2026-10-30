@@ -2633,7 +2633,13 @@ def test_collectives_land_where_the_parallelism_needs_them():
                 assert all2all[0]["emit"] == "expert_parallel", (
                     f"{where}: All2All emits on {all2all[0]['emit']!r}, but expert "
                     f"dispatch is what expert parallelism conditions")
-                assert any(n["emit"] == mlp_reduction for n in allreduce), (
+                # A family whose MoE reduces a different tensor per mode states one
+                # reduction per mode instead; neither fires under a dispatch, which every
+                # sequence-parallel MoE has, so both stand down there too.
+                per_mode = {n["emit"] for n in allreduce} >= {
+                    "tensor_parallel_without_expert_parallel",
+                    "expert_parallel_without_dispatch"}
+                assert per_mode or any(n["emit"] == mlp_reduction for n in allreduce), (
                     f"{where}: a routed layer's MLP reduction must stand down under "
                     f"sequence parallelism, which is what {mlp_reduction!r} says")
                 checked_moe += 1
@@ -2656,7 +2662,9 @@ def test_every_emit_condition_is_one_a_resolver_knows():
     since that is what a rules pack decides them by (blis-schemas#55)."""
     dg = _dg()
     known = {dg.EMIT_TENSOR_PARALLEL, dg.EMIT_EXPERT_PARALLEL,
-             dg.EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE}
+             dg.EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE,
+             dg.EMIT_TENSOR_PARALLEL_WITHOUT_EXPERT_PARALLEL,
+             dg.EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH}
     own = {dg.EMIT_SEQUENCE_PARALLEL, dg.EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL}
     for d in model_dirs():
         g = graph_of(d)
@@ -5601,3 +5609,181 @@ def test_w4a16_group_scales_are_resident():
         g = graph_of(d)
         assert g["global"]["weight_dtype"] == "int4"
         assert g["global"].get("weight_scale") == {"elements": 32, "bytes": 2}, name
+
+
+# --- Muse Spark ------------------------------------------------------------------------
+
+MUSE = MODELS / "muse-spark-open-816b-a42b"
+MUSE_NVFP4 = MODELS / "muse-spark-open-816b-a42b-nvfp4"
+MUSE_DSPARK = MODELS / "muse-spark-open-dspark"
+
+
+def _derive_raw(raw: dict, tmp_path: Path, name: str = "muse-test") -> dict:
+    sys.path.insert(0, str(DERIVER.parent))
+    import derive_graph  # noqa: E402
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(raw))
+    return derive_graph.derive(p, name)
+
+
+def _kind_of(g: dict, layer: int) -> dict:
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    return kinds[layer_sequence(g["stack"])[layer]]
+
+
+def _node(kind: dict, role: str) -> dict:
+    found = [n for n in kind["nodes"] if n.get("role") == role]
+    assert len(found) == 1, f"{kind['id']}: {len(found)} nodes with role {role!r}"
+    return found[0]
+
+
+def test_muse_spark_layers_follow_layer_types():
+    """The 16 full-attention layers (1, 5, ..., 61) read the whole context; the other 46 a
+    2048-token window. Read per layer from layer_types, never from a period."""
+    raw = config_of(MUSE)
+    t = text_config(raw)
+    g = graph_of(MUSE)
+    seq = layer_sequence(g["stack"])
+    assert len(seq) == t["num_hidden_layers"] == 62
+    for i, lt in enumerate(t["layer_types"]):
+        attn = [
+            n for n in _kind_of(g, i)["nodes"] if n["op"] == "Attention"][0]
+        if lt == "full_attention":
+            assert attn["kind"] == "gqa" and "window" not in attn, i
+        else:
+            assert attn["kind"] == "swa" and attn["window"] == t["sliding_window"], i
+        assert (attn["n_q"], attn["n_kv"], attn["d_h"]) == (128, 16, 64)
+    assert sum(lt == "full_attention" for lt in t["layer_types"]) == 16
+
+
+def test_muse_spark_experts_run_at_the_latent_width():
+    """Every layer is an MoE of 256 experts at top-8 whose GEMMs run at moe_hidden_size,
+    between a pooler and an unpooler that run every token, with no shared expert."""
+    g = graph_of(MUSE)
+    for k in g["layer_kinds"]:
+        e = _node(k, "experts")
+        assert (e["experts"], e["top_k"], e["n"], e["k"], e["latent_size"]) == (
+            256, 8, 4096, 8192, 4096)
+        assert "shared_experts" not in e
+        down, up = _node(k, "routed_expert_down_proj"), _node(k, "routed_expert_up_proj")
+        assert (down["n"], down["k"]) == (4096, 8192)
+        assert (up["n"], up["k"]) == (8192, 4096)
+        assert down["tp"] == up["tp"] == "replicated"
+        router = _node(k, "router")
+        assert (router["n"], router["k"], router["weight_dtype"]) == (256, 8192, "fp32")
+
+
+def test_muse_spark_parameters_match_the_checkpoint():
+    """820.0 B parameters, the vLLM recipe's own count from this config (experts 798.9 B,
+    attention 13.5 B, squeeze/expand 4.2 B, router + embed + lm_head 3.4 B), and 42.8 B
+    active in the layers."""
+    g = graph_of(MUSE)
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    total = active = 0
+    for kid in layer_sequence(g["stack"]):
+        for n in kinds[kid]["nodes"]:
+            if n["op"] == "GEMM":
+                total += n["n"] * n["k"]
+                active += n["n"] * n["k"]
+            elif n["op"] == "GroupedGEMM":
+                per = 3 * n["n"] * n.get("latent_size", n["k"])
+                total += per * n["experts"]
+                active += per * n["top_k"]
+    total += sum(n["n"] * n["k"] for n in g["head"] if n["op"] == "GEMM")
+    total += sum(n["rows"] * n["row_bytes"] // 2 for n in g["embedding"] if n["op"] == "Gather")
+    assert round(total / 1e9, 1) == 820.0
+    assert round(active / 1e9, 1) == 42.8
+
+
+def test_muse_spark_moe_reduces_one_tensor_per_mode():
+    """Under TP the top_k per-route rows reduce before the post-expert norm; under EP with
+    every token on every rank only the latent-width combine does; with a dispatch the
+    all-to-all moves it. No hidden-width MoE all-reduce exists in any mode."""
+    g = graph_of(MUSE)
+    for k in g["layer_kinds"]:
+        rows = _node(k, "moe_route_rows")
+        combine = _node(k, "moe_combine")
+        assert rows["emit"] == "tensor_parallel_without_expert_parallel"
+        assert rows["bytes_per_token"] == 8 * 4096 * 2
+        assert combine["emit"] == "expert_parallel_without_dispatch"
+        assert combine["bytes_per_token"] == 4096 * 2
+        assert _node(k, "moe_dispatch_combine")["emit"] == "expert_parallel"
+        assert not any(n.get("role") == "mlp_out" for n in k["nodes"])
+
+
+def test_muse_spark_hands_an_fp32_stream_between_pipeline_stages():
+    g = graph_of(MUSE)
+    assert g["global"]["pipeline_boundary_bytes_per_token"] == 8192 * 4
+    assert g["global"]["architecture"] == "MuseSparkForConditionalGeneration"
+    assert g["global"]["context_window"] == 1048576
+    assert g["modality"] == "text_decoder_of_multimodal"
+
+
+def test_muse_spark_nvfp4_quantizes_only_the_experts_it_names():
+    """ModelOpt NVFP4 leaves attention, the pooler/unpooler, the router, lm_head and the
+    experts of layers 0 and 61 at BF16: those two layers are kinds of their own, and every
+    other expert node is NVFP4."""
+    raw = config_of(MUSE_NVFP4)
+    excluded = raw["quantization_config"]["modules_to_not_convert"]
+    g = graph_of(MUSE_NVFP4)
+    assert g["global"]["weight_dtype"] == "bf16"
+    for i in range(62):
+        e = _node(_kind_of(g, i), "experts")
+        named = f"model.language_model.layers.{i}.mlp.experts" in excluded
+        assert e.get("weight_dtype", "bf16") == ("bf16" if named else "nvfp4"), i
+    assert {i for i in range(62) if "weight_dtype" not in _node(_kind_of(g, i), "experts")} == {0, 61}
+    for k in g["layer_kinds"]:
+        for n in k["nodes"]:
+            if n["op"] == "GEMM":
+                assert n.get("weight_dtype") in (None, "bf16", "fp32"), (k["id"], n["role"])
+
+
+def test_muse_spark_refuses_what_it_does_not_price(tmp_path):
+    raw = config_of(MUSE)
+    for mutate, why in [
+        (lambda t: t.update(num_shared_experts=1), "shared expert"),
+        (lambda t: t["mlp_layer_types"].__setitem__(3, "dense"), "mlp_layer_types"),
+        (lambda t: t["layer_types"].__setitem__(3, "chunked_attention"), "layer_types"),
+        (lambda t: t.update(moe_hidden_size=16384), "moe_hidden_size"),
+        (lambda t: t["layer_types"].pop(), "entries"),
+    ]:
+        bad = json.loads(json.dumps(raw))
+        mutate(bad["text_config"])
+        sys.path.insert(0, str(DERIVER.parent))
+        import derive_graph  # noqa: E402
+        with pytest.raises(derive_graph.DeriveError, match=why):
+            _derive_raw(bad, tmp_path)
+
+
+def test_modelopt_quant_algo_names_the_expert_width_only_where_it_excludes_modules(tmp_path):
+    """A ModelOpt checkpoint that excludes modules keeps the base as the global width; one
+    that excludes none is wholly in its quant_algo."""
+    sys.path.insert(0, str(DERIVER.parent))
+    import derive_graph  # noqa: E402
+    raw = config_of(MUSE_NVFP4)
+    cfg = text_config(raw)
+    assert derive_graph.weight_dtype(cfg, raw, "x") == "bf16"
+    whole = json.loads(json.dumps(raw))
+    whole["quantization_config"]["modules_to_not_convert"] = []
+    assert derive_graph.weight_dtype(text_config(whole), whole, "x") == "nvfp4"
+    whole["quantization_config"]["quant_algo"] = "FP6"
+    with pytest.raises(derive_graph.DeriveError, match="quant_algo"):
+        derive_graph.weight_dtype(text_config(whole), whole, "x")
+
+
+def test_muse_spark_dspark_drafter_is_its_own_speculator():
+    """Five dense sliding-window layers draft block_size tokens in one pass; the context
+    stack projects the five target layers' hidden states; the Markov head runs per
+    position over replicated weights."""
+    raw = config_of(MUSE_DSPARK)
+    g = graph_of(MUSE_DSPARK)
+    sp = g["speculator"]
+    assert (sp["method"], sp["num_spec_tokens"], sp["drafting"]) == ("dspark", 7, "parallel_block")
+    assert sp["stack"] == {"pattern": ["dspark_layer"], "repeat": 5}
+    kinds = {k["id"]: k for k in g["layer_kinds"]}
+    attn = [n for n in kinds["dspark_layer"]["nodes"] if n["op"] == "Attention"][0]
+    assert (attn["kind"], attn["window"]) == ("swa", 2048)
+    fc = _node(kinds["dspark_context"], "dspark_fc")
+    assert (fc["n"], fc["k"]) == (8192, 8192 * len(raw["target_layer_ids"]))
+    assert [n["role"] for n in sp["sequential_head"]] == ["markov_w1", "markov_w2"]
+    assert _node({"id": "h", "nodes": sp["sequential_head"]}, "markov_w2")["tp"] == "replicated"

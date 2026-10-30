@@ -383,6 +383,19 @@ def weight_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
         fmt = str(quant.get("quant_method", "")).lower()
         if "nvfp4" in fmt or "modelopt_fp4" in fmt:
             return "nvfp4"
+        # ModelOpt states its format as quant_algo beside quant_method "modelopt", and,
+        # like the mxfp4 case below, names in modules_to_not_convert what it leaves at the
+        # base width. Muse Spark's NVFP4 checkpoint excludes all attention, the latent
+        # projections, lm_head and two layers' experts, so NVFP4 is the expert width
+        # only, carried on those nodes, and the global width stays the base.
+        if fmt == "modelopt" and quant.get("quant_algo"):
+            algo = QUANT_ALGOS.get(str(quant["quant_algo"]).upper())
+            if algo is None:
+                raise DeriveError(f"{model}: ModelOpt quant_algo {quant['quant_algo']!r} "
+                                  f"is not one this deriver maps")
+            if quant.get("modules_to_not_convert"):
+                return base_dtype(cfg, raw, model)
+            return algo
         if "fp8" in fmt:
             return "fp8"
         # A per-group block states the width per tensor set rather than once. The
@@ -805,6 +818,12 @@ EMIT_TENSOR_PARALLEL_UNLESS_SP_MOE = "tensor_parallel_unless_sp_moe"
 # global.architecture names (blis-schemas#55); DeepSeek-V4.1 is the family that needs it.
 EMIT_SEQUENCE_PARALLEL = "sequence_parallel"
 EMIT_TENSOR_PARALLEL_UNLESS_SEQUENCE_PARALLEL = "tensor_parallel_unless_sequence_parallel"
+# An MoE that reduces a different tensor in each mode states one collective per mode
+# (blis-schemas emit conditions): the TP-sharded experts' own reduction, and the combine
+# of expert-parallel partials when every rank holds every token. Muse Spark is the family
+# that needs them (handler_muse_spark).
+EMIT_TENSOR_PARALLEL_WITHOUT_EXPERT_PARALLEL = "tensor_parallel_without_expert_parallel"
+EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH = "expert_parallel_without_dispatch"
 
 
 def collective(op: str, role: str, emit: str) -> dict[str, Any]:
@@ -3994,6 +4013,339 @@ def handler_glm5_next(cfg, raw, model):
     return kinds, compress(sequence)
 
 
+# --- Muse Spark -------------------------------------------------------------------
+# Every fact below is read from vLLM's Muse Spark model code as merged in
+# vllm-project/vllm#61879 (merge commit 0f6b26191064384aa35060c87f4ed570c7875e66, cited
+# as @0f6b2619), the code the vLLM recipe serves the model with. Muse Spark support
+# landed after vLLM v0.32.0, so these are model-code facts at that commit, not v0.32.0
+# behaviour.
+MUSE_SPARK_SOURCE = "vllm/models/muse_spark/nvidia/model.py@0f6b2619"
+
+# Per token, a fused residual boundary reads the branch (activation width) and the fp32
+# residual stream, writes the stream back and the normalized activation for the next
+# block: post-norm, residual add and pre-norm in one pass (norm_residual_then_norm,
+# model.py:1425-1500). The stream is carried in fp32 (residual_dtype, model.py:1396).
+def _muse_boundary_bytes(hidden: int, act: int) -> int:
+    fp32 = DTYPE_WIDTHS["fp32"]
+    return hidden * act + 2 * hidden * fp32 + hidden * act
+
+
+def handler_muse_spark(cfg, raw, model):
+    """Muse Spark: GQA with a hybrid sliding-window/full pattern, an MoE on every layer
+    whose experts run at a narrower latent width, and an fp32 residual stream.
+
+    The layer (MuseSpark1xDecoderLayer and its attention and MoE, model.py@0f6b2619):
+
+      * attention: a fused [Q, K, V, O-gate] projection of 2 (nq + nkv) d_h rows
+        (MuseSpark1xQKVOGateParallelLinear, common/layers.py:339-369), QK-norm and RoPE
+        fused with the KV-cache insert (model.py:1167-1222), GQA over a 2048-token window
+        on the sliding layers and the whole context on the full ones (layer_types,
+        model.py:1101-1110), the per-head output norm fused with its sigmoid gate
+        (model.py:1240-1262), the row-parallel o_proj and its TP all-reduce;
+      * the MoE (MuseSpark1xMoE, model.py:373-940): an fp32 router over the hidden state
+        before the squeeze (GateLinear with fp32 params and fp32 input, :413-428), the
+        replicated pooler hidden -> moe_hidden_size and its norm, 256 experts at top-8
+        whose GEMMs run at the latent width (latent_size), the post-expert finalize
+        (a per-route RMSNorm, then the fp32 weighted sum, muse_moe_runner.py:160-330),
+        and the replicated unpooler back to hidden. No shared expert.
+      * the reductions an MoE layer runs depend on the mode, so each states its own
+        condition. Under tensor parallelism without expert parallelism the experts'
+        GEMM2 rows are partial sums and RMS is not linear in them, so the top_k
+        per-route rows are all-reduced BEFORE the norm (needs_pre_norm_all_reduce,
+        common/moe.py:114-120; muse_moe_runner.py:288-290). Under expert parallelism
+        with every token on every rank (no dispatch: dp 1, no sequence parallelism),
+        each rank's combined latent output is partial over its experts and is
+        all-reduced once (_create_all_reduce, muse_moe_runner.py:200-215). With a
+        dispatch (data parallelism), the all-to-all moves it. The unpooler's output is
+        replicated, so nothing reduces at hidden width after the MoE.
+
+    The NVFP4 checkpoint (ModelOpt, quant_algo NVFP4, group 16) excludes the attention,
+    the pooler and unpooler, the router, lm_head, and the experts of layers 0 and 61,
+    which stay BF16 (modules_to_not_convert); those two layers are kinds of their own.
+
+    KNOWN GAPS, recorded rather than priced:
+      * On SM100 with dp 1 and at most 256 tokens a step, the pooler and unpooler shard
+        their output columns over TP and all-gather (shard_pooler/shard_unpooler,
+        model.py:502-541, 638-660). A layer kind cannot change its TP layout with the
+        chip and the step size, so both are priced replicated: exact on Hopper and in
+        prefill, an overstatement of GB200-class decode by one replicated
+        (moe_hidden_size x hidden) BF16 read per projection per layer.
+      * The final logit soft-cap (final_logit_softcapping) runs on the sampled rows'
+        vocabulary-wide logits, which no node of a head can scope to sampled rows, so it
+        is not priced.
+      * Under sequence-parallel MoE the gathered unpooler output (model.py:936-938) is
+        not stated; Muse runs data parallelism only on Blackwell's TRT-LLM experts.
+    """
+    def whole(v, key):
+        if isinstance(v, bool) or int(v) != v:
+            raise DeriveError(f"{model}: {key} is {v!r}, not a whole number")
+        return int(v)
+
+    hidden = whole(require(cfg, "hidden_size", model), "hidden_size")
+    layers = whole(require(cfg, "num_layers", model), "num_hidden_layers")
+    nq = whole(require(cfg, "num_q_heads", model), "num_attention_heads")
+    nkv = whole(require(cfg, "num_kv_heads", model), "num_key_value_heads")
+    dh = head_dim(cfg, model)
+    vocab = whole(require(cfg, "vocab_size", model), "vocab_size")
+    experts = whole(require(cfg, "num_experts", model), "num_local_experts")
+    top_k = whole(require(cfg, "top_k", model), "num_experts_per_tok")
+    inner = whole(require_key(cfg, "moe_intermediate_size", model), "moe_intermediate_size")
+    latent = whole(require_key(cfg, "moe_hidden_size", model), "moe_hidden_size")
+    window = pick(cfg, "sliding_window")
+    if top_k > experts:
+        raise DeriveError(f"{model}: top-{top_k} routing over {experts} experts")
+    if int(pick(cfg, "num_shared_experts") or 0):
+        raise DeriveError(f"{model}: a shared expert, which this architecture's MoE never "
+                          f"builds (model.py:373-470)")
+    if not 0 < latent <= hidden:
+        raise DeriveError(f"{model}: moe_hidden_size {latent} is not a narrowing of "
+                          f"hidden_size {hidden}")
+    attn_types = require_key(cfg, "layer_types", model)
+    mlp_types = require_key(cfg, "mlp_layer_types", model)
+    for key, vec in (("layer_types", attn_types), ("mlp_layer_types", mlp_types)):
+        if len(vec) != layers:
+            raise DeriveError(f"{model}: {key} has {len(vec)} entries for {layers} layers")
+    unknown = set(attn_types) - {"sliding_attention", "full_attention"}
+    if unknown:
+        raise DeriveError(f"{model}: layer_types names {sorted(unknown)}")
+    if set(mlp_types) != {"sparse"}:
+        raise DeriveError(f"{model}: mlp_layer_types {sorted(set(mlp_types))}; every Muse "
+                          f"Spark layer is an MoE, and a dense one is not priced here")
+    if "sliding_attention" in attn_types and not window:
+        raise DeriveError(f"{model}: sliding layers with no sliding_window")
+
+    base = base_dtype(cfg, raw, model)
+    act = DTYPE_WIDTHS[base]
+    fp32 = DTYPE_WIDTHS["fp32"]
+
+    # Which layers' experts the checkpoint quantizes. A layer the exclusion list names
+    # keeps the base width; the rest carry the method's.
+    quant = raw.get("quantization_config") or {}
+    expert_fmt = None
+    bf16_experts: set[int] = set()
+    if quant:
+        if str(quant.get("quant_method", "")).lower() != "modelopt":
+            raise DeriveError(f"{model}: quant_method {quant.get('quant_method')!r}; this "
+                              f"handler reads ModelOpt's layout")
+        expert_fmt = QUANT_ALGOS.get(str(quant.get("quant_algo", "")).upper())
+        if expert_fmt is None:
+            raise DeriveError(f"{model}: quant_algo {quant.get('quant_algo')!r}")
+        prefix = "model.language_model.layers."
+        for name in quant.get("modules_to_not_convert") or ():
+            if name.startswith(prefix) and name.endswith(".mlp.experts"):
+                bf16_experts.add(int(name[len(prefix):].split(".")[0]))
+
+    def gemm_at(role, n, k, tp=None, dtype=None):
+        node = gemm(role, n, k)
+        if tp:
+            node["tp"] = tp
+        if dtype:
+            node["weight_dtype"] = dtype
+        return node
+
+    def traffic(role, nbytes, tp=None):
+        node = dict(norm(role), bytes_per_token=int(nbytes))
+        if tp:
+            node["tp"] = tp
+        return node
+
+    def attention_nodes(win):
+        attn = {"op": "Attention", "kind": "swa" if win else "gqa", "n_q": nq,
+                "n_kv": nkv, "d_h": dh}
+        if win:
+            attn["window"] = int(win)
+        # Unquantized in both checkpoints: ModelOpt excludes self_attn, so the attention
+        # GEMMs carry the base width explicitly where the global width is the base anyway.
+        return [
+            traffic("input_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+            gemm_at("qkv_gate_proj", 2 * (nq + nkv) * dh, hidden),
+            # QK-norm and RoPE read and write Q and K once, fused with the cache insert,
+            # whose record the attention's cache accounts for.
+            traffic("qk_norm_rope", 2 * (nq + nkv) * dh * act),
+            attn,
+            # The per-head output norm and its sigmoid gate: read the output and the gate,
+            # write the gated output.
+            traffic("o_norm_gate", 3 * nq * dh * act),
+            gemm_at("o_proj", hidden, nq * dh),
+            collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
+        ]
+
+    def moe_nodes(expert_dtype):
+        node = {"op": "GroupedGEMM", "role": "experts", "n": inner, "k": hidden,
+                "experts": experts, "top_k": top_k, "latent_size": latent}
+        if expert_dtype and expert_dtype != base:
+            node["weight_dtype"] = expert_dtype
+        rows = top_k * latent * act
+        return [
+            traffic("post_attn_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+            gemm_at("router", experts, hidden, tp="replicated", dtype="fp32"),
+            # The pooler: the catalog's name for the projection into a latent MoE.
+            gemm_at("routed_expert_down_proj", latent, hidden, tp="replicated"),
+            traffic("pre_expert_norm", 2 * latent * act, tp="replicated"),
+            node,
+            collective("All2All", "moe_dispatch_combine", EMIT_EXPERT_PARALLEL),
+            dict(collective("AllReduce", "moe_route_rows",
+                            EMIT_TENSOR_PARALLEL_WITHOUT_EXPERT_PARALLEL),
+                 bytes_per_token=rows),
+            # The finalize: read each route's row, write the fp32 weighted sum.
+            traffic("post_expert_norm", rows + latent * fp32, tp="replicated"),
+            dict(collective("AllReduce", "moe_combine", EMIT_EXPERT_PARALLEL_WITHOUT_DISPATCH),
+                 bytes_per_token=latent * act),
+            # The unpooler, back out of it.
+            gemm_at("routed_expert_up_proj", hidden, latent, tp="replicated"),
+        ]
+
+    kinds, sequence, seen = [], [], set()
+    for i, t in enumerate(attn_types):
+        win = window if t == "sliding_attention" else None
+        dtype = base if i in bf16_experts else expert_fmt
+        kid = ("swa" if win else "full") + "_moe" + (
+            "_" + base if expert_fmt and i in bf16_experts else "")
+        sequence.append(kid)
+        if kid in seen:
+            continue
+        seen.add(kid)
+        nodes = attention_nodes(win) + moe_nodes(dtype)
+        kinds.append({"id": kid, "nodes": nodes, "edges": chain(nodes)})
+
+    embed = {"op": "Gather", "role": "embed_tokens", "rows": vocab,
+             "row_bytes": hidden * act, "rows_per_token": 1,
+             "out_bytes_per_token": hidden * act, "shard": "rows"}
+    head = [traffic("final_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+            gemm_at("lm_head", vocab, hidden, tp="column")]
+    extras = {
+        "global": {
+            "architecture": raw["architectures"][0],
+            # max_position_embeddings with no RoPE scaling factor (rope_type default), so
+            # vLLM's derived max_model_len is that value.
+            "context_window": whole(require_key(cfg, "max_position_embeddings", model),
+                                    "max_position_embeddings"),
+            # What a pipeline stage hands the next: the fp32 residual stream
+            # (_make_empty_intermediate_tensors, model.py:1640-1650).
+            "pipeline_boundary_bytes_per_token": hidden * fp32,
+        },
+        # A vocabulary-parallel lookup whose partials are all-reduced.
+        "embedding": [embed, collective("AllReduce", "embed_out", EMIT_TENSOR_PARALLEL)],
+        "head": head,
+    }
+    return kinds, compress(sequence), extras
+
+
+def handler_muse_spark_dspark(cfg, raw, model):
+    """Muse Spark's DSpark drafter, a checkpoint of its own (MuseSparkDSparkModel,
+    vllm/models/muse_spark/common/dspark.py@0f6b2619), which a deployment names as its
+    speculative draft_model.
+
+    The graph is the drafter, and states itself as the speculator a kernel prices beside
+    the target: num_hidden_layers dense Muse layers, each sliding-window only
+    (global_attn_cfg, model.py:1101-1108), that draft block_size tokens in ONE pass;
+    before it, the context stack over the target's scheduled tokens (the fc projection of
+    the target's hidden states at target_layer_ids and its norm, then each layer's
+    pre-norm and K/V projection and cache insert, _project_muse_context_kv and
+    precompute_and_store_context_kv, dspark.py:205-250); after it, the final norm and the
+    drafter's own lm_head (has_own_lm_head, dspark.py:310-330); then the Markov head once
+    per draft position (DSparkMarkovHead, qwen3_dspark.py:48-93), both of whose weights
+    are replicated.
+
+    NOT PRICED, each small: the drafter's token embedding, which it does not load and so
+    reads from the target's table (load_weights drops model.embed_tokens, dspark.py:
+    360-368); the confidence head, which adaptive verification alone consults; the
+    output soft-cap. The context K/V projection reads a slice of each layer's
+    qkv_gate_proj rows, which a separate node cannot alias at a different shape, so those
+    rows' bytes are resident twice: 2 nkv d_h hidden per layer, 21 MiB a rank at TP8."""
+    def whole(v, key):
+        if isinstance(v, bool) or int(v) != v:
+            raise DeriveError(f"{model}: {key} is {v!r}, not a whole number")
+        return int(v)
+
+    hidden = whole(require(cfg, "hidden_size", model), "hidden_size")
+    layers = whole(require(cfg, "num_layers", model), "num_hidden_layers")
+    nq = whole(require(cfg, "num_q_heads", model), "num_attention_heads")
+    nkv = whole(require(cfg, "num_kv_heads", model), "num_key_value_heads")
+    dh = head_dim(cfg, model)
+    vocab = whole(require(cfg, "vocab_size", model), "vocab_size")
+    ffn = whole(require(cfg, "ffn_size", model), "intermediate_size")
+    window = whole(require(cfg, "sliding_window", model), "sliding_window")
+    block = whole(require_key(cfg, "block_size", model), "block_size")
+    markov = whole(require_key(cfg, "markov_rank", model), "markov_rank")
+    targets = require_key(cfg, "target_layer_ids", model)
+    target_hidden = whole(require_key(cfg, "target_hidden_size", model), "target_hidden_size")
+    target_layers = whole(require_key(cfg, "target_num_hidden_layers", model),
+                          "target_num_hidden_layers")
+    if (cfg.get("moe") or {}).get("is_enabled"):
+        raise DeriveError(f"{model}: an MoE drafter; this handler prices the dense one")
+    if not targets or any(not 0 <= int(t) < target_layers for t in targets):
+        raise DeriveError(f"{model}: target_layer_ids {targets} outside the target's "
+                          f"{target_layers} layers")
+    if set(cfg.get("layer_types") or ["sliding_attention"]) != {"sliding_attention"}:
+        raise DeriveError(f"{model}: a full-attention draft layer")
+    base = base_dtype(cfg, raw, model)
+    act = DTYPE_WIDTHS[base]
+    fp32 = DTYPE_WIDTHS["fp32"]
+
+    def traffic(role, nbytes, tp=None):
+        node = dict(norm(role), bytes_per_token=int(nbytes))
+        if tp:
+            node["tp"] = tp
+        return node
+
+    def with_tp(node, tp):
+        node["tp"] = tp
+        return node
+
+    layer = [
+        traffic("input_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+        gemm("qkv_gate_proj", 2 * (nq + nkv) * dh, hidden),
+        traffic("qk_norm_rope", 2 * (nq + nkv) * dh * act),
+        {"op": "Attention", "kind": "swa", "n_q": nq, "n_kv": nkv, "d_h": dh,
+         "window": window},
+        traffic("o_norm_gate", 3 * nq * dh * act),
+        gemm("o_proj", hidden, nq * dh),
+        collective("AllReduce", "attn_out", EMIT_TENSOR_PARALLEL),
+        traffic("post_attn_norm", _muse_boundary_bytes(hidden, act), tp="replicated"),
+        gemm("mlp_gate_up", 2 * ffn, hidden),
+        gemm("mlp_down", hidden, ffn),
+        collective("AllReduce", "mlp_out", EMIT_TENSOR_PARALLEL),
+    ]
+    context = [
+        with_tp(gemm("dspark_fc", hidden, target_hidden * len(targets)), "replicated"),
+        traffic("dspark_hidden_norm", 2 * hidden * act, tp="replicated"),
+    ]
+    for d in range(layers):
+        context += [
+            traffic(f"dspark_context_norm_{d}", 2 * hidden * act, tp="replicated"),
+            gemm(f"dspark_context_kv_{d}", 2 * nkv * dh, hidden),
+            # The K norm, RoPE and the cache insert over the projected K and V.
+            traffic(f"dspark_context_kv_insert_{d}", 2 * 2 * nkv * dh * act),
+        ]
+    kinds = [{"id": "dspark_layer", "nodes": layer, "edges": chain(layer)},
+             {"id": "dspark_context", "nodes": context, "edges": chain(context)}]
+    head = [traffic("final_norm", hidden * fp32 + hidden * act, tp="replicated"),
+            with_tp(gemm("lm_head", vocab, hidden), "column")]
+    extras = {
+        "global": {"architecture": raw["architectures"][0]},
+        "head": head,
+        "speculator": {
+            "method": "dspark",
+            "num_spec_tokens": block,
+            "drafting": "parallel_block",
+            "stack": {"pattern": ["dspark_layer"], "repeat": layers},
+            "context_stack": {"pattern": ["dspark_context"], "repeat": 1},
+            "head": [traffic("dspark_final_norm", hidden * fp32 + hidden * act,
+                             tp="replicated"),
+                     {**with_tp(gemm("dspark_lm_head", vocab, hidden), "column"),
+                      "aliases": "head.lm_head"}],
+            "sequential_head": [
+                {"op": "Gather", "role": "markov_w1", "rows": vocab,
+                 "row_bytes": markov * act, "rows_per_token": 1,
+                 "out_bytes_per_token": markov * act},
+                with_tp(gemm("markov_w2", vocab, markov), "replicated"),
+            ],
+        },
+    }
+    return kinds, {"pattern": ["dspark_layer"], "repeat": layers}, extras
+
+
 HANDLERS = {
     "LlamaForCausalLM": handler_dense,
     "MistralForCausalLM": handler_dense,
@@ -4034,6 +4386,10 @@ HANDLERS = {
     "Qwen3_5MoeForConditionalGeneration": handler_qwen3_5_moe,
     "KimiK3ForConditionalGeneration": handler_kimi_k3,
     "Glm5NextForConditionalGeneration": handler_glm5_next,
+    # Muse Spark's language model is the text decoder of a multimodal checkpoint; the
+    # vision and audio towers are not priced (modality text_decoder_of_multimodal).
+    "MuseSparkForConditionalGeneration": handler_muse_spark,
+    "MuseSparkDSparkModel": handler_muse_spark_dspark,
     # Kimi-K2.5 is a vision-language model whose TEXT decoder vLLM instantiates as
     # DeepseekV2ForCausalLM over config.text_config
     # (model_executor/models/kimi_k25.py:371-376, architectures=["DeepseekV2ForCausalLM"]),
@@ -4053,7 +4409,8 @@ EXTRAS_KEYS = frozenset({"global", "embedding", "head", "speculator",
                          "base_capability_families", "arch_overrides"})
 # The global shapes a handler may add; the rest derive() computes itself.
 EXTRA_GLOBAL_KEYS = frozenset({"architecture", "weight_scale", "context_window",
-                               "default_context_window"})
+                               "default_context_window",
+                               "pipeline_boundary_bytes_per_token"})
 
 
 def derive(config_path: Path, model: str) -> dict[str, Any]:

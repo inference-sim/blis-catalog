@@ -31,7 +31,9 @@ jobs:
         # fails naming the file when an entry is malformed. Nothing here re-implements
         # a rule — pinned by version so the gate is reproducible and bumping it is a
         # one-line change.
-        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.4.0 .
+        # TEMPORARY: the pushed head of inference-sim/blis-schemas#112 (the fabric scope key
+        # and the Muse Spark graph vocabulary), until that pull request is released.
+        run: go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.8.1-0.20261030013641-b796f8db50ce .
 
   derive-graph:
     name: check derived graphs

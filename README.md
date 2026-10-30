@@ -206,8 +206,10 @@ CI validates every committed entry by running that owner's binary against the
 checkout, pinned by version:
 
 ```sh
-go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.4.0 .
+go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.8.1-0.20261030013641-b796f8db50ce .
 ```
+
+(TEMPORARY: the pushed head of inference-sim/blis-schemas#112, until it is released.)
 
 It walks all six namespaces (`models/`, `hardware/`, `networks/`, `workloads/`,
 `devices/`, `measurements/`), prints a per-entry summary, and fails naming the file when an entry
