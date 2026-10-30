@@ -4217,13 +4217,32 @@ def handler_muse_spark(cfg, raw, model):
     vLLM reads; the pooler, unpooler and router are built unquantized. Layers 0 and 61
     are kinds of their own.
 
+    The pooler and unpooler state sharded_at_decode: on SM100 with TP, dp 1 and at most
+    256 tokens a step they shard their output columns over TP and all-gather
+    (shard_pooler/shard_unpooler, model.py:502-541, 638-660), which the consumer prices.
+
     KNOWN GAPS, recorded rather than priced:
-      * On SM100 with dp 1 and at most 256 tokens a step, the pooler and unpooler shard
-        their output columns over TP and all-gather (shard_pooler/shard_unpooler,
-        model.py:502-541, 638-660). A layer kind cannot change its TP layout with the
-        chip and the step size, so both are priced replicated: exact on Hopper and in
-        prefill, an overstatement of GB200-class decode by one replicated
-        (moe_hidden_size x hidden) BF16 read per projection per layer.
+      * Under PP the residual stream is not fused across layers (fuse_across_layers is
+        pp == 1, model.py:1533): every layer's output runs norm_then_gated_residual
+        (model.py:1711-1712) and the next layer's input norm runs on its own, one extra
+        fp32 stream pass, hidden x 4 B a token a layer, against the fused boundary priced
+        here. No emit condition names pipeline parallelism, so it is not priced (about
+        +9% of a layer's elementwise traffic under PP).
+      * The token-embedding norm (tok_embeddings_norm, model.py:1662-1664) reads the bf16
+        lookup and writes the fp32 stream, hidden x (2 + 4) B a token, and layer 0's input
+        norm then runs on its own (model.py:1431-1435), hidden x (4 + 2) B, where the
+        layer kind prices the fused boundary, hidden x (2 + 8 + 2) B. The two offset
+        exactly in bytes; one launch is unpriced.
+      * The fp32 router input for 32 < tokens <= 128 (wants_fp32_router_input,
+        model.py:670-677, 1451-1455) is on only where torch allows TF32 matmuls
+        (model.py:413-416), which VLLM_FLOAT32_MATMUL_PRECISION's default "highest" does
+        not; no node can scope bytes to a token range, so it is not priced.
+      * Under EP the finalize reads only the rank's local routes (fused_finalize.py
+        masks remote experts, muse_moe_runner.py:340-342), where post_expert_norm charges
+        every rank all top_k rows; no node scales its bytes by the expert-parallel width.
+      * The native finalize (_finalize_chunk, muse_moe_runner.py:433-439) materialises a
+        (tokens x top_k x moe_hidden_size) fp32 intermediate; it runs only on Blackwell at
+        TP > 1 above 8192 tokens or where FlashInfer's TP finalize is unavailable.
       * The final logit soft-cap (final_logit_softcapping) runs on the sampled rows'
         vocabulary-wide logits, which no node of a head can scope to sampled rows, so it
         is not priced.
@@ -4435,7 +4454,7 @@ def handler_muse_spark_dspark(cfg, raw, model):
     the target's hidden states at target_layer_ids and its norm, then each layer's
     pre-norm and K/V projection and cache insert, _project_muse_context_kv and
     precompute_and_store_context_kv, dspark.py:205-250); after it, the final norm and the
-    drafter's own lm_head (has_own_lm_head, dspark.py:310-330); then the Markov head once
+    drafter's own lm_head (has_own_lm_head, dspark.py:281, 305-309); then the Markov head once
     per draft position (DSparkMarkovHead, qwen3_dspark.py:48-93), both of whose weights
     are replicated.
 
