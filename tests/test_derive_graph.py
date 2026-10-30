@@ -5787,3 +5787,94 @@ def test_muse_spark_dspark_drafter_is_its_own_speculator():
     assert (fc["n"], fc["k"]) == (8192, 8192 * len(raw["target_layer_ids"]))
     assert [n["role"] for n in sp["sequential_head"]] == ["markov_w1", "markov_w2"]
     assert _node({"id": "h", "nodes": sp["sequential_head"]}, "markov_w2")["tp"] == "replicated"
+
+
+# --- Auxiliary hidden states and the pipeline boundary --------------------------------
+
+def test_muse_spark_dspark_states_the_target_layers_it_reads():
+    """vLLM resolves the drafter's capture points from dflash_config.target_layer_ids,
+    adding one (get_eagle3_aux_layers_from_config, eagle3_utils.py:107-111@v0.32.0), and
+    the target captures its fp32 residual stream there (model.py:1713-1722@0f6b2619)."""
+    raw = config_of(MUSE_DSPARK)
+    sp = graph_of(MUSE_DSPARK)["speculator"]
+    assert raw["dflash_config"]["target_layer_ids"] == [13, 29, 45, 57, 61]
+    assert sp["aux_hidden_state_layers"] == [14, 30, 46, 58, 62]
+    assert sp["aux_hidden_state_bytes_per_token"] == 8192 * 4
+
+
+def test_draft_aux_layers_follow_the_engine_resolution_order(tmp_path):
+    """Each source vLLM consults, in its order, with its own offset; an id past the
+    target's last layer, or a count the drafter's fc cannot take, is refused."""
+    D = deriver()
+    raw = config_of(MUSE_DSPARK)
+
+    def aux(mutate):
+        bad = json.loads(json.dumps(raw))
+        mutate(bad)
+        return _derive_raw(bad, tmp_path)["speculator"]["aux_hidden_state_layers"]
+
+    # dflash_config wins over the top-level ids, and adds one.
+    assert aux(lambda c: c["dflash_config"].update(target_layer_ids=[0, 1, 2, 3, 4])) == [
+        1, 2, 3, 4, 5]
+    # Without it, the dense-DSpark top-level ids, plus one.
+    assert aux(lambda c: c.pop("dflash_config")) == [14, 30, 46, 58, 62]
+    # An explicit eagle list is taken as-is, ahead of everything else.
+    assert aux(lambda c: c.update(eagle_aux_hidden_state_layer_ids=[2, 4, 6, 8, 10])) == [
+        2, 4, 6, 8, 10]
+    for mutate, why in [
+        # 61 + 1 is the last layer's output; 62 + 1 is past it.
+        (lambda c: c["dflash_config"].update(target_layer_ids=[13, 29, 45, 57, 62]),
+         "past the target's 62 layers"),
+        (lambda c: c["dflash_config"].update(target_layer_ids=[13, 29, 45, 57]),
+         "captures 4 states"),
+        (lambda c: c["dflash_config"].update(target_layer_ids=[13, 13, 45, 57, 61]),
+         "strictly increasing"),
+    ]:
+        bad = json.loads(json.dumps(raw))
+        mutate(bad)
+        with pytest.raises(D.DeriveError, match=why):
+            _derive_raw(bad, tmp_path)
+
+
+def test_v41_dspark_reads_its_target_layer_ids_as_is():
+    """For model_type deepseek_v41 vLLM uses dspark_target_layer_ids without the +1
+    (eagle3_utils.py:115-120@v0.32.0), and each captured state is the bf16 mean of the
+    hc_mult streams, one hidden-width activation (tilelang.py:313-323, mhc.py:260-264), so
+    the default width stands."""
+    raw = config_of(V41)
+    sp = v41_graph()["speculator"]
+    assert raw["model_type"] == "deepseek_v41"
+    assert sp["aux_hidden_state_layers"] == text_config(raw)["dspark_target_layer_ids"]
+    assert sp["aux_hidden_state_layers"] == [37, 38, 39]
+    assert "aux_hidden_state_bytes_per_token" not in sp
+
+
+def test_an_mtp_speculator_reads_no_aux_layers():
+    assert "aux_hidden_state_layers" not in v4_graph()["speculator"]
+
+
+# What each architecture's stage boundary carries where it is not vLLM's standard
+# hidden_states + residual pair (the schema's default, 2 x hidden x 2 bytes).
+BOUNDARY_BYTES = {
+    # One fp32 stream (_make_empty_intermediate_tensors, model.py:1639-1650@0f6b2619).
+    "muse-spark-open-816b-a42b": 8192 * 4,
+    "muse-spark-open-816b-a42b-nvfp4": 8192 * 4,
+    # The (hc_mult, hidden) bundle at the activation dtype (deepseek_v4/nvidia/
+    # model.py:1406-1424@v0.32.0).
+    "deepseek-v4-pro": 4 * 7168 * 2,
+    # That bundle plus the (hc_mult,) fp32 pre-mix (deepseek_v41/nvidia/
+    # model.py:885-910@v0.32.0).
+    "deepseek-v4.1-flash": 4 * 5120 * 2 + 4 * 4,
+    # hidden_states alone (inkling/nvidia/model.py:294-296, 354-359@v0.32.0).
+    "inkling": 6144 * 2,
+}
+
+
+@pytest.mark.parametrize("d", model_dirs(), ids=lambda d: d.name)
+def test_pipeline_boundary_bytes_follow_the_intermediate_tensors(d: Path):
+    """A graph states its boundary only where vLLM sends something other than the
+    standard pair; every other committed architecture sends the pair and omits it.
+    Kimi-K3's attention-residual blocks make its residual stage-dependent
+    (kimi_k3/nvidia/model.py:1201-1222@v0.32.0), which one figure cannot state."""
+    g = graph_of(d)
+    assert g["global"].get("pipeline_boundary_bytes_per_token") == BOUNDARY_BYTES.get(d.name)

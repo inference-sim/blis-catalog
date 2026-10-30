@@ -225,3 +225,10 @@ speculator:
     n: 202048
     k: 512
     tp: replicated
+  aux_hidden_state_layers:
+  - 14
+  - 30
+  - 46
+  - 58
+  - 62
+  aux_hidden_state_bytes_per_token: 32768

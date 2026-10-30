@@ -541,6 +541,71 @@ def base_dtype(cfg: dict[str, Any], raw: dict[str, Any], model: str) -> str:
     return name
 
 
+def draft_aux_hidden_state_layers(hf: dict[str, Any], model: str, target_layers: int,
+                                  states: int | None = None) -> list[int]:
+    """The target layers a drafter reads, as the engine resolves them from its config.
+
+    The ids are in the engine's capture convention, which the graph's
+    speculator.aux_hidden_state_layers states: L is the state entering decoder layer L, 0
+    the embedding output, the layer count the last layer's output. vLLM reads, in order,
+    eagle_aux_hidden_state_layer_ids as-is; dflash_config.target_layer_ids plus one;
+    dspark_target_layer_ids as-is for model_type deepseek_v41 and plus one otherwise; the
+    dense-DSpark top-level target_layer_ids plus one; then dflash_config or eagle_config
+    layer_ids as-is (get_eagle3_aux_layers_from_config,
+    vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py:100-137@v0.32.0, unchanged at
+    vllm-project/vllm 0f6b2619). A config naming none of them falls back to a per-model
+    default, which no graph can read from a config, so that is refused.
+
+    The engine sorts and deduplicates the ids (_set_aux_hidden_state_layers,
+    model_executor/models/interfaces.py:1577-1578@v0.32.0); a repeat would leave the
+    drafter's input projection, sized for one state per listed layer, a state short, so
+    a repeat is refused rather than collapsed. `hf` is the drafter's config as the engine
+    sees it, flattened; `states`, where given, is how many states the drafter consumes.
+    The upper bound is checked here because the schema cannot check it on a drafter
+    graph, which does not hold its target's layer count."""
+    def entries(key, ids):
+        out = []
+        for i in ids:
+            if isinstance(i, bool) or not isinstance(i, int):
+                raise DeriveError(f"{model}: {key} entry {i!r} is not a layer id")
+            out.append(i)
+        return out
+
+    ids: list[int] | None = None
+    if hf.get("eagle_aux_hidden_state_layer_ids"):
+        ids = entries("eagle_aux_hidden_state_layer_ids",
+                      hf["eagle_aux_hidden_state_layer_ids"])
+    dflash = hf.get("dflash_config")
+    if not ids and isinstance(dflash, dict) and dflash:
+        ids = [i + 1 for i in entries("dflash_config.target_layer_ids",
+                                      dflash.get("target_layer_ids") or ())]
+    if not ids and hf.get("dspark_target_layer_ids"):
+        ds = entries("dspark_target_layer_ids", hf["dspark_target_layer_ids"])
+        ids = ds if hf.get("model_type") == "deepseek_v41" else [i + 1 for i in ds]
+    if not ids and hf.get("target_layer_ids"):
+        ids = [i + 1 for i in entries("target_layer_ids", hf["target_layer_ids"])]
+    if not ids:
+        for name in ("dflash_config", "eagle_config"):
+            sub = hf.get(name)
+            if isinstance(sub, dict) and sub.get("layer_ids"):
+                ids = entries(f"{name}.layer_ids", sub["layer_ids"])
+                break
+    if not ids:
+        raise DeriveError(f"{model}: the drafter names no target layers to read; the "
+                          f"engine would fall back to a per-model default")
+    ids = sorted(ids)
+    if len(set(ids)) != len(ids):
+        raise DeriveError(f"{model}: aux hidden-state layers {ids} repeat a capture point; "
+                          f"the ids must be strictly increasing")
+    if ids[0] < 0 or ids[-1] > target_layers:
+        raise DeriveError(f"{model}: aux hidden-state layers {ids} reach past the target's "
+                          f"{target_layers} layers")
+    if states is not None and len(ids) != states:
+        raise DeriveError(f"{model}: the engine captures {len(ids)} states {ids}, and the "
+                          f"drafter's input projection takes {states}")
+    return ids
+
+
 def head_dim(cfg: dict[str, Any], model: str) -> int:
     """Return the attention head dimension.
 
@@ -1635,7 +1700,16 @@ def handler_moe(cfg, raw, model):
         ]
         local = set(int(i) for i in local_ids)
         sequence = ["swa_moe" if i in local else "full_moe" for i in range(layers)]
-        return kinds, compress(sequence)
+        if raw.get("architectures", [None])[0] != "InklingForConditionalGeneration":
+            return kinds, compress(sequence)
+        # Inkling's stage boundary carries hidden_states alone at the model dtype, not
+        # vLLM's standard hidden_states + residual pair: the pending short-conv residual
+        # add is applied before the send (make_empty_intermediate_tensors_factory(
+        # ["hidden_states"]), inkling/nvidia/model.py:294-296, 354-359@v0.32.0; add_rmsnorm
+        # allocates its output like the residual, nvidia/ops/norm.py:160-161).
+        boundary = hidden * DTYPE_WIDTHS[base_dtype(cfg, raw, model)]
+        return kinds, compress(sequence), {
+            "global": {"pipeline_boundary_bytes_per_token": boundary}}
 
     # A per-layer MLP type vector marks which layers are sparse.
     mlp_types = cfg.get("mlp_layer_types")
@@ -2272,6 +2346,12 @@ def handler_deepseek_v4(cfg, raw, model):
         "global": {
             "architecture": "DeepseekV4ForCausalLM",
             "context_window": positive("max_position_embeddings"),
+            # A stage hands the next the hc_mult-stream bundle alone, (tokens, hc_mult,
+            # hidden) at the activation dtype, and no residual: the streams ARE the
+            # residual (make_empty_intermediate_tensors, nvidia/model.py:1406-1424@v0.32.0;
+            # the send, :1501-1507). Sequence parallelism is off under PP
+            # (_use_sequence_parallel, :1047-1058), so every boundary moves this much.
+            "pipeline_boundary_bytes_per_token": bundle,
         },
         "embedding": [embed, collective("AllReduce", "embed_out", EMIT_TENSOR_PARALLEL)],
         "head": head,
@@ -3153,6 +3233,20 @@ def handler_deepseek_v41(cfg, raw, model):
         # main_proj's input is one hidden-wide state per target layer, so the ids are
         # checked as layers of this stack, not just counted.
         targets = layer_ids("dspark_target_layer_ids", 0, layers, nonempty=True)
+        # The capture points. The draft config is the target's, with model_type set to
+        # deepseek_v41 where the target's is (config/speculative.py:1439-1447@v0.32.0),
+        # and for that model_type vLLM takes the ids as-is: V4.1 reads the stream
+        # entering each named layer (eagle3_utils.py:112-122). Each captured state is the
+        # mean over the hc_mult bf16 streams, (tokens, hidden) -- one hidden-width
+        # activation, which is the schema's default width, so none is stated
+        # (mhc_shifted_post_pre's aux, nvidia/ops/mhc.py:260-264; tilelang.py:313-323;
+        # previous_post.mean(dim=1), nvidia/model.py:541-542; _collapse, :1153-1157).
+        # V4.1's decoder does not relay aux states over pipeline stages (it sets no
+        # supports_aux_hidden_states_over_pp, and its boundary carries none,
+        # nvidia/model.py:1052-1055), so DSpark runs without PP.
+        spec_type = "deepseek_v41" if raw.get("model_type") == "deepseek_v41" else "deepseek_v4"
+        aux_layers = draft_aux_hidden_state_layers({**cfg, "model_type": spec_type}, model,
+                                                   layers, states=len(targets))
         draft_experts = positive("dspark_n_routed_experts")
         draft_top_k = positive("dspark_num_experts_per_tok")
         if draft_top_k > draft_experts:
@@ -3210,6 +3304,13 @@ def handler_deepseek_v41(cfg, raw, model):
             # (config/model.py:2496-2501), and at 1,048,576 at the pinned revision it
             # equals max_position_embeddings, so it does not lower it.
             "context_window": positive("max_position_embeddings"),
+            # A stage hands the next the hc_mult-stream bundle at the activation dtype and
+            # the (tokens, hc_mult) fp32 pre-mix the next stage's first layer collapses
+            # with, and no separate residual (make_empty_intermediate_tensors,
+            # nvidia/model.py:885-910@v0.32.0; the send, :1052-1055). Sequence parallelism
+            # is off under PP (_use_sequence_parallel, :246-256), so every boundary moves
+            # this much.
+            "pipeline_boundary_bytes_per_token": bundle + hc_mult * fp32,
         },
         # BF16, not FP8: vLLM passes the quant config, but it returns no method for an
         # embedding (quantization/fp8.py:177-209), so the table falls back to
@@ -3270,6 +3371,7 @@ def handler_deepseek_v41(cfg, raw, model):
                  "out_bytes_per_token": markov * act},
                 with_tp(base_gemm("markov_w2", vocab, markov), "replicated"),
             ],
+            "aux_hidden_state_layers": aux_layers,
         }
     # With no draft layers there is no speculator to state: derive()'s fallback reads
     # the same num_nextn_predict_layers and emits none at zero.
@@ -4220,8 +4322,10 @@ def handler_muse_spark(cfg, raw, model):
             # vLLM's derived max_model_len is that value.
             "context_window": whole(require_key(cfg, "max_position_embeddings", model),
                                     "max_position_embeddings"),
-            # What a pipeline stage hands the next: the fp32 residual stream
-            # (_make_empty_intermediate_tensors, model.py:1640-1650).
+            # What a pipeline stage hands the next: the fp32 residual stream alone, with
+            # the residual folded into it and no separate residual tensor
+            # (_make_empty_intermediate_tensors, model.py:1639-1650; the send carries
+            # hidden_states and any captured aux states only, :1724-1731).
             "pipeline_boundary_bytes_per_token": hidden * fp32,
         },
         # A vocabulary-parallel lookup whose partials are all-reduced.
@@ -4277,6 +4381,14 @@ def handler_muse_spark_dspark(cfg, raw, model):
     if not targets or any(not 0 <= int(t) < target_layers for t in targets):
         raise DeriveError(f"{model}: target_layer_ids {targets} outside the target's "
                           f"{target_layers} layers")
+    # The capture points the engine resolves for this drafter. Its config states the ids
+    # twice, in dflash_config and at the top level, and vLLM reads dflash_config first and
+    # adds one: target_layer_ids 13, 29, 45, 57, 61 are captured as 14, 30, 46, 58, 62, the
+    # last being the final layer's output (eagle3_utils.py:107-111@v0.32.0). The drafter
+    # concatenates one state per top-level id into its fc (dspark.py:106, 125@0f6b2619), so
+    # the engine must capture exactly that many.
+    aux_layers = draft_aux_hidden_state_layers(cfg, model, target_layers,
+                                               states=len(targets))
     if set(cfg.get("layer_types") or ["sliding_attention"]) != {"sliding_attention"}:
         raise DeriveError(f"{model}: a full-attention draft layer")
     base = base_dtype(cfg, raw, model)
@@ -4341,6 +4453,14 @@ def handler_muse_spark_dspark(cfg, raw, model):
                  "out_bytes_per_token": markov * act},
                 with_tp(gemm("markov_w2", vocab, markov), "replicated"),
             ],
+            "aux_hidden_state_layers": aux_layers,
+            # Each captured state is the target's fp32 residual stream, not one bf16
+            # activation: the target keeps the stream in fp32 (residual_dtype,
+            # model.py:1531@0f6b2619) and, at a capture point, appends either the stream
+            # itself or norm_then_gated_residual of it (model.py:1713-1722), which returns
+            # the stream's dtype (common/layers.py:276-286, 299-322; the fused kernel
+            # allocates its output like the stream, common/ops/fused_rmsnorm.py:295-296).
+            "aux_hidden_state_bytes_per_token": target_hidden * fp32,
         },
     }
     return kinds, {"pattern": ["dspark_layer"], "repeat": layers}, extras
