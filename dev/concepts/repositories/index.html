@@ -1517,7 +1517,7 @@
 </ul>
 <h2 id="what-the-catalog-depends-on">What the catalog depends on<a class="headerlink" href="#what-the-catalog-depends-on" title="Permanent link">&para;</a></h2>
 <p>Nothing at run time: the catalog contains no code that a simulation executes. Two scripts live here. <code>scripts/derive_graph.py</code> translates a vendor config into a model graph and runs when an entry is added. <code>scripts/docs/catalog_pages.py</code> builds this site. Neither runs during a simulation.</p>
-<p>blis-schemas is the catalog's one dependency, and it is used only for validation. CI runs the schemas' <code>validate-catalog</code> command, pinned to <code>v0.4.0</code>, against every commit. The dependency points one way: the schemas do not read the catalog. They keep a pinned copy of its data as test fixtures, so their tests never depend on the catalog's <code>main</code> branch.</p>
+<p>blis-schemas is the catalog's one dependency, and it is used only for validation. CI runs the schemas' <code>validate-catalog</code> command, pinned to <code>v0.10.0</code>, against every commit. The dependency points one way: the schemas do not read the catalog. They keep a pinned copy of its data as test fixtures, so their tests never depend on the catalog's <code>main</code> branch.</p>
 <h2 id="where-a-new-model-lands">Where a new model lands<a class="headerlink" href="#where-a-new-model-lands" title="Permanent link">&para;</a></h2>
 <table>
 <thead>

@@ -1329,7 +1329,7 @@
 
 
 <h1 id="models">Models<a class="headerlink" href="#models" title="Permanent link">&para;</a></h1>
-<p>39 models. Each has a page with its layer stack, its dimensions, every node of its model graph, and where its config came from.</p>
+<p>42 models. Each has a page with its layer stack, its dimensions, every node of its model graph, and where its config came from.</p>
 <dl>
 <dt>Weights</dt>
 <dd>The format the parameters are stored in, followed by any format individual nodes override it with.</dd>
@@ -1575,6 +1575,30 @@
 <td style="text-align: left;">gqa</td>
 <td style="text-align: left;">8, top-2</td>
 <td style="text-align: left;">—</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="muse-spark-open-816b-a42b/">muse-spark-open-816b-a42b</a></td>
+<td style="text-align: right;">62</td>
+<td style="text-align: left;">bf16 (fp32 for some nodes)</td>
+<td style="text-align: left;">gqa + swa</td>
+<td style="text-align: left;">256, top-8</td>
+<td style="text-align: left;">—</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="muse-spark-open-816b-a42b-nvfp4/">muse-spark-open-816b-a42b-nvfp4</a></td>
+<td style="text-align: right;">62</td>
+<td style="text-align: left;">bf16 (fp32, nvfp4 for some nodes)</td>
+<td style="text-align: left;">gqa + swa</td>
+<td style="text-align: left;">256, top-8</td>
+<td style="text-align: left;">—</td>
+</tr>
+<tr>
+<td style="text-align: left;"><a href="muse-spark-open-dspark/">muse-spark-open-dspark</a></td>
+<td style="text-align: right;">5</td>
+<td style="text-align: left;">bf16</td>
+<td style="text-align: left;">swa</td>
+<td style="text-align: left;">—</td>
+<td style="text-align: left;"><code>dspark</code>, 7 tokens</td>
 </tr>
 <tr>
 <td style="text-align: left;"><a href="nemotron-3-ultra-550b-a55b-bf16/">nemotron-3-ultra-550b-a55b-bf16</a></td>
