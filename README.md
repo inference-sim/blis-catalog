@@ -206,7 +206,7 @@ CI validates every committed entry by running that owner's binary against the
 checkout, pinned by version:
 
 ```sh
-go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.8.1-0.20261030103752-99502b8e6ff8 .
+go run github.com/inference-sim/blis-schemas/cmd/validate-catalog@v0.8.1-0.20261030134601-9f0c06989492 .
 ```
 
 (TEMPORARY: the pushed head of inference-sim/blis-schemas#112, until it is released.)
